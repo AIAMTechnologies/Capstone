@@ -1,0 +1,32 @@
+{
+  "metrics": {
+    "accuracy": 0.75,
+    "precision": 0.75,
+    "recall": 0.8181818181818182,
+    "f1_score": 0.7826086956521738,
+    "roc_auc": 0.7853535353535354,
+    "confusion_matrix": [
+      [
+        12,
+        6
+      ],
+      [
+        4,
+        18
+      ]
+    ],
+    "classification_report": "precision    recall  f1-score   support\n    0       0.75     0.67      0.71         18\n    1       0.75     0.82      0.78         22"
+  },
+  "n_train": 160,
+  "n_validation": 40,
+  "class_balance": {
+    "train": {
+      "1": 87,
+      "0": 73
+    },
+    "validation": {
+      "0": 18,
+      "1": 22
+    }
+  }
+}
