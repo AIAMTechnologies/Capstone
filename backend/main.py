@@ -13,11 +13,14 @@
 # python-multipart==0.0.6
 # requests==2.31.0
 
+import logging
 import os
+import pickle
 import time
 from datetime import datetime, timedelta
-from typing import List, Optional
 from math import radians, sin, cos, sqrt, atan2
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -43,7 +46,255 @@ class Settings:
     GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
     GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
 
+    MODEL_ARTIFACT_DEFAULT = Path(__file__).resolve().parent / "model_artifacts" / "lead_scoring_pipeline.pkl"
+    LEAD_MODEL_PATH = os.getenv("LEAD_MODEL_PATH", str(MODEL_ARTIFACT_DEFAULT))
+    LEAD_SCORE_THRESHOLD = float(os.getenv("LEAD_SCORE_THRESHOLD", "0.5"))
+
 settings = Settings()
+
+logger = logging.getLogger("lead_scoring")
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler())
+logger.setLevel(logging.INFO)
+
+lead_scoring_pipeline = None
+lead_scoring_model = None
+lead_scoring_preprocessor = None
+lead_scoring_metadata: Dict[str, Any] = {}
+lead_scoring_loaded = False
+
+
+def _to_python_scalar(value: Any) -> Any:
+    """Convert numpy/scalar values to native Python types."""
+    try:
+        import numpy as np  # type: ignore
+
+        if isinstance(value, np.generic):
+            return value.item()
+    except Exception:
+        pass
+
+    if hasattr(value, "item") and callable(getattr(value, "item")):
+        try:
+            return value.item()
+        except Exception:
+            pass
+
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return value
+
+    return value
+
+
+def _stringify(value: Any) -> Optional[str]:
+    """Return string representation for JSON serialization."""
+    if value is None:
+        return None
+    scalar = _to_python_scalar(value)
+    if isinstance(scalar, str):
+        return scalar
+    return str(scalar)
+
+
+def _ensure_dataframe_row(payload: Dict[str, Any]):
+    """Convert payload to a pandas DataFrame row when possible."""
+    try:
+        import pandas as pd  # type: ignore
+
+        return pd.DataFrame([payload])
+    except Exception:
+        return [payload]
+
+
+def _extract_probability_row(probabilities: Any) -> Optional[List[float]]:
+    """Normalize probability outputs to a list of floats."""
+    if probabilities is None:
+        return None
+
+    try:
+        values = probabilities.tolist()  # type: ignore[attr-defined]
+    except Exception:
+        values = probabilities
+
+    try:
+        if not values:
+            return None
+    except TypeError:
+        return None
+
+    first_row = values[0] if isinstance(values, list) else values
+
+    if isinstance(first_row, (list, tuple)):
+        try:
+            return [float(x) for x in first_row]
+        except Exception:
+            return None
+
+    try:
+        return [float(first_row)]
+    except Exception:
+        return None
+
+
+def load_lead_scoring_artifact() -> None:
+    """Load serialized lead scoring assets into memory."""
+
+    global lead_scoring_pipeline, lead_scoring_model, lead_scoring_preprocessor
+    global lead_scoring_metadata, lead_scoring_loaded
+
+    artifact_path = Path(settings.LEAD_MODEL_PATH)
+
+    if not artifact_path.exists():
+        logger.warning("Lead scoring model not found at %s", artifact_path)
+        lead_scoring_pipeline = None
+        lead_scoring_model = None
+        lead_scoring_preprocessor = None
+        lead_scoring_metadata = {}
+        lead_scoring_loaded = False
+        return
+
+    try:
+        with artifact_path.open("rb") as artifact_file:
+            artifact = pickle.load(artifact_file)
+    except FileNotFoundError:
+        logger.warning("Lead scoring model not found at %s", artifact_path)
+        lead_scoring_loaded = False
+        return
+    except Exception as exc:
+        logger.error("Failed to load lead scoring model from %s: %s", artifact_path, exc)
+        lead_scoring_loaded = False
+        return
+
+    pipeline = None
+    model = None
+    preprocessor = None
+    metadata: Dict[str, Any] = {}
+
+    if isinstance(artifact, dict):
+        metadata = artifact.get("metadata") or {}
+        pipeline = artifact.get("pipeline")
+        preprocessor = artifact.get("preprocessor")
+        model = artifact.get("model") or pipeline
+    else:
+        if hasattr(artifact, "predict"):
+            pipeline = artifact
+            model = artifact
+
+    if model is None and pipeline is None:
+        logger.error(
+            "Loaded lead scoring artifact from %s does not include a usable estimator.",
+            artifact_path,
+        )
+        lead_scoring_loaded = False
+        return
+
+    lead_scoring_pipeline = pipeline
+    lead_scoring_model = model
+    lead_scoring_preprocessor = preprocessor
+    lead_scoring_metadata = metadata
+    if lead_scoring_metadata is not None:
+        lead_scoring_metadata = dict(lead_scoring_metadata)
+        lead_scoring_metadata.setdefault("artifact_path", str(artifact_path))
+
+    lead_scoring_loaded = True
+    logger.info("Lead scoring model loaded from %s", artifact_path)
+
+
+def is_lead_scoring_available() -> bool:
+    """Check if the lead scoring model is loaded and usable."""
+
+    return lead_scoring_loaded and (lead_scoring_pipeline is not None or lead_scoring_model is not None)
+
+
+def score_lead_application(lead: "LeadCreate") -> Optional[Dict[str, Any]]:
+    """Run the loaded model against incoming lead data."""
+
+    if not is_lead_scoring_available():
+        return None
+
+    payload = lead.model_dump()
+    if payload.get("comments") is None:
+        payload["comments"] = ""
+
+    dataframe_row = _ensure_dataframe_row(payload)
+
+    estimator = lead_scoring_pipeline or lead_scoring_model
+    inputs = dataframe_row
+
+    if estimator is None:
+        return None
+
+    if estimator is not lead_scoring_pipeline and lead_scoring_preprocessor is not None:
+        try:
+            inputs = lead_scoring_preprocessor.transform(dataframe_row)
+        except Exception as exc:
+            logger.exception("Lead preprocessor failed: %s", exc)
+            raise
+
+    try:
+        classes_attr = getattr(estimator, "classes_", None)
+        classes_list = [_stringify(cls) for cls in list(classes_attr)] if classes_attr is not None else None
+
+        probabilities_row = None
+        probability = None
+        if hasattr(estimator, "predict_proba"):
+            probabilities_row = _extract_probability_row(estimator.predict_proba(inputs))
+            if probabilities_row:
+                positive_label = lead_scoring_metadata.get("positive_label") if lead_scoring_metadata else None
+                positive_index = 1 if len(probabilities_row) > 1 else 0
+
+                if classes_list and positive_label is not None:
+                    for idx, cls in enumerate(classes_list):
+                        if cls == str(positive_label):
+                            positive_index = idx
+                            break
+
+                if positive_index >= len(probabilities_row):
+                    positive_index = len(probabilities_row) - 1
+
+                probability = float(probabilities_row[positive_index])
+            else:
+                positive_index = 0
+        else:
+            positive_index = 0
+
+        label = None
+        if hasattr(estimator, "predict"):
+            predictions = estimator.predict(inputs)
+            if len(predictions) > 0:
+                label = _stringify(predictions[0])
+
+        if label is None and probability is not None and classes_list:
+            positive_value = classes_list[positive_index]
+            negative_value = next((cls for idx, cls in enumerate(classes_list) if idx != positive_index), None)
+            threshold = lead_scoring_metadata.get("threshold") if lead_scoring_metadata else None
+            threshold = float(threshold) if threshold is not None else settings.LEAD_SCORE_THRESHOLD
+            label = positive_value if probability >= threshold else negative_value
+        else:
+            threshold = lead_scoring_metadata.get("threshold") if lead_scoring_metadata else None
+            threshold = float(threshold) if threshold is not None else settings.LEAD_SCORE_THRESHOLD
+
+        result_metadata = dict(lead_scoring_metadata) if lead_scoring_metadata else {}
+        result_metadata.setdefault("threshold", threshold)
+
+        return {
+            "probability": probability,
+            "label": label,
+            "positive_label": classes_list[positive_index] if classes_list else None,
+            "classes": classes_list,
+            "probabilities": probabilities_row,
+            "metadata": result_metadata or None,
+        }
+    except Exception as exc:
+        logger.exception("Lead scoring failed: %s", exc)
+        raise
+
+
+# Attempt to load the lead scoring model during startup
+load_lead_scoring_artifact()
 
 # ============================================
 # FASTAPI APP SETUP
@@ -132,8 +383,21 @@ class LeadResponse(BaseModel):
     assigned_installer_name: Optional[str]
     allocation_score: Optional[float]
     distance_to_installer_km: Optional[float]
+    lead_score_probability: Optional[float] = None
+    lead_score_label: Optional[str] = None
+    allocation_match_score: Optional[float] = None
     created_at: datetime
     message: str = "Lead submitted successfully"
+
+
+class LeadScoreResponse(BaseModel):
+    probability: Optional[float]
+    label: Optional[str] = None
+    positive_label: Optional[str] = None
+    classes: Optional[List[str]] = None
+    probabilities: Optional[List[float]] = None
+    threshold: Optional[float] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 class AdminUser(BaseModel):
     id: int
@@ -442,7 +706,37 @@ async def submit_lead(lead: LeadCreate):
         allocation = allocate_lead_to_installer(
             latitude, longitude, lead.province, lead.job_type
         )
-        
+
+        lead_score_result: Optional[Dict[str, Any]] = None
+        lead_probability_value: Optional[float] = None
+        lead_score_label_value: Optional[str] = None
+        allocation_match_score = allocation['allocation_score'] if allocation else None
+
+        if is_lead_scoring_available():
+            try:
+                lead_score_result = score_lead_application(lead)
+            except Exception as exc:
+                logger.error("Lead scoring failed for lead %s: %s", lead.email, exc)
+            else:
+                if lead_score_result:
+                    raw_probability = lead_score_result.get("probability")
+                    if raw_probability is not None:
+                        try:
+                            lead_probability_value = round(float(raw_probability), 6)
+                        except (TypeError, ValueError):
+                            lead_probability_value = None
+
+                    label_candidate = lead_score_result.get("label")
+                    if label_candidate is not None:
+                        lead_score_label_value = _stringify(label_candidate)
+
+        if lead_probability_value is not None:
+            stored_allocation_score = lead_probability_value
+        elif allocation:
+            stored_allocation_score = allocation['allocation_score']
+        else:
+            stored_allocation_score = None
+
         # Step 3: Insert lead into database
         conn = get_db_connection()
         try:
@@ -452,7 +746,7 @@ async def submit_lead(lead: LeadCreate):
                         INSERT INTO leads (
                             name, email, phone, address, city, province, postal_code,
                             latitude, longitude, job_type, comments,
-                            assigned_installer_id, allocation_score, 
+                            assigned_installer_id, allocation_score,
                             distance_to_installer_km, estimated_travel_time_minutes,
                             status, source, assigned_at
                         ) VALUES (
@@ -462,8 +756,8 @@ async def submit_lead(lead: LeadCreate):
                     params = (
                         lead.name, lead.email, lead.phone, lead.address, lead.city,
                         lead.province, lead.postal_code, latitude, longitude,
-                        lead.job_type, lead.comments, allocation['installer_id'], 
-                        allocation['allocation_score'], allocation['distance_km'], 
+                        lead.job_type, lead.comments, allocation['installer_id'],
+                        stored_allocation_score, allocation['distance_km'],
                         allocation['travel_time_minutes'], 'active', 'website'
                     )
                 else:
@@ -471,15 +765,17 @@ async def submit_lead(lead: LeadCreate):
                         INSERT INTO leads (
                             name, email, phone, address, city, province, postal_code,
                             latitude, longitude, job_type, comments,
+                            allocation_score,
                             status, source
                         ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         ) RETURNING id, created_at
                     """
                     params = (
                         lead.name, lead.email, lead.phone, lead.address, lead.city,
                         lead.province, lead.postal_code, latitude, longitude,
-                        lead.job_type, lead.comments, 'active', 'website'
+                        lead.job_type, lead.comments, stored_allocation_score,
+                        'active', 'website'
                     )
                 
                 cursor.execute(insert_query, params)
@@ -504,8 +800,11 @@ async def submit_lead(lead: LeadCreate):
             status='active',
             assigned_installer_id=allocation['installer_id'] if allocation else None,
             assigned_installer_name=allocation['installer_name'] if allocation else None,
-            allocation_score=allocation['allocation_score'] if allocation else None,
+            allocation_score=stored_allocation_score,
             distance_to_installer_km=allocation['distance_km'] if allocation else None,
+            lead_score_probability=lead_probability_value,
+            lead_score_label=lead_score_label_value,
+            allocation_match_score=allocation_match_score,
             created_at=created_at,
             message="Lead submitted and assigned successfully" if allocation else "Lead submitted - no installer available in your area"
         )
@@ -518,6 +817,43 @@ async def submit_lead(lead: LeadCreate):
 # ============================================
 # API ENDPOINTS - ADMIN (PROTECTED)
 # ============================================
+
+@app.post("/api/admin/leads/score", response_model=LeadScoreResponse)
+async def score_lead_endpoint(
+    lead: LeadCreate,
+    current_user: AdminUser = Depends(get_current_user)
+):
+    """Score a lead using the loaded machine learning model."""
+
+    if not is_lead_scoring_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Lead scoring model is not available."
+        )
+
+    try:
+        result = score_lead_application(lead)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Lead scoring endpoint error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to score lead.")
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Lead scoring model did not return a result.")
+
+    metadata = result.get("metadata") or {}
+    threshold_value = metadata.get("threshold", settings.LEAD_SCORE_THRESHOLD)
+
+    return LeadScoreResponse(
+        probability=result.get("probability"),
+        label=_stringify(result.get("label")) if result.get("label") is not None else None,
+        positive_label=_stringify(result.get("positive_label")) if result.get("positive_label") is not None else None,
+        classes=result.get("classes"),
+        probabilities=result.get("probabilities"),
+        threshold=float(threshold_value) if threshold_value is not None else settings.LEAD_SCORE_THRESHOLD,
+        metadata=metadata or None,
+    )
 
 @app.post("/api/admin/login", response_model=Token)
 async def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
