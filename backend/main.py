@@ -37,18 +37,31 @@ import requests
 # ============================================
 
 class Settings:
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:4567@localhost:5432/capstone25")
-    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
-    ALGORITHM = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
-    
-    # Geocoding API (Google Maps or alternative)
-    GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
-    GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
+    def __init__(self) -> None:
+        # Database configuration
+        supabase_url = os.getenv("SUPABASE_DB_URL")
+        self.DATABASE_URL = supabase_url or os.getenv(
+            "DATABASE_URL",
+            "postgresql://postgres:4567@localhost:5432/capstone25",
+        )
 
-    MODEL_ARTIFACT_DEFAULT = Path(__file__).resolve().parent / "model_artifacts" / "lead_scoring_pipeline.pkl"
-    LEAD_MODEL_PATH = os.getenv("LEAD_MODEL_PATH", str(MODEL_ARTIFACT_DEFAULT))
-    LEAD_SCORE_THRESHOLD = float(os.getenv("LEAD_SCORE_THRESHOLD", "0.5"))
+        self.DB_SSLMODE = os.getenv("DB_SSLMODE")
+        if not self.DB_SSLMODE and self.DATABASE_URL and "supabase.co" in self.DATABASE_URL:
+            # Supabase requires SSL connections by default
+            self.DB_SSLMODE = "require"
+
+        # Security / auth configuration
+        self.SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+        self.ALGORITHM = "HS256"
+        self.ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
+
+        # Geocoding API (Google Maps or alternative)
+        self.GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
+        self.GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
+
+        self.MODEL_ARTIFACT_DEFAULT = Path(__file__).resolve().parent / "model_artifacts" / "lead_scoring_pipeline.pkl"
+        self.LEAD_MODEL_PATH = os.getenv("LEAD_MODEL_PATH", str(self.MODEL_ARTIFACT_DEFAULT))
+        self.LEAD_SCORE_THRESHOLD = float(os.getenv("LEAD_SCORE_THRESHOLD", "0.5"))
 
 settings = Settings()
 
@@ -326,7 +339,14 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login")
 def get_db_connection():
     """Get database connection"""
     try:
-        conn = psycopg2.connect(settings.DATABASE_URL, cursor_factory=RealDictCursor)
+        connect_kwargs = {
+            "dsn": settings.DATABASE_URL,
+            "cursor_factory": RealDictCursor,
+        }
+        if getattr(settings, "DB_SSLMODE", None):
+            connect_kwargs["sslmode"] = settings.DB_SSLMODE
+
+        conn = psycopg2.connect(**connect_kwargs)
         return conn
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
