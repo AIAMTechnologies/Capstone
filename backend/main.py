@@ -32,6 +32,50 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 
+
+def _load_env_file() -> None:
+    """Populate os.environ with key/value pairs from the project .env file.
+
+    The backend expects connection credentials (such as SUPABASE_DB_URL) to be
+    available as environment variables. When developers store them in a local
+    .env file we need to load it explicitly so imports during app start pick up
+    the values.
+    """
+
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        with env_path.open("r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+
+                value = value.strip()
+                if (value.startswith('"') and value.endswith('"')) or (
+                    value.startswith("'") and value.endswith("'")
+                ):
+                    value = value[1:-1]
+
+                # Do not overwrite variables that are already set in the
+                # process environment.
+                os.environ.setdefault(key, value)
+    except OSError as exc:
+        logging.getLogger("lead_scoring").warning("Failed to load .env: %s", exc)
+
+
+_load_env_file()
+
 # ============================================
 # CONFIGURATION
 # ============================================
