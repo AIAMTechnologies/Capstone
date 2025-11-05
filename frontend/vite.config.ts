@@ -38,6 +38,28 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 3000,
       proxy: proxyConfig,
+export default ({ mode }: { mode: string }) => {
+  const env = loadEnv(mode, process.cwd(), "");
+  const target = env.VITE_API_URL;
+
+  if (!target) {
+    throw new Error(
+      "VITE_API_URL is not defined. Set it to the backend API base URL (including the /api prefix)."
+    );
+  }
+
+  const normalizedTarget = target.replace(/\/+$/, "");
+
+  return defineConfig({
+    plugins: [react()],
+    server: {
+      port: 3000,
+      proxy: {
+        "/api": {
+          target: normalizedTarget,
+          changeOrigin: true,
+        },
+      },
     },
     build: {
       outDir: "dist",
@@ -45,3 +67,5 @@ export default defineConfig(({ mode }) => {
     },
   };
 });
+  });
+};
