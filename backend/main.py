@@ -32,23 +32,93 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 
+
+def _load_env_file() -> None:
+    """Populate os.environ with key/value pairs from the project .env file.
+
+    The backend expects connection credentials (such as SUPABASE_DB_URL) to be
+    available as environment variables. When developers store them in a local
+    .env file we need to load it explicitly so imports during app start pick up
+    the values.
+    """
+
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        with env_path.open("r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+
+                value = value.strip()
+                if (value.startswith('"') and value.endswith('"')) or (
+                    value.startswith("'") and value.endswith("'")
+                ):
+                    value = value[1:-1]
+
+                # Do not overwrite variables that are already set in the
+                # process environment.
+                os.environ.setdefault(key, value)
+    except OSError as exc:
+        logging.getLogger("lead_scoring").warning("Failed to load .env: %s", exc)
+
+
+_load_env_file()
+
 # ============================================
 # CONFIGURATION
 # ============================================
 
 class Settings:
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:4567@localhost:5432/capstone25")
-    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
-    ALGORITHM = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
-    
-    # Geocoding API (Google Maps or alternative)
-    GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
-    GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
+    def __init__(self) -> None:
+        # Database configuration
+        supabase_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
+        if not supabase_url:
+            raise RuntimeError(
+                "Supabase database URL is not configured. Set SUPABASE_DB_URL "
+                "(or DATABASE_URL) in the environment or .env file."
+            )
 
-    MODEL_ARTIFACT_DEFAULT = Path(__file__).resolve().parent / "model_artifacts" / "lead_scoring_pipeline.pkl"
-    LEAD_MODEL_PATH = os.getenv("LEAD_MODEL_PATH", str(MODEL_ARTIFACT_DEFAULT))
-    LEAD_SCORE_THRESHOLD = float(os.getenv("LEAD_SCORE_THRESHOLD", "0.5"))
+        self.DATABASE_URL = supabase_url
+
+        self.DB_SSLMODE = os.getenv("DB_SSLMODE")
+        if not self.DB_SSLMODE and self.DATABASE_URL and "supabase.co" in self.DATABASE_URL:
+            # Supabase requires SSL connections by default
+            self.DB_SSLMODE = "require"
+
+        # Security / auth configuration
+        self.SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+        self.ALGORITHM = "HS256"
+        self.ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
+
+        # Supabase API keys
+        self.SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
+        self.SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
+
+        if not self.SUPABASE_PUBLISHABLE_KEY or not self.SUPABASE_SECRET_KEY:
+            logging.getLogger("lead_scoring").warning(
+                "Supabase API keys are not configured. Set SUPABASE_PUBLISHABLE_KEY and "
+                "SUPABASE_SECRET_KEY in the environment or .env file."
+            )
+
+        # Geocoding API (Google Maps or alternative)
+        self.GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
+        self.GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
+
+        self.MODEL_ARTIFACT_DEFAULT = Path(__file__).resolve().parent / "model_artifacts" / "lead_scoring_pipeline.pkl"
+        self.LEAD_MODEL_PATH = os.getenv("LEAD_MODEL_PATH", str(self.MODEL_ARTIFACT_DEFAULT))
+        self.LEAD_SCORE_THRESHOLD = float(os.getenv("LEAD_SCORE_THRESHOLD", "0.5"))
 
 settings = Settings()
 
@@ -326,7 +396,14 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login")
 def get_db_connection():
     """Get database connection"""
     try:
-        conn = psycopg2.connect(settings.DATABASE_URL, cursor_factory=RealDictCursor)
+        connect_kwargs = {
+            "dsn": settings.DATABASE_URL,
+            "cursor_factory": RealDictCursor,
+        }
+        if getattr(settings, "DB_SSLMODE", None):
+            connect_kwargs["sslmode"] = settings.DB_SSLMODE
+
+        conn = psycopg2.connect(**connect_kwargs)
         return conn
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
