@@ -9,7 +9,27 @@ import type {
   Installer
 } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
+const rawApiUrl = import.meta.env.VITE_API_URL?.trim();
+
+const normalizeUrl = (url: string) => url.replace(/\/+$/, '');
+
+let apiBaseUrl = rawApiUrl ? normalizeUrl(rawApiUrl) : undefined;
+
+if (!apiBaseUrl) {
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    apiBaseUrl = `${normalizeUrl(window.location.origin)}/api`;
+    console.warn(
+      'VITE_API_URL is not defined. Falling back to the current origin for API requests; set VITE_API_URL to silence this warning.'
+    );
+  } else {
+    apiBaseUrl = '/api';
+    console.warn(
+      'VITE_API_URL is not defined. Falling back to the relative /api path; set VITE_API_URL to silence this warning.'
+    );
+  }
+}
+
+const API_BASE_URL = apiBaseUrl;
 
 // Create axios instance
 const api = axios.create({
