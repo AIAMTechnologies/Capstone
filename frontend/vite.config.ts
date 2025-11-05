@@ -1,50 +1,42 @@
-import { defineConfig, loadEnv } from "vite";
-import react from "@vitejs/plugin-react";
+import { defineConfig, loadEnv } from 'vite';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+
+const normalizeUrl = (value: string) => value.replace(/\/+$/, '');
 
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), "");
-  const rawTarget = (env.VITE_API_URL || "").trim();
-  const hasExplicitTarget = rawTarget.length > 0;
-  const normalizedTarget = hasExplicitTarget ? rawTarget.replace(/\/+$/, "") : "";
-  const targetIncludesApiSuffix = normalizedTarget.toLowerCase().endsWith("/api");
+  const env = loadEnv(mode, process.cwd(), '');
+  const rawApiUrl = env.VITE_API_URL ? env.VITE_API_URL.trim() : '';
+  const normalizedApiUrl = rawApiUrl ? normalizeUrl(rawApiUrl) : '';
 
-  const proxyTarget = hasExplicitTarget
-    ? targetIncludesApiSuffix
-      ? normalizedTarget
-      : `${normalizedTarget}/api`
-    : "";
+  const server: Record<string, unknown> = {
+    port: 3000,
+  };
 
-  const proxy = hasExplicitTarget
-    ? {
-        "/api": {
-          target: proxyTarget,
-          changeOrigin: true,
-          rewrite: targetIncludesApiSuffix
-            ? (path) => path.replace(/^\/api/, "")
-            : undefined,
-        },
-      }
-    : {
-        "/api": {
-          target: "http://localhost:8000",
-          changeOrigin: true,
-        },
-      };
+  if (!normalizedApiUrl || /localhost|127\.0\.0\.1/i.test(normalizedApiUrl)) {
+    const proxyTarget = normalizedApiUrl
+      ? normalizedApiUrl.replace(/\/api$/i, '')
+      : 'http://localhost:8000';
 
-  if (!hasExplicitTarget) {
-    console.info(
-      "VITE_API_URL is not defined. The dev server will proxy API requests to http://localhost:8000; set VITE_API_URL to target a remote backend."
-    );
+    server.proxy = {
+      '/api': {
+        target: proxyTarget,
+        changeOrigin: true,
+        secure: false,
+      },
+    };
   }
 
   return {
     plugins: [react()],
-    server: {
-      port: 3000,
-      proxy,
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, 'src'),
+      },
     },
+    server,
     build: {
-      outDir: "dist",
+      outDir: 'dist',
       sourcemap: true,
     },
   };

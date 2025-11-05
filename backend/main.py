@@ -14,6 +14,7 @@
 # requests==2.31.0
 
 import base64
+import json
 import hmac
 import logging
 import os
@@ -774,18 +775,32 @@ def allocate_lead_to_installer(
 # AUTHENTICATION
 # ============================================
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password against hash or fallback to direct comparison."""
+def verify_password(
+    plain_password: str,
+    hashed_password: Optional[str],
+    legacy_password: Optional[str] = None,
+) -> bool:
+    """Verify password against a hash or legacy plain-text value."""
 
-    if not hashed_password:
-        return False
+    if hashed_password:
+        try:
+            if pwd_context.verify(plain_password, hashed_password):
+                return True
+        except Exception as exc:
+            logger.debug("Bcrypt verification failed, falling back to legacy password: %s", exc)
+            try:
+                if hmac.compare_digest(plain_password, str(hashed_password)):
+                    return True
+            except Exception:
+                pass
 
-    try:
-        return pwd_context.verify(plain_password, hashed_password)
-    except Exception:
-        # Some existing databases might store admin passwords in plain text.
-        # Fall back to a constant-time comparison to remain compatible.
-        return hmac.compare_digest(plain_password, str(hashed_password))
+    if legacy_password:
+        try:
+            return hmac.compare_digest(plain_password, str(legacy_password))
+        except Exception:
+            return False
+
+    return False
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Create JWT access token"""
@@ -1008,35 +1023,75 @@ async def score_lead_endpoint(
 async def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
     """Admin login endpoint"""
     
-    query = "SELECT id, username, email, last_name, role, password_hash FROM admin_users WHERE username = %s AND is_active = TRUE"
-    user = execute_query(query, (form_data.username,))
-    
-    if not user or not verify_password(form_data.password, user[0]['password_hash']):
+    query = """
+        SELECT row_to_json(u) AS user_data
+        FROM admin_users AS u
+        WHERE username = %s
+          AND is_active = TRUE
+    """
+
+    result = execute_query(query, (form_data.username,))
+
+    if not result:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
+    raw_user_data = result[0].get("user_data")
+    if isinstance(raw_user_data, str):
+        try:
+            user_data = json.loads(raw_user_data)
+        except json.JSONDecodeError:
+            user_data = {}
+    elif isinstance(raw_user_data, dict):
+        user_data = dict(raw_user_data)
+    else:
+        user_data = {}
+
+    hashed_password = user_data.get("password_hash")
+    legacy_password = (
+        user_data.get("password")
+        or user_data.get("legacy_password")
+        or user_data.get("plain_password")
+    )
+
+    if not verify_password(form_data.password, hashed_password, legacy_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     # Update last login
+    user_id = user_data.get("id")
+    username = user_data.get("username", form_data.username)
+    if user_id is None or username is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     execute_query(
         "UPDATE admin_users SET last_login = CURRENT_TIMESTAMP WHERE id = %s",
-        (user[0]['id'],),
+        (user_id,),
         fetch=False
     )
-    
+
     # Create access token
-    access_token = create_access_token(data={"sub": user[0]['username']})
-    
+    access_token = create_access_token(data={"sub": username})
+
     return Token(
         access_token=access_token,
         token_type="bearer",
         user=AdminUser(
-            id=user[0]['id'],
-            username=user[0]['username'],
-            email=user[0]['email'],
-            last_name=user[0]['last_name'],
-            role=user[0]['role']
+            id=user_id,
+            username=username,
+            email=user_data.get("email"),
+            last_name=user_data.get("last_name"),
+            role=user_data.get("role", "admin")
         )
     )
 

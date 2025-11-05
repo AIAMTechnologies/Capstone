@@ -11,40 +11,13 @@ import type {
 
 const normalizeUrl = (url: string) => url.replace(/\/+$/, '');
 
-const LOCAL_DEV_API = 'http://localhost:8000/api';
-
-const getApiBaseUrl = (): string => {
-  const rawApiUrl = import.meta.env.VITE_API_URL?.trim();
-
-  if (rawApiUrl) {
-    return normalizeUrl(rawApiUrl);
+const API_BASE_URL = (() => {
+  const raw = import.meta.env.VITE_API_URL?.trim();
+  if (raw && raw.length > 0) {
+    return normalizeUrl(raw);
   }
-
-  if (typeof window !== 'undefined') {
-    const { origin, hostname } = window.location;
-
-    if (hostname === 'localhost' || hostname === '127.0.0.1') {
-      console.warn(
-        'VITE_API_URL is not defined. Using the local backend at http://localhost:8000/api; set VITE_API_URL to silence this warning.'
-      );
-      return normalizeUrl(LOCAL_DEV_API);
-    }
-
-    if (origin) {
-      console.warn(
-        'VITE_API_URL is not defined. Falling back to the current origin for API requests; set VITE_API_URL to silence this warning.'
-      );
-      return `${normalizeUrl(origin)}/api`;
-    }
-  }
-
-  console.warn(
-    'VITE_API_URL is not defined. Falling back to the relative /api path; set VITE_API_URL to silence this warning.'
-  );
-  return '/api';
-};
-
-const API_BASE_URL = getApiBaseUrl();
+  return normalizeUrl('http://localhost:8000/api');
+})();
 
 // Create axios instance
 const api = axios.create({
@@ -94,18 +67,14 @@ export const submitLead = async (leadData: LeadFormData): Promise<Lead> => {
 
 export const login = async (username: string, password: string): Promise<LoginResponse> => {
   const body = new URLSearchParams();
-  body.append('username', username);
-  body.append('password', password);
+  body.set('username', username);
+  body.set('password', password);
 
-  const response = await axios.post<LoginResponse>(
-    `${API_BASE_URL}/admin/login`,
-    body.toString(),
-    {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-    }
-  );
+  const response = await axios.post<LoginResponse>(`${API_BASE_URL}/admin/login`, body, {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  });
   
   return response.data;
 };
