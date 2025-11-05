@@ -5,3 +5,4 @@ __pycache__/
 backend/ml/models/*.joblib
 data/*
 !data/.gitkeep
+.env
