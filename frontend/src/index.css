@@ -151,26 +151,20 @@
 
 /* Form Styles */
 .form-input {
-  @apply w-full px-4 py-3 bg-white/10 border border-white/20 rounded-xl text-white placeholder-gray-400;
-  @apply focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-transparent;
-  @apply backdrop-blur-sm transition-all duration-300;
+  @apply w-full px-4 py-3 bg-white border border-gray-300 rounded-xl text-gray-900 placeholder-gray-500;
+  @apply focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-400;
+  @apply transition-all duration-200;
 }
 
 .form-input:focus {
-  background: rgba(255, 255, 255, 0.15);
-  border-color: rgba(59, 130, 246, 0.5);
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-}
-
-.form-input--light {
-  @apply bg-white text-gray-900 placeholder-gray-500 border border-gray-300;
-  @apply focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-400;
-  @apply backdrop-blur-none;
-}
-
-.form-input--light:focus {
   background: #ffffff;
   color: #111827;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+}
+
+.form-input--inverted {
+  @apply bg-white/10 border border-white/20 text-white placeholder-gray-400;
+  @apply focus:ring-blue-500/50 focus:border-transparent backdrop-blur-sm;
 }
 
 /* Button Styles */

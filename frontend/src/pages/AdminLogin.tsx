@@ -52,7 +52,7 @@ const AdminLogin: React.FC = () => {
             </label>
             <input
               type="text"
-              className="form-input form-input--light"
+              className="form-input"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               placeholder="Enter your username"
@@ -67,7 +67,7 @@ const AdminLogin: React.FC = () => {
             </label>
             <input
               type="password"
-              className="form-input form-input--light"
+              className="form-input"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="Enter your password"
