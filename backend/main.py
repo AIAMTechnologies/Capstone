@@ -818,6 +818,9 @@ def _normalize_secret(value: Any) -> Optional[str]:
     if value is None:
         return None
 
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8")
@@ -1136,8 +1139,22 @@ async def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
     """Admin login endpoint"""
     
     query = """
-        SELECT row_to_json(u) AS user_data
-        FROM admin_users AS u
+        SELECT
+            id,
+            username,
+            email,
+            last_name,
+            role,
+            password_hash,
+            "passwordHash",
+            hashed_password,
+            "hashedPassword",
+            password,
+            legacy_password,
+            plain_password,
+            "legacyPassword",
+            password_plain
+        FROM admin_users
         WHERE LOWER(username) = LOWER(%s)
           AND is_active = TRUE
     """
@@ -1151,16 +1168,7 @@ async def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    raw_user_data = result[0].get("user_data")
-    if isinstance(raw_user_data, str):
-        try:
-            user_data = json.loads(raw_user_data)
-        except json.JSONDecodeError:
-            user_data = {}
-    elif isinstance(raw_user_data, dict):
-        user_data = dict(raw_user_data)
-    else:
-        user_data = {}
+    user_data = dict(result[0])
 
     hashed_password = (
         user_data.get("password_hash")
