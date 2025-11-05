@@ -782,23 +782,36 @@ def verify_password(
 ) -> bool:
     """Verify password against a hash or legacy plain-text value."""
 
+    candidates: List[str] = []
+
     if hashed_password:
         try:
-            if pwd_context.verify(plain_password, hashed_password):
-                return True
-        except Exception as exc:
-            logger.debug("Bcrypt verification failed, falling back to legacy password: %s", exc)
-            try:
-                if hmac.compare_digest(plain_password, str(hashed_password)):
-                    return True
-            except Exception:
-                pass
+            candidates.append(str(hashed_password))
+        except Exception:
+            pass
 
     if legacy_password:
         try:
-            return hmac.compare_digest(plain_password, str(legacy_password))
+            candidate = str(legacy_password)
+            if candidate not in candidates:
+                candidates.append(candidate)
         except Exception:
-            return False
+            pass
+
+    for candidate in candidates:
+        try:
+            if candidate.startswith("$2") or candidate.startswith("$argon") or candidate.startswith("$pbkdf2"):
+                if pwd_context.verify(plain_password, candidate):
+                    return True
+        except Exception as exc:
+            logger.debug("Password hash verification failed for candidate: %s", exc)
+
+    for candidate in candidates:
+        try:
+            if hmac.compare_digest(plain_password, candidate):
+                return True
+        except Exception:
+            continue
 
     return False
 
@@ -1026,7 +1039,7 @@ async def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
     query = """
         SELECT row_to_json(u) AS user_data
         FROM admin_users AS u
-        WHERE username = %s
+        WHERE LOWER(username) = LOWER(%s)
           AND is_active = TRUE
     """
 
@@ -1050,11 +1063,18 @@ async def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
     else:
         user_data = {}
 
-    hashed_password = user_data.get("password_hash")
+    hashed_password = (
+        user_data.get("password_hash")
+        or user_data.get("passwordHash")
+        or user_data.get("hashed_password")
+        or user_data.get("hashedPassword")
+    )
     legacy_password = (
         user_data.get("password")
         or user_data.get("legacy_password")
         or user_data.get("plain_password")
+        or user_data.get("legacyPassword")
+        or user_data.get("password_plain")
     )
 
     if not verify_password(form_data.password, hashed_password, legacy_password):
