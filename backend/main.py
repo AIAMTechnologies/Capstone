@@ -14,6 +14,8 @@
 # requests==2.31.0
 
 import base64
+import binascii
+import hashlib
 import json
 import hmac
 import logging
@@ -31,7 +33,17 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field, validator
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+from passlib.hash import bcrypt as bcrypt_hash
+
+try:  # pragma: no cover - optional dependency
+    from passlib.hash import argon2
+except Exception:  # pragma: no cover
+    argon2 = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    from passlib.hash import pbkdf2_sha256 as pbkdf2_sha256_hash
+except Exception:  # pragma: no cover
+    pbkdf2_sha256_hash = None  # type: ignore
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
@@ -450,7 +462,6 @@ app.add_middleware(
 )
 
 # Security
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login")
 
 # ============================================
@@ -775,6 +786,32 @@ def allocate_lead_to_installer(
 # AUTHENTICATION
 # ============================================
 
+def _verify_pbkdf2_colon_hash(plain_password: str, candidate: str) -> bool:
+    """Verify Flask-style pbkdf2:sha256 hashes."""
+
+    try:
+        header, salt, expected_hash = candidate.split("$", 2)
+        if not header.startswith("pbkdf2:"):
+            return False
+
+        parts = header.split(":")
+        if len(parts) != 3:
+            return False
+
+        _prefix, algorithm, iterations_str = parts
+        iterations = int(iterations_str)
+        dk = hashlib.pbkdf2_hmac(
+            algorithm,
+            plain_password.encode("utf-8"),
+            salt.encode("utf-8"),
+            iterations,
+        )
+        computed = binascii.hexlify(dk).decode("ascii")
+        return hmac.compare_digest(computed, expected_hash)
+    except Exception:
+        return False
+
+
 def verify_password(
     plain_password: str,
     hashed_password: Optional[str],
@@ -782,31 +819,55 @@ def verify_password(
 ) -> bool:
     """Verify password against a hash or legacy plain-text value."""
 
-    candidates: List[str] = []
+    hashed_candidates: List[str] = []
+    plain_candidates: List[str] = []
 
     if hashed_password:
         try:
-            candidates.append(str(hashed_password))
+            value = str(hashed_password).strip()
+            if value:
+                hashed_candidates.append(value)
         except Exception:
             pass
 
     if legacy_password:
         try:
-            candidate = str(legacy_password)
-            if candidate not in candidates:
-                candidates.append(candidate)
+            value = str(legacy_password).strip()
+            if value and value not in plain_candidates:
+                plain_candidates.append(value)
         except Exception:
             pass
 
-    for candidate in candidates:
+    for candidate in hashed_candidates:
         try:
-            if candidate.startswith("$2") or candidate.startswith("$argon") or candidate.startswith("$pbkdf2"):
-                if pwd_context.verify(plain_password, candidate):
+            if candidate.startswith("$2"):
+                if bcrypt_hash.verify(plain_password, candidate):
                     return True
-        except Exception as exc:
-            logger.debug("Password hash verification failed for candidate: %s", exc)
+                continue
 
-    for candidate in candidates:
+            if candidate.startswith("$argon") and argon2 is not None:
+                if argon2.verify(plain_password, candidate):  # type: ignore[arg-type]
+                    return True
+                continue
+
+            if candidate.startswith("pbkdf2_sha256$") and pbkdf2_sha256_hash is not None:
+                if pbkdf2_sha256_hash.verify(plain_password, candidate):  # type: ignore[arg-type]
+                    return True
+                continue
+
+            if candidate.startswith("$pbkdf2-sha256$") and pbkdf2_sha256_hash is not None:
+                if pbkdf2_sha256_hash.verify(plain_password, candidate):  # type: ignore[arg-type]
+                    return True
+                continue
+
+            if candidate.startswith("pbkdf2:"):
+                if _verify_pbkdf2_colon_hash(plain_password, candidate):
+                    return True
+                continue
+        except Exception as exc:
+            logger.debug("Password hash verification failed for candidate '%s': %s", candidate, exc)
+
+    for candidate in plain_candidates + hashed_candidates:
         try:
             if hmac.compare_digest(plain_password, candidate):
                 return True
