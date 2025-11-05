@@ -58,6 +58,7 @@ const AdminLogin: React.FC = () => {
               placeholder="Enter your username"
               required
               autoFocus
+              style={{ color: '#111827' }}
             />
           </div>
 
@@ -72,6 +73,7 @@ const AdminLogin: React.FC = () => {
               onChange={(e) => setPassword(e.target.value)}
               placeholder="Enter your password"
               required
+              style={{ color: '#111827' }}
             />
           </div>
 

@@ -93,13 +93,13 @@ export const submitLead = async (leadData: LeadFormData): Promise<Lead> => {
 // ============================================
 
 export const login = async (username: string, password: string): Promise<LoginResponse> => {
-  const formData = new FormData();
-  formData.append('username', username);
-  formData.append('password', password);
-  
+  const body = new URLSearchParams();
+  body.append('username', username);
+  body.append('password', password);
+
   const response = await axios.post<LoginResponse>(
-    `${API_BASE_URL}/admin/login`, 
-    formData,
+    `${API_BASE_URL}/admin/login`,
+    body.toString(),
     {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',

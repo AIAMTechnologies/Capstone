@@ -14,6 +14,7 @@
 # requests==2.31.0
 
 import base64
+import hmac
 import logging
 import os
 import pickle
@@ -774,8 +775,17 @@ def allocate_lead_to_installer(
 # ============================================
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password against hash"""
-    return pwd_context.verify(plain_password, hashed_password)
+    """Verify password against hash or fallback to direct comparison."""
+
+    if not hashed_password:
+        return False
+
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception:
+        # Some existing databases might store admin passwords in plain text.
+        # Fall back to a constant-time comparison to remain compatible.
+        return hmac.compare_digest(plain_password, str(hashed_password))
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Create JWT access token"""
