@@ -1,71 +1,46 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 
-export default defineConfig(({ mode }) => {
+export default ({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
-  const rawTarget = env.VITE_API_URL?.trim();
-  const normalizedTarget = rawTarget ? rawTarget.replace(/\/+$/, "") : undefined;
+  const rawTarget = (env.VITE_API_URL || "").trim();
+  const hasExplicitTarget = rawTarget.length > 0;
+  const normalizedTarget = hasExplicitTarget ? rawTarget.replace(/\/+$/, "") : "";
+  const targetIncludesApiSuffix = normalizedTarget.toLowerCase().endsWith("/api");
 
-  const usingExplicitTarget = Boolean(normalizedTarget);
-  const targetIncludesApiSuffix = normalizedTarget ? /\/api$/i.test(normalizedTarget) : false;
-
-  const proxyTarget = normalizedTarget
+  const proxyTarget = hasExplicitTarget
     ? targetIncludesApiSuffix
       ? normalizedTarget
       : `${normalizedTarget}/api`
-    : undefined;
+    : "";
 
-  const proxyConfig = proxyTarget
+  const proxy = hasExplicitTarget
     ? {
         "/api": {
           target: proxyTarget,
           changeOrigin: true,
           rewrite: targetIncludesApiSuffix
-            ? (path: string) => path.replace(/^\/api/, "")
+            ? (path) => path.replace(/^\/api/, "")
             : undefined,
         },
       }
     : undefined;
 
-  if (!usingExplicitTarget) {
+  if (!hasExplicitTarget) {
     console.info(
       "VITE_API_URL is not defined. The dev server will proxy API requests to the same origin; set VITE_API_URL if you need to target a remote backend."
     );
   }
 
-  return {
-    plugins: [react()],
-    server: {
-      port: 3000,
-      proxy: proxyConfig,
-export default ({ mode }: { mode: string }) => {
-  const env = loadEnv(mode, process.cwd(), "");
-  const target = env.VITE_API_URL;
-
-  if (!target) {
-    throw new Error(
-      "VITE_API_URL is not defined. Set it to the backend API base URL (including the /api prefix)."
-    );
-  }
-
-  const normalizedTarget = target.replace(/\/+$/, "");
-
   return defineConfig({
     plugins: [react()],
     server: {
       port: 3000,
-      proxy: {
-        "/api": {
-          target: normalizedTarget,
-          changeOrigin: true,
-        },
-      },
+      proxy,
     },
     build: {
       outDir: "dist",
       sourcemap: true,
     },
-  };
-});
   });
 };

@@ -91,11 +91,6 @@ class Settings:
             )
 
         self.DATABASE_URL = supabase_url
-        supabase_url = os.getenv("SUPABASE_DB_URL")
-        self.DATABASE_URL = supabase_url or os.getenv(
-            "DATABASE_URL",
-            "postgresql://postgres:4567@localhost:5432/capstone25",
-        )
 
         self.DB_SSLMODE = os.getenv("DB_SSLMODE")
         if not self.DB_SSLMODE and self.DATABASE_URL and "supabase.co" in self.DATABASE_URL:
