@@ -812,6 +812,52 @@ def _verify_pbkdf2_colon_hash(plain_password: str, candidate: str) -> bool:
         return False
 
 
+def _normalize_secret(value: Any) -> Optional[str]:
+    """Return a normalized secret string for password comparison."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            try:
+                return value.decode("latin1")
+            except Exception:
+                return None
+
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+
+    if not text:
+        return None
+
+    # Supabase/Postgres can return bytea columns as "\\x"-prefixed hex strings
+    if text.startswith("\\x") and len(text) > 2:
+        hex_payload = text[2:]
+        try:
+            decoded = bytes.fromhex(hex_payload)
+            return decoded.decode("utf-8")
+        except Exception:
+            # Fall back to returning the original text if decoding fails
+            pass
+
+    # Some clients may have stored base64-encoded secrets
+    if not text.startswith("$") and all(c.isalnum() or c in "+/=\n\r" for c in text):
+        try:
+            decoded_bytes = base64.b64decode(text, validate=True)
+            decoded_text = decoded_bytes.decode("utf-8")
+            if decoded_text.startswith("$"):
+                return decoded_text
+        except Exception:
+            pass
+
+    return text
+
+
 def verify_password(
     plain_password: str,
     hashed_password: Optional[str],
@@ -822,21 +868,13 @@ def verify_password(
     hashed_candidates: List[str] = []
     plain_candidates: List[str] = []
 
-    if hashed_password:
-        try:
-            value = str(hashed_password).strip()
-            if value:
-                hashed_candidates.append(value)
-        except Exception:
-            pass
+    normalized_hash = _normalize_secret(hashed_password)
+    if normalized_hash:
+        hashed_candidates.append(normalized_hash)
 
-    if legacy_password:
-        try:
-            value = str(legacy_password).strip()
-            if value and value not in plain_candidates:
-                plain_candidates.append(value)
-        except Exception:
-            pass
+    normalized_plain = _normalize_secret(legacy_password)
+    if normalized_plain:
+        plain_candidates.append(normalized_plain)
 
     for candidate in hashed_candidates:
         try:
