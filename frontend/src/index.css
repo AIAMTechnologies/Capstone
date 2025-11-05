@@ -162,6 +162,17 @@
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
 }
 
+.form-input--light {
+  @apply bg-white text-gray-900 placeholder-gray-500 border border-gray-300;
+  @apply focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-400;
+  @apply backdrop-blur-none;
+}
+
+.form-input--light:focus {
+  background: #ffffff;
+  color: #111827;
+}
+
 /* Button Styles */
 .btn-primary {
   @apply bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700;

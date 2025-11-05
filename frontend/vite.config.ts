@@ -24,11 +24,16 @@ export default defineConfig(({ mode }) => {
             : undefined,
         },
       }
-    : undefined;
+    : {
+        "/api": {
+          target: "http://localhost:8000",
+          changeOrigin: true,
+        },
+      };
 
   if (!hasExplicitTarget) {
     console.info(
-      "VITE_API_URL is not defined. The dev server will proxy API requests to the same origin; set VITE_API_URL if you need to target a remote backend."
+      "VITE_API_URL is not defined. The dev server will proxy API requests to http://localhost:8000; set VITE_API_URL to target a remote backend."
     );
   }
 

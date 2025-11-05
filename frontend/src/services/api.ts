@@ -11,6 +11,8 @@ import type {
 
 const normalizeUrl = (url: string) => url.replace(/\/+$/, '');
 
+const LOCAL_DEV_API = 'http://localhost:8000/api';
+
 const getApiBaseUrl = (): string => {
   const rawApiUrl = import.meta.env.VITE_API_URL?.trim();
 
@@ -18,11 +20,22 @@ const getApiBaseUrl = (): string => {
     return normalizeUrl(rawApiUrl);
   }
 
-  if (typeof window !== 'undefined' && window.location?.origin) {
-    console.warn(
-      'VITE_API_URL is not defined. Falling back to the current origin for API requests; set VITE_API_URL to silence this warning.'
-    );
-    return `${normalizeUrl(window.location.origin)}/api`;
+  if (typeof window !== 'undefined') {
+    const { origin, hostname } = window.location;
+
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      console.warn(
+        'VITE_API_URL is not defined. Using the local backend at http://localhost:8000/api; set VITE_API_URL to silence this warning.'
+      );
+      return normalizeUrl(LOCAL_DEV_API);
+    }
+
+    if (origin) {
+      console.warn(
+        'VITE_API_URL is not defined. Falling back to the current origin for API requests; set VITE_API_URL to silence this warning.'
+      );
+      return `${normalizeUrl(origin)}/api`;
+    }
   }
 
   console.warn(
