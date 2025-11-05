@@ -99,16 +99,6 @@ class Settings:
         self.ALGORITHM = "HS256"
         self.ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
 
-        # Supabase API keys
-        self.SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
-        self.SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
-
-        if not self.SUPABASE_PUBLISHABLE_KEY or not self.SUPABASE_SECRET_KEY:
-            logging.getLogger("lead_scoring").warning(
-                "Supabase API keys are not configured. Set SUPABASE_PUBLISHABLE_KEY and "
-                "SUPABASE_SECRET_KEY in the environment or .env file."
-            )
-
         # Geocoding API (Google Maps or alternative)
         self.GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
         self.GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
