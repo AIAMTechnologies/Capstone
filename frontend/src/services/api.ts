@@ -9,7 +9,15 @@ import type {
   Installer
 } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
+const rawApiUrl = import.meta.env.VITE_API_URL;
+
+if (!rawApiUrl) {
+  throw new Error(
+    'VITE_API_URL is not defined. Set it to the backend API base URL in your environment configuration.'
+  );
+}
+
+const API_BASE_URL = rawApiUrl.replace(/\/+$/, '');
 
 // Create axios instance
 const api = axios.create({
