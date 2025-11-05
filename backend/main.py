@@ -44,6 +44,15 @@ try:  # pragma: no cover - optional dependency
     from passlib.hash import pbkdf2_sha256 as pbkdf2_sha256_hash
 except Exception:  # pragma: no cover
     pbkdf2_sha256_hash = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    from argon2 import PasswordHasher
+    from argon2 import exceptions as argon2_exceptions
+except Exception:  # pragma: no cover
+    PasswordHasher = None  # type: ignore
+    argon2_exceptions = None  # type: ignore
+
+argon2_password_hasher = PasswordHasher() if PasswordHasher is not None else None
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
@@ -861,35 +870,108 @@ def _normalize_secret(value: Any) -> Optional[str]:
     return text
 
 
-def verify_password(
-    plain_password: str,
-    hashed_password: Optional[str],
-    legacy_password: Optional[str] = None,
-) -> bool:
-    """Verify password against a hash or legacy plain-text value."""
+def _looks_like_hashed_secret(value: str) -> bool:
+    """Heuristically determine whether the provided value is a password hash."""
+
+    lowered = value.lower()
+    if lowered.startswith("$2"):
+        return True  # bcrypt variants
+    if lowered.startswith("$argon") or lowered.startswith("argon2"):
+        return True
+    if lowered.startswith("pbkdf2:"):
+        return True
+    if lowered.startswith("pbkdf2_sha256$") or lowered.startswith("$pbkdf2-sha256$"):
+        return True
+    if lowered.startswith("scrypt$") or lowered.startswith("$scrypt$"):
+        return True
+    if lowered.startswith("sha256$") or lowered.startswith("$sha256$"):
+        return True
+    if value.count("$") >= 2 and len(value) > 20:
+        return True
+    return False
+
+
+def _extend_candidates(
+    raw_value: Any,
+    hashed_candidates: List[str],
+    plain_candidates: List[str],
+) -> None:
+    """Normalize a raw password representation and categorize it."""
+
+    normalized = _normalize_secret(raw_value)
+    if not normalized:
+        return
+
+    candidate = normalized.strip()
+    if not candidate:
+        return
+
+    # Handle JSON-encoded payloads that may include multiple secret representations
+    if (candidate.startswith("{") and candidate.endswith("}")) or (
+        candidate.startswith("[") and candidate.endswith("]")
+    ):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            for value in parsed.values():
+                _extend_candidates(value, hashed_candidates, plain_candidates)
+            return
+        if isinstance(parsed, list):
+            for value in parsed:
+                _extend_candidates(value, hashed_candidates, plain_candidates)
+            return
+
+    if _looks_like_hashed_secret(candidate):
+        hashed_candidates.append(candidate)
+    else:
+        plain_candidates.append(candidate)
+
+
+def verify_password(plain_password: str, *raw_candidates: Any) -> bool:
+    """Verify password against hashed and legacy representations."""
 
     hashed_candidates: List[str] = []
     plain_candidates: List[str] = []
 
-    normalized_hash = _normalize_secret(hashed_password)
-    if normalized_hash:
-        hashed_candidates.append(normalized_hash)
+    for raw_value in raw_candidates:
+        _extend_candidates(raw_value, hashed_candidates, plain_candidates)
 
-    normalized_plain = _normalize_secret(legacy_password)
-    if normalized_plain:
-        plain_candidates.append(normalized_plain)
+    # Deduplicate while preserving order
+    hashed_candidates = list(dict.fromkeys(hashed_candidates))
+    plain_candidates = list(dict.fromkeys(plain_candidates))
 
     for candidate in hashed_candidates:
         try:
+            lowered = candidate.lower()
             if candidate.startswith("$2"):
                 if bcrypt_hash.verify(plain_password, candidate):
                     return True
                 continue
 
-            if candidate.startswith("$argon") and argon2 is not None:
+            if (candidate.startswith("$argon") or lowered.startswith("argon2")) and argon2 is not None:
                 if argon2.verify(plain_password, candidate):  # type: ignore[arg-type]
                     return True
                 continue
+
+            if (
+                (candidate.startswith("$argon") or lowered.startswith("argon2"))
+                and argon2_password_hasher is not None
+            ):
+                try:
+                    argon2_password_hasher.verify(candidate, plain_password)  # type: ignore[arg-type]
+                    return True
+                except Exception as exc:
+                    if argon2_exceptions is not None and isinstance(
+                        exc,
+                        (
+                            argon2_exceptions.VerifyMismatchError,
+                            argon2_exceptions.InvalidHash,
+                        ),
+                    ):
+                        continue
+                    raise
 
             if candidate.startswith("pbkdf2_sha256$") and pbkdf2_sha256_hash is not None:
                 if pbkdf2_sha256_hash.verify(plain_password, candidate):  # type: ignore[arg-type]
@@ -901,9 +983,32 @@ def verify_password(
                     return True
                 continue
 
-            if candidate.startswith("pbkdf2:"):
+            if lowered.startswith("pbkdf2:"):
                 if _verify_pbkdf2_colon_hash(plain_password, candidate):
                     return True
+                continue
+
+            if lowered.startswith("scrypt$"):
+                try:
+                    _algorithm, n_str, r_str, p_str, salt, expected = candidate.split("$", 5)
+                    derived = hashlib.scrypt(
+                        plain_password.encode("utf-8"),
+                        salt=salt.encode("utf-8"),
+                        n=int(n_str),
+                        r=int(r_str),
+                        p=int(p_str),
+                    )
+                    if hmac.compare_digest(
+                        binascii.b2a_base64(derived, newline=False).decode("ascii"),
+                        expected,
+                    ):
+                        return True
+                except Exception as exc:
+                    logger.debug(
+                        "Password scrypt verification failed for candidate '%s': %s",
+                        candidate,
+                        exc,
+                    )
                 continue
         except Exception as exc:
             logger.debug("Password hash verification failed for candidate '%s': %s", candidate, exc)
@@ -1170,21 +1275,13 @@ async def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
 
     user_data = dict(result[0])
 
-    hashed_password = (
-        user_data.get("password_hash")
-        or user_data.get("passwordHash")
-        or user_data.get("hashed_password")
-        or user_data.get("hashedPassword")
-    )
-    legacy_password = (
-        user_data.get("password")
-        or user_data.get("legacy_password")
-        or user_data.get("plain_password")
-        or user_data.get("legacyPassword")
-        or user_data.get("password_plain")
-    )
+    password_fields = [
+        value
+        for key, value in user_data.items()
+        if "password" in key.lower()
+    ]
 
-    if not verify_password(form_data.password, hashed_password, legacy_password):
+    if not verify_password(form_data.password, *password_fields):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
