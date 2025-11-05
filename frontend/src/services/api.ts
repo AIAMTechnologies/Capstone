@@ -9,29 +9,15 @@ import type {
   Installer
 } from '../types';
 
-const rawApiUrl = import.meta.env.VITE_API_URL?.trim();
+const rawApiUrl = import.meta.env.VITE_API_URL;
 
-const normalizeUrl = (url: string) => url.replace(/\/+$/, '');
-
-let apiBaseUrl = rawApiUrl ? normalizeUrl(rawApiUrl) : undefined;
-
-if (!apiBaseUrl && typeof window !== 'undefined') {
-  const windowOrigin = window.location.origin;
-  if (windowOrigin) {
-    apiBaseUrl = `${normalizeUrl(windowOrigin)}/api`;
-    console.warn(
-      'VITE_API_URL is not defined. Falling back to the current origin for API requests; set VITE_API_URL to silence this warning.'
-    );
-  }
-}
-
-if (!apiBaseUrl) {
+if (!rawApiUrl) {
   throw new Error(
-    'VITE_API_URL is not defined and no browser origin is available. Set VITE_API_URL to the backend API base URL.'
+    'VITE_API_URL is not defined. Set it to the backend API base URL in your environment configuration.'
   );
 }
 
-const API_BASE_URL = apiBaseUrl;
+const API_BASE_URL = rawApiUrl.replace(/\/+$/, '');
 
 // Create axios instance
 const api = axios.create({
