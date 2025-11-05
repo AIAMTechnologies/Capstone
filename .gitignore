@@ -2,7 +2,7 @@
 node_modules/
 __pycache__/
 *.pyc
-.env
 backend/ml/models/*.joblib
 data/*
 !data/.gitkeep
+.env

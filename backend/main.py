@@ -13,6 +13,7 @@
 # python-multipart==0.0.6
 # requests==2.31.0
 
+import base64
 import logging
 import os
 import pickle
@@ -22,6 +23,7 @@ from math import radians, sin, cos, sqrt, atan2
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from io import BytesIO
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,23 +34,103 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 
+try:  # pragma: no cover - optional dependency
+    import joblib  # type: ignore
+except Exception:  # pragma: no cover - joblib is optional at runtime
+    joblib = None  # type: ignore
+
+
+def _load_env_file() -> None:
+    """Populate os.environ with key/value pairs from the project .env file.
+
+    The backend expects connection credentials (such as SUPABASE_DB_URL) to be
+    available as environment variables. When developers store them in a local
+    .env file we need to load it explicitly so imports during app start pick up
+    the values.
+    """
+
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        with env_path.open("r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+
+                value = value.strip()
+                if (value.startswith('"') and value.endswith('"')) or (
+                    value.startswith("'") and value.endswith("'")
+                ):
+                    value = value[1:-1]
+
+                # Do not overwrite variables that are already set in the
+                # process environment.
+                os.environ.setdefault(key, value)
+    except OSError as exc:
+        logging.getLogger("lead_scoring").warning("Failed to load .env: %s", exc)
+
+
+_load_env_file()
+
 # ============================================
 # CONFIGURATION
 # ============================================
 
 class Settings:
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:4567@localhost:5432/capstone25")
-    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
-    ALGORITHM = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
-    
-    # Geocoding API (Google Maps or alternative)
-    GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
-    GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
+    def __init__(self) -> None:
+        # Database configuration
+        supabase_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
+        if not supabase_url:
+            raise RuntimeError(
+                "Supabase database URL is not configured. Set SUPABASE_DB_URL "
+                "(or DATABASE_URL) in the environment or .env file."
+            )
 
-    MODEL_ARTIFACT_DEFAULT = Path(__file__).resolve().parent / "model_artifacts" / "lead_scoring_pipeline.pkl"
-    LEAD_MODEL_PATH = os.getenv("LEAD_MODEL_PATH", str(MODEL_ARTIFACT_DEFAULT))
-    LEAD_SCORE_THRESHOLD = float(os.getenv("LEAD_SCORE_THRESHOLD", "0.5"))
+        self.DATABASE_URL = supabase_url
+
+        self.DB_SSLMODE = os.getenv("DB_SSLMODE")
+        if not self.DB_SSLMODE and self.DATABASE_URL and "supabase.co" in self.DATABASE_URL:
+            # Supabase requires SSL connections by default
+            self.DB_SSLMODE = "require"
+
+        # Security / auth configuration
+        self.SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+        self.ALGORITHM = "HS256"
+        self.ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
+
+        # Supabase API keys
+        self.SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
+        self.SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
+
+        if not self.SUPABASE_PUBLISHABLE_KEY or not self.SUPABASE_SECRET_KEY:
+            logging.getLogger("lead_scoring").warning(
+                "Supabase API keys are not configured. Set SUPABASE_PUBLISHABLE_KEY and "
+                "SUPABASE_SECRET_KEY in the environment or .env file."
+            )
+
+        # Geocoding API (Google Maps or alternative)
+        self.GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
+        self.GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
+
+        self.MODEL_ARTIFACT_DEFAULT = (
+            Path(__file__).resolve().parent
+            / "ml"
+            / "models"
+            / "lead_conversion_model.joblib.base64"
+        )
+        self.LEAD_MODEL_PATH = os.getenv("LEAD_MODEL_PATH", str(self.MODEL_ARTIFACT_DEFAULT))
+        self.LEAD_SCORE_THRESHOLD = float(os.getenv("LEAD_SCORE_THRESHOLD", "0.5"))
 
 settings = Settings()
 
@@ -139,32 +221,82 @@ def _extract_probability_row(probabilities: Any) -> Optional[List[float]]:
         return None
 
 
+def _resolve_artifact_path(configured_path: str) -> Path:
+    """Resolve the configured artifact path to an existing file when possible."""
+
+    candidates = []
+    raw_path = Path(configured_path).expanduser()
+    candidates.append(raw_path)
+
+    if not raw_path.is_absolute():
+        backend_dir = Path(__file__).resolve().parent
+        project_root = backend_dir.parent
+        candidates.append(backend_dir / raw_path)
+        candidates.append(project_root / raw_path)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    # Fall back to the first candidate even if it does not currently exist so
+    # the warning message reflects the intended location.
+    return candidates[0].resolve()
+
+
+def _deserialize_artifact_bytes(raw_bytes: bytes) -> Any:
+    """Deserialize model artifacts using joblib when available, otherwise pickle."""
+
+    if joblib is not None:  # pragma: no branch - best effort joblib usage
+        try:
+            return joblib.load(BytesIO(raw_bytes))
+        except Exception as exc:
+            logger.debug("joblib failed to load artifact: %s", exc)
+
+    try:
+        return pickle.loads(raw_bytes)
+    except Exception:
+        buffer = BytesIO(raw_bytes)
+        buffer.seek(0)
+        return pickle.load(buffer)
+
+
+def _load_artifact_from_path(artifact_path: Path) -> Optional[Any]:
+    """Read the configured artifact file, handling base64-encoded payloads."""
+
+    try:
+        if artifact_path.suffix.lower() == ".base64":
+            encoded = artifact_path.read_text(encoding="utf-8")
+            raw_bytes = base64.b64decode(encoded)
+        else:
+            raw_bytes = artifact_path.read_bytes()
+    except FileNotFoundError:
+        logger.warning("Lead scoring model not found at %s", artifact_path)
+        return None
+    except Exception as exc:
+        logger.error("Failed to read lead scoring model from %s: %s", artifact_path, exc)
+        return None
+
+    try:
+        return _deserialize_artifact_bytes(raw_bytes)
+    except Exception as exc:
+        logger.error("Failed to deserialize lead scoring model from %s: %s", artifact_path, exc)
+        return None
+
+
 def load_lead_scoring_artifact() -> None:
     """Load serialized lead scoring assets into memory."""
 
     global lead_scoring_pipeline, lead_scoring_model, lead_scoring_preprocessor
     global lead_scoring_metadata, lead_scoring_loaded
 
-    artifact_path = Path(settings.LEAD_MODEL_PATH)
+    artifact_path = _resolve_artifact_path(settings.LEAD_MODEL_PATH)
 
-    if not artifact_path.exists():
-        logger.warning("Lead scoring model not found at %s", artifact_path)
+    artifact = _load_artifact_from_path(artifact_path)
+    if artifact is None:
         lead_scoring_pipeline = None
         lead_scoring_model = None
         lead_scoring_preprocessor = None
         lead_scoring_metadata = {}
-        lead_scoring_loaded = False
-        return
-
-    try:
-        with artifact_path.open("rb") as artifact_file:
-            artifact = pickle.load(artifact_file)
-    except FileNotFoundError:
-        logger.warning("Lead scoring model not found at %s", artifact_path)
-        lead_scoring_loaded = False
-        return
-    except Exception as exc:
-        logger.error("Failed to load lead scoring model from %s: %s", artifact_path, exc)
         lead_scoring_loaded = False
         return
 
@@ -326,7 +458,14 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login")
 def get_db_connection():
     """Get database connection"""
     try:
-        conn = psycopg2.connect(settings.DATABASE_URL, cursor_factory=RealDictCursor)
+        connect_kwargs = {
+            "dsn": settings.DATABASE_URL,
+            "cursor_factory": RealDictCursor,
+        }
+        if getattr(settings, "DB_SSLMODE", None):
+            connect_kwargs["sslmode"] = settings.DB_SSLMODE
+
+        conn = psycopg2.connect(**connect_kwargs)
         return conn
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
