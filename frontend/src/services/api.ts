@@ -6,7 +6,8 @@ import type {
   LeadsResponse, 
   Lead,
   LeadStatus,
-  Installer
+  Installer,
+  HistoricalDataResponse
 } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
@@ -115,6 +116,20 @@ export const updateLeadStatus = async (
 
 export const getInstallers = async (): Promise<{ installers: Installer[]; count: number }> => {
   const response = await api.get('/admin/installers');
+  return response.data;
+};
+
+export const getHistoricalData = async (
+  limit = 100,
+  offset = 0,
+  status?: string
+): Promise<HistoricalDataResponse> => {
+  const params: any = { limit, offset };
+  if (status && status !== 'all') {
+    params.status = status;
+  }
+  
+  const response = await api.get<HistoricalDataResponse>('/admin/historical-data', { params });
   return response.data;
 };
 

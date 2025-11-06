@@ -679,6 +679,43 @@ async def get_installers(current_user: AdminUser = Depends(get_current_user)):
     installers = execute_query(query)
     return {"installers": installers, "count": len(installers)}
 
+@app.get("/api/admin/historical-data")
+async def get_historical_data(
+    limit: int = 100,
+    offset: int = 0,
+    status: Optional[str] = None,
+    current_user: AdminUser = Depends(get_current_user)
+):
+    """Get historical data records"""
+    
+    if status and status != 'all':
+        query = """
+            SELECT * FROM historical_data
+            WHERE current_status = %s
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """
+        params = (status, limit, offset)
+    else:
+        query = """
+            SELECT * FROM historical_data
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """
+        params = (limit, offset)
+    
+    data = execute_query(query, params)
+    
+    # Get total count
+    count_query = "SELECT COUNT(*) as total FROM historical_data"
+    if status and status != 'all':
+        count_query += " WHERE current_status = %s"
+        total_count = execute_query(count_query, (status,))[0]['total']
+    else:
+        total_count = execute_query(count_query)[0]['total']
+    
+    return {"data": data, "count": len(data), "total": total_count}
+
 # ============================================
 # RUN SERVER
 # ============================================

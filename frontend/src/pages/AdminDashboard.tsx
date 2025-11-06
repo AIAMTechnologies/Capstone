@@ -25,9 +25,9 @@ import {
   Legend,
   ResponsiveContainer
 } from 'recharts';
-import { getDashboardStats, getLeads, updateLeadStatus } from '../services/api';
+import { getDashboardStats, getLeads, updateLeadStatus, getHistoricalData } from '../services/api';
 import { format } from 'date-fns';
-import type { DashboardStats, Lead, LeadStatus } from '../types';
+import type { DashboardStats, Lead, LeadStatus, HistoricalData } from '../types';
 
 const COLORS = ['#3498db', '#27ae60', '#e74c3c', '#f39c12'];
 
@@ -36,6 +36,9 @@ type TabType = 'current' | 'historical' | 'profile';
 const AdminDashboard: React.FC = () => {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [leads, setLeads] = useState<Lead[]>([]);
+  const [historicalData, setHistoricalData] = useState<HistoricalData[]>([]);
+  const [historicalLoading, setHistoricalLoading] = useState<boolean>(false);
+  const [historicalStatusFilter, setHistoricalStatusFilter] = useState<string>('all');
   const [loading, setLoading] = useState<boolean>(true);
   const [statusFilter, setStatusFilter] = useState<LeadStatus | 'all'>('active');
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
@@ -44,6 +47,24 @@ const AdminDashboard: React.FC = () => {
   useEffect(() => {
     loadDashboardData();
   }, [statusFilter]);
+
+  useEffect(() => {
+    if (activeTab === 'historical') {
+      loadHistoricalData();
+    }
+  }, [activeTab, historicalStatusFilter]);
+
+  const loadHistoricalData = async () => {
+    setHistoricalLoading(true);
+    try {
+      const response = await getHistoricalData(100, 0, historicalStatusFilter);
+      setHistoricalData(response.data);
+    } catch (error) {
+      console.error('Error loading historical data:', error);
+    } finally {
+      setHistoricalLoading(false);
+    }
+  };
 
   const loadDashboardData = async () => {
     setLoading(true);
@@ -298,36 +319,121 @@ const AdminDashboard: React.FC = () => {
       {/* Historical Data Tab */}
       {activeTab === 'historical' && (
         <div className="card">
-          <div className="card-header">Historical Lead Data</div>
-          <div style={{ marginBottom: '32px' }}>
-            <ResponsiveContainer width="100%" height={400}>
-              <LineChart data={performanceData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="name" />
-                <YAxis />
-                <Tooltip />
-                <Legend />
-                <Line type="monotone" dataKey="leads" stroke="#3498db" strokeWidth={2} name="Total Leads" />
-                <Line type="monotone" dataKey="converted" stroke="#27ae60" strokeWidth={2} name="Converted" />
-              </LineChart>
-            </ResponsiveContainer>
+          <div className="card-header">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+              <span>Historical Data Records</span>
+              <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                <Filter size={20} />
+                <select
+                  className="form-select"
+                  value={historicalStatusFilter}
+                  onChange={(e) => setHistoricalStatusFilter(e.target.value)}
+                  style={{ width: 'auto', padding: '8px 16px' }}
+                >
+                  <option value="all">All Status</option>
+                  <option value="Won">Won</option>
+                  <option value="Lost">Lost</option>
+                  <option value="Pending">Pending</option>
+                  <option value="In Progress">In Progress</option>
+                </select>
+                <button className="btn btn-outline" style={{ padding: '8px 16px' }}>
+                  <Download size={20} />
+                  Export
+                </button>
+              </div>
+            </div>
           </div>
 
-          <div className="grid grid-3">
-            <div className="card">
-              <h3 style={{ marginBottom: '16px' }}>Last 30 Days</h3>
-              <div className="stat-value" style={{ color: '#3498db' }}>87</div>
-              <p style={{ color: '#7f8c8d' }}>Total Leads</p>
+          {historicalLoading ? (
+            <div style={{ padding: '40px', textAlign: 'center' }}>
+              <div className="spinner"></div>
             </div>
-            <div className="card">
-              <h3 style={{ marginBottom: '16px' }}>Last 90 Days</h3>
-              <div className="stat-value" style={{ color: '#27ae60' }}>243</div>
-              <p style={{ color: '#7f8c8d' }}>Total Leads</p>
+          ) : (
+            <div className="table-container" style={{ overflowX: 'auto' }}>
+              <table className="table" style={{ minWidth: '2000px' }}>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Submit Date</th>
+                    <th>First Name</th>
+                    <th>Last Name</th>
+                    <th>Company</th>
+                    <th>Address</th>
+                    <th>City</th>
+                    <th>Province</th>
+                    <th>Postal</th>
+                    <th>Dealer</th>
+                    <th>Project Type</th>
+                    <th>Product Type</th>
+                    <th>Sq. Footage</th>
+                    <th>Status</th>
+                    <th>Job Won Date</th>
+                    <th>Order Value</th>
+                    <th>Job Lost Date</th>
+                    <th>Reason</th>
+                    <th>Created At</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {historicalData.length === 0 ? (
+                    <tr>
+                      <td colSpan={19} style={{ textAlign: 'center', padding: '40px', color: '#7f8c8d' }}>
+                        No historical data records found
+                      </td>
+                    </tr>
+                  ) : (
+                    historicalData.map((record) => (
+                      <tr key={record.id}>
+                        <td>{record.id}</td>
+                        <td>{record.submit_date ? format(new Date(record.submit_date), 'MMM dd, yyyy') : '-'}</td>
+                        <td>{record.first_name || '-'}</td>
+                        <td>{record.last_name || '-'}</td>
+                        <td>{record.company_name || '-'}</td>
+                        <td style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {record.address1 || '-'}
+                        </td>
+                        <td>{record.city || '-'}</td>
+                        <td>{record.province || '-'}</td>
+                        <td>{record.postal || '-'}</td>
+                        <td>{record.dealer_name || '-'}</td>
+                        <td>{record.project_type || '-'}</td>
+                        <td>{record.product_type || '-'}</td>
+                        <td>{record.square_footage ? record.square_footage.toLocaleString() : '-'}</td>
+                        <td>
+                          <span className={`badge ${
+                            record.current_status === 'Won' ? 'badge-converted' :
+                            record.current_status === 'Lost' ? 'badge-dead' :
+                            'badge-active'
+                          }`}>
+                            {record.current_status || 'Unknown'}
+                          </span>
+                        </td>
+                        <td>{record.job_won_date ? format(new Date(record.job_won_date), 'MMM dd, yyyy') : '-'}</td>
+                        <td>{record.value_of_order ? `$${record.value_of_order.toLocaleString()}` : '-'}</td>
+                        <td>{record.job_lost_date ? format(new Date(record.job_lost_date), 'MMM dd, yyyy') : '-'}</td>
+                        <td style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {record.reason || '-'}
+                        </td>
+                        <td>{format(new Date(record.created_at), 'MMM dd, yyyy')}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
             </div>
-            <div className="card">
-              <h3 style={{ marginBottom: '16px' }}>This Year</h3>
-              <div className="stat-value" style={{ color: '#f39c12' }}>1,247</div>
-              <p style={{ color: '#7f8c8d' }}>Total Leads</p>
+          )}
+
+          <div style={{ padding: '20px', borderTop: '1px solid #e0e0e0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ color: '#7f8c8d' }}>
+              Showing {historicalData.length} records
+            </div>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button className="btn btn-outline" style={{ padding: '8px 16px' }}>
+                Previous
+              </button>
+              <button className="btn btn-outline" style={{ padding: '8px 16px' }}>
+                Next
+              </button>
             </div>
           </div>
         </div>

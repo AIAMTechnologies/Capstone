@@ -84,3 +84,32 @@ export type LeadStatus = 'active' | 'converted' | 'dead';
 export type Province = 
   | 'AB' | 'BC' | 'MB' | 'NB' | 'NL' | 'NS' 
   | 'NT' | 'NU' | 'ON' | 'PE' | 'QC' | 'SK' | 'YT';
+
+export interface HistoricalData {
+  id: number;
+  submit_date?: string;
+  first_name?: string;
+  last_name?: string;
+  company_name?: string;
+  address1?: string;
+  city?: string;
+  province?: string;
+  postal?: string;
+  dealer_name?: string;
+  project_type?: string;
+  product_type?: string;
+  square_footage?: number;
+  current_status?: string;
+  job_won_date?: string;
+  value_of_order?: number;
+  job_lost_date?: string;
+  reason?: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface HistoricalDataResponse {
+  data: HistoricalData[];
+  count: number;
+  total: number;
+}
