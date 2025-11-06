@@ -34,7 +34,8 @@ import requests
 # ============================================
 
 class Settings:
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:4567@localhost:5432/capstone25")
+    #DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:4567@localhost:5432/capstone25")
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://q4gems_admin:890*()iopIOP@capstone25.postgres.database.azure.com:5432/capstone25db")  #Azure specific
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
