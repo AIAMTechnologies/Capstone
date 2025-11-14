@@ -338,7 +338,7 @@ const AdminDashboard: React.FC = () => {
                             }}
                             title="Select alternative installer"
                           >
-                            <option value="">Use ML Choice</option>
+                            <option value="">Other Installers</option>
                             {lead.alternative_installers.map((alt) => (
                               <option key={alt.id} value={alt.id}>
                                 {alt.name} - {alt.city} ({alt.distance_km.toFixed(1)}km, Score: {alt.allocation_score.toFixed(1)})
