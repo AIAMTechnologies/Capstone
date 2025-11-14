@@ -11,17 +11,29 @@ export interface Lead {
   postal_code?: string;
   job_type: 'residential' | 'commercial';
   comments?: string;
-  status: 'active' | 'converted' | 'dead';
+  status: 'active' | 'converted' | 'dead'|'follow_up' ;
   assigned_installer_id?: number;
   assigned_installer_name?: string;
   installer_name?: string;
   installer_city?: string;
   allocation_score?: number;
   distance_to_installer_km?: number;
+  installer_override_id?: number;
+  alternative_installers?: AlternativeInstaller[];
   created_at: string;
   updated_at?: string;
   latitude?: number;
   longitude?: number;
+}
+
+export interface AlternativeInstaller {
+  id: number;
+  name: string;
+  city: string;
+  province: string;
+  distance_km: number;
+  allocation_score: number;
+  active_leads: number;
 }
 
 export interface LeadFormData {
@@ -79,7 +91,7 @@ export interface Installer {
   active_leads?: number;
 }
 
-export type LeadStatus = 'active' | 'converted' | 'dead';
+export type LeadStatus = 'active' | 'converted' | 'dead'| 'follow_up';
 
 export type Province = 
   | 'AB' | 'BC' | 'MB' | 'NB' | 'NL' | 'NS' 

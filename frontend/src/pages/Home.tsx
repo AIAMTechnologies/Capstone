@@ -96,18 +96,51 @@ const Home: React.FC = () => {
             <div>
               <h4 style={styles.footerHeading}>Services</h4>
               <ul style={styles.footerList}>
-                <li>Residential Window Film</li>
-                <li>Commercial Window Film</li>
-                <li>UV Protection</li>
-                <li>Energy Efficiency</li>
+                <li><a 
+      href="https://www.windowfilmcanada.ca/residential-solutions" 
+      style={styles.footerLink}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      3M Residential Window Film
+    </a></li>
+                <li><a 
+      href="https://www.windowfilmcanada.ca/3m-commercial-solutions" 
+      style={styles.footerLink}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      3M Commercial Window Film
+    </a></li>
+                <li><a 
+      href="https://www.windowfilmcanada.ca/graphic-and-architectural-solutions" 
+      style={styles.footerLink}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      3M Graphic & Architectural Solutions Film
+    </a></li>
+                <li><a 
+      href="https://www.windowfilmcanada.ca/project-gallery" 
+      style={styles.footerLink}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      Explore our Projects 
+    </a></li>
               </ul>
             </div>
             <div>
               <h4 style={styles.footerHeading}>Contact</h4>
               <p style={styles.footerText}>
-                Email: info@windowfilmcanada.com<br />
-                Phone: 1-800-XXX-XXXX
-              </p>
+ <a 
+    href="mailto:rodney.mbaguta.m@gmail.com" 
+    style={styles.footerLink}
+  >
+    info@windowfilmcanada.com
+  </a> <br />
+  1-800-XXX-XXXX
+</p>
             </div>
           </div>
           <div style={styles.copyright}>
@@ -121,7 +154,7 @@ const Home: React.FC = () => {
 
 const styles = {
   hero: {
-    background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+    background: 'black',
     color: 'white',
     padding: '80px 0',
     textAlign: 'center' as const,
@@ -192,6 +225,21 @@ const styles = {
     padding: 0,
     margin: 0,
   },
+  footerLink: {
+  color: 'white',
+  textDecoration: 'none',
+  fontSize: '14px',
+  lineHeight: '2',
+  opacity: 0.8,
+  transition: 'opacity 0.2s',
+  display: 'block',
+} as const,
+footerEmailLink: {
+  color: 'inherit',
+  textDecoration: 'underline',
+  opacity: 0.8,
+  transition: 'opacity 0.2s',
+} as const,
   copyright: {
     textAlign: 'center' as const,
     marginTop: '32px',

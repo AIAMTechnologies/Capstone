@@ -8,7 +8,8 @@ import {
   Award,
   Filter,
   Download,
-  Eye
+  Eye,
+  User
 } from 'lucide-react';
 import {
   BarChart,
@@ -25,9 +26,15 @@ import {
   Legend,
   ResponsiveContainer
 } from 'recharts';
-import { getDashboardStats, getLeads, updateLeadStatus, getHistoricalData } from '../services/api';
+import { 
+  getDashboardStats, 
+  getLeads, 
+  updateLeadStatus, 
+  updateInstallerOverride,
+  getHistoricalData 
+} from '../services/api';
 import { format } from 'date-fns';
-import type { DashboardStats, Lead, LeadStatus, HistoricalData } from '../types';
+import type { DashboardStats, Lead, LeadStatus, HistoricalData, AlternativeInstaller } from '../types';
 
 const COLORS = ['#3498db', '#27ae60', '#e74c3c', '#f39c12'];
 
@@ -83,7 +90,7 @@ const AdminDashboard: React.FC = () => {
     }
   };
 
-  const handleStatusChange = async (leadId, newStatus) => {
+  const handleStatusChange = async (leadId: number, newStatus: LeadStatus) => {
     try {
       await updateLeadStatus(leadId, newStatus);
       loadDashboardData();
@@ -92,13 +99,28 @@ const AdminDashboard: React.FC = () => {
     }
   };
 
+  const handleInstallerOverride = async (leadId: number, installerId: number | null) => {
+    try {
+      await updateInstallerOverride(leadId, installerId);
+      loadDashboardData();
+    } catch (error) {
+      console.error('Error updating installer override:', error);
+      alert('Failed to update installer assignment');
+    }
+  };
+
   const getStatusBadgeClass = (status: LeadStatus): string => {
     const classes = {
       active: 'badge-active',
       converted: 'badge-converted',
-      dead: 'badge-dead'
+      dead: 'badge-dead',
+      follow_up: 'badge-follow_up',
     };
     return `badge ${classes[status] || 'badge-active'}`;
+  };
+
+  const formatStatus = (status: LeadStatus): string => {
+    return status === 'follow_up' ? 'Follow Up' : status.charAt(0).toUpperCase() + status.slice(1);
   };
 
   if (loading && !stats) {
@@ -112,6 +134,7 @@ const AdminDashboard: React.FC = () => {
     { name: 'Assigned', value: stats.assigned_leads }
   ] : [];
 
+  //change this to reflect real performance data
   const performanceData = [
     { name: 'Week 1', leads: 12, converted: 5 },
     { name: 'Week 2', leads: 19, converted: 8 },
@@ -165,7 +188,7 @@ const AdminDashboard: React.FC = () => {
                 <Clock size={32} />
               </div>
               <div className="stat-value">{stats?.pending_leads || 0}</div>
-              <div className="stat-label">Pending</div>
+              <div className="stat-label">Active</div>
             </div>
 
             <div className="stat-card success">
@@ -243,6 +266,7 @@ const AdminDashboard: React.FC = () => {
                     <option value="active">Active</option>
                     <option value="converted">Converted</option>
                     <option value="dead">Dead</option>
+                    <option value="follow_up">Follow Up</option>
                   </select>
                   <button className="btn btn-outline" style={{ padding: '8px 16px' }}>
                     <Download size={20} />
@@ -252,8 +276,8 @@ const AdminDashboard: React.FC = () => {
               </div>
             </div>
 
-            <div className="table-container">
-              <table className="table">
+            <div className="table-container" style={{ overflowX: 'auto' }}>
+              <table className="table" style={{ minWidth: '1400px' }}>
                 <thead>
                   <tr>
                     <th>ID</th>
@@ -263,8 +287,9 @@ const AdminDashboard: React.FC = () => {
                     <th>City</th>
                     <th>Job Type</th>
                     <th>Status</th>
-                    <th>Installer</th>
+                    <th>Installer (ML)</th>
                     <th>Score</th>
+                    <th style={{ minWidth: '200px' }}>Alternative Options</th>
                     <th>Date</th>
                     <th>Actions</th>
                   </tr>
@@ -280,11 +305,52 @@ const AdminDashboard: React.FC = () => {
                       <td style={{ textTransform: 'capitalize' }}>{lead.job_type}</td>
                       <td>
                         <span className={getStatusBadgeClass(lead.status)}>
-                          {lead.status}
+                          {formatStatus(lead.status)}
                         </span>
                       </td>
-                      <td>{lead.installer_name || 'Unassigned'}</td>
+                      <td>
+                        <div style={{ fontSize: '14px' }}>
+                          <div style={{ fontWeight: '600', color: '#2c3e50' }}>
+                            {lead.installer_name || 'Unassigned'}
+                          </div>
+                          {lead.installer_city && (
+                            <div style={{ fontSize: '12px', color: '#7f8c8d' }}>
+                              {lead.installer_city}
+                            </div>
+                          )}
+                        </div>
+                      </td>
                       <td>{lead.allocation_score ? lead.allocation_score.toFixed(1) : 'N/A'}</td>
+                      <td>
+                        {lead.alternative_installers && lead.alternative_installers.length > 0 ? (
+                          <select
+                            className="form-select"
+                            value={lead.installer_override_id || ''}
+                            onChange={(e) => {
+                              const installerId = e.target.value ? Number(e.target.value) : null;
+                              handleInstallerOverride(lead.id, installerId);
+                            }}
+                            style={{ 
+                              width: '100%', 
+                              padding: '4px 8px', 
+                              fontSize: '13px',
+                              minWidth: '180px'
+                            }}
+                            title="Select alternative installer"
+                          >
+                            <option value="">Use ML Choice</option>
+                            {lead.alternative_installers.map((alt) => (
+                              <option key={alt.id} value={alt.id}>
+                                {alt.name} - {alt.city} ({alt.distance_km.toFixed(1)}km, Score: {alt.allocation_score.toFixed(1)})
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span style={{ fontSize: '12px', color: '#95a5a6' }}>
+                            No alternatives
+                          </span>
+                        )}
+                      </td>
                       <td>{format(new Date(lead.created_at), 'MMM dd, yyyy')}</td>
                       <td>
                         <div style={{ display: 'flex', gap: '8px' }}>
@@ -297,6 +363,7 @@ const AdminDashboard: React.FC = () => {
                             <option value="active">Active</option>
                             <option value="converted">Converted</option>
                             <option value="dead">Dead</option>
+                            <option value="follow_up">Follow Up</option>
                           </select>
                           <button
                             className="btn btn-outline"
@@ -331,10 +398,12 @@ const AdminDashboard: React.FC = () => {
                   style={{ width: 'auto', padding: '8px 16px' }}
                 >
                   <option value="all">All Status</option>
-                  <option value="Won">Won</option>
-                  <option value="Lost">Lost</option>
-                  <option value="Pending">Pending</option>
-                  <option value="In Progress">In Progress</option>
+                  <option value="converted">Converted Sale</option>
+                  <option value="New">New</option>
+                  <option value="Dead Lead">Dead Lead</option>
+                  <option value="Follow Up">Follow Up</option>
+                  <option value="Called">Called</option>
+                  <option value="Client reviewing">Client reviewing</option>
                 </select>
                 <button className="btn btn-outline" style={{ padding: '8px 16px' }}>
                   <Download size={20} />
@@ -349,62 +418,44 @@ const AdminDashboard: React.FC = () => {
               <div className="spinner"></div>
             </div>
           ) : (
-            <div className="table-container" style={{ overflowX: 'auto' }}>
-              <table className="table" style={{ minWidth: '2000px' }}>
+            <div className="table-container">
+              <table className="table">
                 <thead>
                   <tr>
                     <th>ID</th>
                     <th>Submit Date</th>
-                    <th>First Name</th>
-                    <th>Last Name</th>
+                    <th>Name</th>
                     <th>Company</th>
-                    <th>Address</th>
                     <th>City</th>
-                    <th>Province</th>
-                    <th>Postal</th>
                     <th>Dealer</th>
                     <th>Project Type</th>
-                    <th>Product Type</th>
-                    <th>Sq. Footage</th>
                     <th>Status</th>
-                    <th>Job Won Date</th>
-                    <th>Order Value</th>
-                    <th>Job Lost Date</th>
+                    <th>Job Won</th>
+                    <th>Value</th>
+                    <th>Job Lost</th>
                     <th>Reason</th>
-                    <th>Created At</th>
+                    <th>Created</th>
                   </tr>
                 </thead>
                 <tbody>
                   {historicalData.length === 0 ? (
                     <tr>
-                      <td colSpan={19} style={{ textAlign: 'center', padding: '40px', color: '#7f8c8d' }}>
-                        No historical data records found
+                      <td colSpan={13} style={{ textAlign: 'center', padding: '40px', color: '#7f8c8d' }}>
+                        No historical data found
                       </td>
                     </tr>
                   ) : (
                     historicalData.map((record) => (
                       <tr key={record.id}>
-                        <td>{record.id}</td>
+                        <td>#{record.id}</td>
                         <td>{record.submit_date ? format(new Date(record.submit_date), 'MMM dd, yyyy') : '-'}</td>
-                        <td>{record.first_name || '-'}</td>
-                        <td>{record.last_name || '-'}</td>
+                        <td>{record.first_name} {record.last_name}</td>
                         <td>{record.company_name || '-'}</td>
-                        <td style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {record.address1 || '-'}
-                        </td>
-                        <td>{record.city || '-'}</td>
-                        <td>{record.province || '-'}</td>
-                        <td>{record.postal || '-'}</td>
+                        <td>{record.city}, {record.province}</td>
                         <td>{record.dealer_name || '-'}</td>
                         <td>{record.project_type || '-'}</td>
-                        <td>{record.product_type || '-'}</td>
-                        <td>{record.square_footage ? record.square_footage.toLocaleString() : '-'}</td>
                         <td>
-                          <span className={`badge ${
-                            record.current_status === 'Won' ? 'badge-converted' :
-                            record.current_status === 'Lost' ? 'badge-dead' :
-                            'badge-active'
-                          }`}>
+                          <span className={`badge ${record.current_status === 'converted' ? 'badge-converted' : 'badge-active'}`}>
                             {record.current_status || 'Unknown'}
                           </span>
                         </td>
@@ -555,6 +606,36 @@ const AdminDashboard: React.FC = () => {
                   <p style={styles.detailValue}>{selectedLead.comments}</p>
                 </div>
               )}
+              
+              {/* Alternative Installers Section */}
+              {selectedLead.alternative_installers && selectedLead.alternative_installers.length > 0 && (
+                <div style={{ marginTop: '24px', padding: '16px', backgroundColor: '#f8f9fa', borderRadius: '8px' }}>
+                  <p style={{...styles.detailLabel, marginBottom: '12px'}}>Alternative Installers (Within 50km)</p>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {selectedLead.alternative_installers.map((alt) => (
+                      <div 
+                        key={alt.id} 
+                        style={{ 
+                          padding: '12px', 
+                          backgroundColor: 'white', 
+                          borderRadius: '6px',
+                          border: '1px solid #e0e0e0'
+                        }}
+                      >
+                        <div style={{ fontWeight: '600', color: '#2c3e50', marginBottom: '4px' }}>
+                          {alt.name}
+                        </div>
+                        <div style={{ fontSize: '13px', color: '#7f8c8d' }}>
+                          {alt.city}, {alt.province} • {alt.distance_km.toFixed(1)}km away
+                        </div>
+                        <div style={{ fontSize: '13px', color: '#7f8c8d', marginTop: '4px' }}>
+                          Score: {alt.allocation_score.toFixed(1)} • Active Leads: {alt.active_leads}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -600,7 +681,7 @@ const styles = {
     color: '#c91414',
   },
   modal: {
-    position: 'fixed',
+    position: 'fixed' as const,
     top: 0,
     left: 0,
     right: 0,
