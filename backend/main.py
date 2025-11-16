@@ -14,12 +14,13 @@
 # requests==2.31.0
 
 import os
+import secrets
 import time
 from datetime import datetime, timedelta
 from typing import Any, List, Optional
 from math import radians, sin, cos, sqrt, atan2
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field, validator
@@ -41,6 +42,7 @@ class Settings:
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
+    ML_PUBLIC_API_KEY = os.getenv("ML_PUBLIC_API_KEY")
     
     # Geocoding API (Google Maps or alternative)
     GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
@@ -70,6 +72,7 @@ app.add_middleware(
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login")
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="api/admin/login", auto_error=False)
 
 # ============================================
 # DATABASE CONNECTION
@@ -454,29 +457,62 @@ def create_access_token(data: dict) -> str:
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
 
+def resolve_admin_user_from_token(token: str) -> Optional[AdminUser]:
+    """Return an AdminUser from a JWT token, or None if invalid."""
+
+    if not token:
+        return None
+
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username: Optional[str] = payload.get("sub")
+        if not username:
+            return None
+    except JWTError:
+        return None
+
+    query = "SELECT id, username, email, last_name, role FROM admin_users WHERE username = %s AND is_active = TRUE"
+    user = execute_query(query, (username,))
+
+    if not user:
+        return None
+
+    return AdminUser(**user[0])
+
+
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> AdminUser:
-    """Get current authenticated user"""
+    """Require a valid authenticated user."""
+
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    
-    query = "SELECT id, username, email, last_name, role FROM admin_users WHERE username = %s AND is_active = TRUE"
-    user = execute_query(query, (username,))
-    
+
+    user = resolve_admin_user_from_token(token)
     if not user:
         raise credentials_exception
-    
-    return AdminUser(**user[0])
+
+    return user
+
+
+async def get_optional_user(token: Optional[str] = Depends(oauth2_scheme_optional)) -> Optional[AdminUser]:
+    """Best-effort authenticated user helper used by public endpoints."""
+
+    if not token:
+        return None
+
+    return resolve_admin_user_from_token(token)
+
+
+def has_valid_ml_api_key(provided_key: Optional[str]) -> bool:
+    """Verify the optional API key for ML endpoints."""
+
+    return bool(
+        provided_key
+        and settings.ML_PUBLIC_API_KEY
+        and secrets.compare_digest(provided_key, settings.ML_PUBLIC_API_KEY)
+    )
 
 # ============================================
 # API ENDPOINTS - PUBLIC
@@ -875,25 +911,42 @@ async def get_historical_data(
 
 
 @app.get("/api/admin/ml/status", response_model=MLStatusResponse)
-async def get_ml_status(current_user: AdminUser = Depends(get_current_user)):
-    """Return the current ML training status for administrators."""
+async def get_ml_status(
+    api_key: Optional[str] = Query(None, alias="api_key"),
+    token: Optional[str] = Query(None, alias="token"),
+    current_user: Optional[AdminUser] = Depends(get_optional_user),
+):
+    """Return the current ML training status for administrators or API key holders."""
 
-    status = ml_allocator.status()
-    return MLStatusResponse(**status, message="ok" if status.get("trained") else "not_trained")
+    resolved_user = current_user or (resolve_admin_user_from_token(token) if token else None)
+    if not (resolved_user or has_valid_ml_api_key(api_key)):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    status_payload = ml_allocator.status()
+    return MLStatusResponse(
+        **status_payload,
+        message="ok" if status_payload.get("trained") else "not_trained",
+    )
 
 
 @app.post("/api/admin/ml/train", response_model=MLStatusResponse)
 async def trigger_ml_training(
     payload: Optional[MLTrainRequest] = None,
-    current_user: AdminUser = Depends(get_current_user)
+    api_key: Optional[str] = Query(None, alias="api_key"),
+    token: Optional[str] = Query(None, alias="token"),
+    current_user: Optional[AdminUser] = Depends(get_optional_user)
 ):
-    """Allow administrators to retrain the ML model on demand."""
+    """Allow administrators (or requests with the ML API key) to retrain the model on demand."""
+
+    resolved_user = current_user or (resolve_admin_user_from_token(token) if token else None)
+    if not (resolved_user or has_valid_ml_api_key(api_key)):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
     payload = payload or MLTrainRequest()
     success = ml_allocator.train(force=payload.force)
-    status = ml_allocator.status()
+    status_payload = ml_allocator.status()
     message = "trained" if success else "training_failed"
-    return MLStatusResponse(**status, message=message)
+    return MLStatusResponse(**status_payload, message=message)
 
 # ============================================
 # RUN SERVER
