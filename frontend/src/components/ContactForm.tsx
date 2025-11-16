@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { Autocomplete, useLoadScript } from '@react-google-maps/api';
 import { MapPin, User, Mail, Phone, Home, MessageSquare, Send, CheckCircle } from 'lucide-react';
@@ -12,10 +12,16 @@ const ContactForm: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [addressError, setAddressError] = useState('');
-  const addressInputRef = useRef<HTMLInputElement>(null);
+  const [addressValue, setAddressValue] = useState('');
   
   const { register, handleSubmit, formState: { errors }, setValue, reset } = useForm<LeadFormData>();
+
+  useEffect(() => {
+    register('address', {
+      required: 'Address is required',
+      minLength: { value: 5, message: 'Address must be at least 5 characters' }
+    });
+  }, [register]);
 
   // Load Google Maps script
   const { isLoaded, loadError } = useLoadScript({
@@ -62,45 +68,27 @@ const ContactForm: React.FC = () => {
         });
 
         const fullAddress = `${streetNumber} ${route}`.trim();
-        
-        // Update the input field with just the street address
-        if (addressInputRef.current) {
-          addressInputRef.current.value = fullAddress;
-        }
-        
-        setValue('address', fullAddress);
+
+        setAddressValue(fullAddress);
+        setValue('address', fullAddress, { shouldValidate: true });
         setValue('city', city);
         setValue('province', province as any);
         setValue('postal_code', postalCode);
-        setAddressError('');
       }
     }
   };
 
   const onSubmit = async (data: LeadFormData) => {
-    // Get address value from the input element
-    const addressValue = addressInputRef.current?.value || '';
-    
-    // Validate address manually since it's not registered with react-hook-form
-    if (!addressValue || addressValue.length < 5) {
-      setAddressError('Address must be at least 5 characters');
-      return;
-    }
-
     setLoading(true);
     setError(null);
     setSuccess(false);
 
     try {
-      // Add address to data
-      const submitData = { ...data, address: addressValue };
-      await submitLead(submitData);
+      await submitLead(data);
       setSuccess(true);
       reset();
-      if (addressInputRef.current) {
-        addressInputRef.current.value = '';
-      }
-      
+      setAddressValue('');
+
       // Reset success message after 5 seconds
       setTimeout(() => setSuccess(false), 5000);
     } catch (err: any) {
@@ -207,21 +195,19 @@ const ContactForm: React.FC = () => {
             }}
           >
             <input
-              ref={addressInputRef}
               type="text"
               className="form-input"
               placeholder="Start typing your address..."
-              autoComplete="new-password"
-              name="street_address"
+              autoComplete="street-address"
+              value={addressValue}
               onChange={(e) => {
-                console.log('Input value:', e.target.value);
-                if (e.target.value.length >= 5) {
-                  setAddressError('');
-                }
+                const value = e.target.value;
+                setAddressValue(value);
+                setValue('address', value, { shouldValidate: true });
               }}
             />
           </Autocomplete>
-          {addressError && <p className="form-error">{addressError}</p>}
+          {errors.address && <p className="form-error">{errors.address.message}</p>}
           <p className="form-help">Start typing and select your address from the suggestions</p>
         </div>
 
