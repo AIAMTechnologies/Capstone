@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Optional
 from math import radians, sin, cos, sqrt, atan2
 
-from fastapi import FastAPI, HTTPException, Depends, status, Query
+from fastapi import FastAPI, HTTPException, Depends, status, Query, Header
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field, validator
@@ -72,7 +72,6 @@ app.add_middleware(
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login")
-oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="api/admin/login", auto_error=False)
 
 # ============================================
 # DATABASE CONNECTION
@@ -496,15 +495,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> AdminUser:
     return user
 
 
-async def get_optional_user(token: Optional[str] = Depends(oauth2_scheme_optional)) -> Optional[AdminUser]:
-    """Best-effort authenticated user helper used by public endpoints."""
-
-    if not token:
-        return None
-
-    return resolve_admin_user_from_token(token)
-
-
 def has_valid_ml_api_key(provided_key: Optional[str]) -> bool:
     """Verify the optional API key for ML endpoints."""
 
@@ -910,16 +900,53 @@ async def get_historical_data(
     return {"data": data, "count": len(data), "total": total_count}
 
 
+def extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
+    """Parse an Authorization header and return the bearer token when present."""
+
+    if not auth_header:
+        return None
+
+    parts = auth_header.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+
+    return None
+
+
+def resolve_request_user(
+    token_param: Optional[str],
+    auth_header: Optional[str],
+) -> Optional[AdminUser]:
+    """Resolve an AdminUser from either the query token or Authorization header."""
+
+    token_value = token_param or extract_bearer_token(auth_header)
+    if not token_value:
+        return None
+
+    return resolve_admin_user_from_token(token_value)
+
+
+def resolve_request_api_key(
+    query_api_key: Optional[str],
+    header_api_key: Optional[str],
+) -> Optional[str]:
+    """Return whichever API key source is populated (query param or header)."""
+
+    return query_api_key or header_api_key
+
+
 @app.get("/api/admin/ml/status", response_model=MLStatusResponse)
 async def get_ml_status(
     api_key: Optional[str] = Query(None, alias="api_key"),
     token: Optional[str] = Query(None, alias="token"),
-    current_user: Optional[AdminUser] = Depends(get_optional_user),
+    header_api_key: Optional[str] = Header(None, alias="X-ML-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
     """Return the current ML training status for administrators or API key holders."""
 
-    resolved_user = current_user or (resolve_admin_user_from_token(token) if token else None)
-    if not (resolved_user or has_valid_ml_api_key(api_key)):
+    resolved_user = resolve_request_user(token, authorization)
+    provided_key = resolve_request_api_key(api_key, header_api_key)
+    if not (resolved_user or has_valid_ml_api_key(provided_key)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
     status_payload = ml_allocator.status()
@@ -929,21 +956,31 @@ async def get_ml_status(
     )
 
 
-@app.post("/api/admin/ml/train", response_model=MLStatusResponse)
+@app.api_route("/api/admin/ml/train", response_model=MLStatusResponse, methods=["GET", "POST"])
 async def trigger_ml_training(
     payload: Optional[MLTrainRequest] = None,
+    force: Optional[bool] = Query(None, alias="force"),
     api_key: Optional[str] = Query(None, alias="api_key"),
     token: Optional[str] = Query(None, alias="token"),
-    current_user: Optional[AdminUser] = Depends(get_optional_user)
+    header_api_key: Optional[str] = Header(None, alias="X-ML-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
     """Allow administrators (or requests with the ML API key) to retrain the model on demand."""
 
-    resolved_user = current_user or (resolve_admin_user_from_token(token) if token else None)
-    if not (resolved_user or has_valid_ml_api_key(api_key)):
+    resolved_user = resolve_request_user(token, authorization)
+    provided_key = resolve_request_api_key(api_key, header_api_key)
+    if not (resolved_user or has_valid_ml_api_key(provided_key)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
-    payload = payload or MLTrainRequest()
-    success = ml_allocator.train(force=payload.force)
+    force_value: Optional[bool] = None
+    if payload is not None:
+        force_value = payload.force
+    if force is not None:
+        force_value = force
+    if force_value is None:
+        force_value = True
+
+    success = ml_allocator.train(force=force_value)
     status_payload = ml_allocator.status()
     message = "trained" if success else "training_failed"
     return MLStatusResponse(**status_payload, message=message)
