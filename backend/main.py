@@ -108,6 +108,7 @@ ml_allocator = InstallerMLModel(execute_query)
 # Distance preferences used when evaluating installer suitability
 PREFERRED_DISTANCE_KM = 120
 ALTERNATIVE_DISTANCE_LIMIT_KM = 50
+LOCAL_PRIORITY_DISTANCE_KM = 75
 MAX_DISTANCE_KM = 400
 
 # ============================================
@@ -408,7 +409,18 @@ def allocate_lead_to_installer(
         if installer['distance_km'] <= PREFERRED_DISTANCE_KM
     ]
 
-    if preferred_installers:
+    # If we have very local installers (<= LOCAL_PRIORITY_DISTANCE_KM) we always
+    # pick the highest scoring option among them, ensuring cities like
+    # Kitchener do not get skipped in favor of farther dealers such as Toronto
+    # when local coverage exists.
+    local_priority_installers = [
+        installer for installer in preferred_installers
+        if installer['distance_km'] <= LOCAL_PRIORITY_DISTANCE_KM
+    ]
+
+    if local_priority_installers:
+        best_installer = local_priority_installers[0]
+    elif preferred_installers:
         best_installer = preferred_installers[0]
     else:
         best_installer = scored_installers[0]
