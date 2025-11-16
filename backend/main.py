@@ -19,7 +19,9 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, List, Optional
 from math import radians, sin, cos, sqrt, atan2
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, status, Query, Header
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +33,12 @@ from psycopg2.extras import RealDictCursor
 import requests
 
 from ml_model import InstallerMLModel
+
+# Load environment variables from a project-level .env file when running locally
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = BASE_DIR / ".env"
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
 
 # ============================================
 # CONFIGURATION
