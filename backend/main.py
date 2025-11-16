@@ -16,7 +16,7 @@
 import os
 import time
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Any, List, Optional
 from math import radians, sin, cos, sqrt, atan2
 
 from fastapi import FastAPI, HTTPException, Depends, status
@@ -28,6 +28,8 @@ from passlib.context import CryptContext
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
+
+from ml_model import InstallerMLModel
 
 # ============================================
 # CONFIGURATION
@@ -99,6 +101,10 @@ def execute_query(query: str, params: tuple = None, fetch: bool = True):
     finally:
         conn.close()
 
+
+# Initialize the ML allocator once so it can be reused across requests
+ml_allocator = InstallerMLModel(execute_query)
+
 # ============================================
 # PYDANTIC MODELS
 # ============================================
@@ -129,6 +135,8 @@ class AlternativeInstaller(BaseModel):
     distance_km: float
     allocation_score: float
     active_leads: int
+    converted_leads: Optional[int] = None
+    ml_probability: Optional[float] = None
 
 class LeadResponse(BaseModel):
     id: int
@@ -142,6 +150,7 @@ class LeadResponse(BaseModel):
     assigned_installer_name: Optional[str]
     allocation_score: Optional[float]
     distance_to_installer_km: Optional[float]
+    installer_ml_probability: Optional[float] = None
     alternative_installers: Optional[List[AlternativeInstaller]]
     created_at: datetime
     message: str = "Lead submitted successfully"
@@ -246,24 +255,51 @@ def geocode_address(address: str, city: str, province: str) -> tuple:
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Geocoding error: {str(e)}")
 
+
+def build_ml_feature_payload(source: Optional[Any]) -> dict:
+    """Extract ML-specific attributes from a lead or record."""
+
+    if source is None:
+        return {}
+
+    if isinstance(source, dict):
+        payload = source
+    elif hasattr(source, "model_dump"):
+        payload = source.model_dump()
+    else:
+        payload = getattr(source, "__dict__", {})
+
+    return {
+        "project_type": payload.get("project_type") or payload.get("job_type"),
+        "product_type": payload.get("product_type"),
+        "square_footage": payload.get("square_footage") or payload.get("square_feet"),
+        "current_status": payload.get("current_status") or payload.get("status"),
+    }
+
 # ============================================
 # LEAD ALLOCATION ALGORITHM - ENHANCED VERSION
 # ============================================
 
-def allocate_lead_to_installer(lead_lat: float, lead_lon: float, province: str):
+def allocate_lead_to_installer(
+    lead_lat: float,
+    lead_lon: float,
+    province: str,
+    lead_payload: Optional[Any] = None,
+):
     """
     Enhanced allocation algorithm that returns:
-    - Best installer (lowest score)
+    - Best installer (highest composite score)
     - 2-3 alternative installers within 50km
-    
-    Scoring Formula:
-    Score = (distance_km * 0.5) + (active_leads * 2)
-    Lower score = better match
+
+    Composite score blends:
+    - ML probability learned from historical data
+    - Geographic distance to the dealer
+    - Closed deals and currently active allocations
     """
     
     # Get all active installers from the same province
     query = """
-        SELECT 
+        SELECT
             i.id,
             i.name,
             i.email,
@@ -272,13 +308,13 @@ def allocate_lead_to_installer(lead_lat: float, lead_lon: float, province: str):
             i.latitude,
             i.longitude,
             i.is_active,
-            COUNT(l.id) as active_leads
+            COUNT(CASE WHEN l.status = 'active' THEN 1 END) as active_leads,
+            COUNT(CASE WHEN l.status = 'converted' THEN 1 END) as converted_leads
         FROM installers i
-        LEFT JOIN leads l ON i.id = l.assigned_installer_id 
-            AND l.status = 'active'
-        WHERE i.is_active = TRUE 
+        LEFT JOIN leads l ON i.id = l.assigned_installer_id
+        WHERE i.is_active = TRUE
             AND i.province = %s
-            AND i.latitude IS NOT NULL 
+            AND i.latitude IS NOT NULL
             AND i.longitude IS NOT NULL
         GROUP BY i.id
     """
@@ -288,32 +324,56 @@ def allocate_lead_to_installer(lead_lat: float, lead_lon: float, province: str):
     if not installers:
         return None
     
+    # Prepare ML probabilities for this lead
+    lead_features = build_ml_feature_payload(lead_payload)
+    ml_probabilities = ml_allocator.predict_probabilities(lead_features)
+
     # Calculate scores for all installers
     scored_installers = []
-    
+    max_closed = max((installer.get('converted_leads') or 0) for installer in installers) if installers else 0
+    max_active = max((installer.get('active_leads') or 0) for installer in installers) if installers else 0
+
     for installer in installers:
         # Calculate distance
         distance_km = haversine_distance(
-            lead_lat, lead_lon, 
+            lead_lat, lead_lon,
             installer['latitude'], installer['longitude']
         )
-        
-        # Calculate allocation score
-        # Lower score = better match
-        allocation_score = (distance_km * 0.5) + (installer['active_leads'] * 2)
-        
+
+        installer_name = installer['name']
+        probability = (
+            ml_probabilities.get(installer_name)
+            or ml_probabilities.get(installer_name.lower())
+            or 0.0
+        )
+        closed_leads = installer.get('converted_leads') or 0
+        active_leads = installer.get('active_leads') or 0
+
+        distance_component = max(0.0, 1 - min(distance_km / 300, 1))
+        closed_component = (closed_leads / max_closed) if max_closed else 0
+        active_component = (active_leads / max_active) if max_active else 0
+
+        allocation_score = (
+            (probability * 0.6)
+            + (distance_component * 0.2)
+            + (closed_component * 0.15)
+            - (active_component * 0.15)
+        )
+
         scored_installers.append({
             'installer_id': installer['id'],
             'installer_name': installer['name'],
             'city': installer['city'],
             'province': installer['province'],
             'distance_km': round(distance_km, 2),
-            'allocation_score': round(allocation_score, 2),
-            'active_leads': installer['active_leads']
+            'allocation_score': round(allocation_score, 4),
+            'active_leads': active_leads,
+            'converted_leads': closed_leads,
+            'ml_probability': round(probability, 4)
         })
-    
-    # Sort by allocation score (lowest first)
-    scored_installers.sort(key=lambda x: x['allocation_score'])
+
+    # Sort by allocation score (higher scores are better)
+    scored_installers.sort(key=lambda x: x['allocation_score'], reverse=True)
     
     # Get best match
     best_installer = scored_installers[0]
@@ -397,7 +457,7 @@ async def create_lead(lead: LeadCreate):
         # Step 2: Get allocation (best + alternatives) if geocoding succeeded
         allocation = None
         if lead_lat and lead_lon:
-            allocation = allocate_lead_to_installer(lead_lat, lead_lon, lead.province)
+            allocation = allocate_lead_to_installer(lead_lat, lead_lon, lead.province, lead)
         
         # Step 3: Insert lead into database
         conn = get_db_connection()
@@ -453,7 +513,9 @@ async def create_lead(lead: LeadCreate):
                     province=alt['province'],
                     distance_km=alt['distance_km'],
                     allocation_score=alt['allocation_score'],
-                    active_leads=alt['active_leads']
+                    active_leads=alt['active_leads'],
+                    converted_leads=alt.get('converted_leads'),
+                    ml_probability=alt.get('ml_probability')
                 ) for alt in allocation['alternative_installers']
             ]
         
@@ -470,6 +532,7 @@ async def create_lead(lead: LeadCreate):
             assigned_installer_name=allocation['best_installer']['installer_name'] if allocation else None,
             allocation_score=allocation['best_installer']['allocation_score'] if allocation else None,
             distance_to_installer_km=allocation['best_installer']['distance_km'] if allocation else None,
+            installer_ml_probability=allocation['best_installer'].get('ml_probability') if allocation else None,
             alternative_installers=alternative_installers,
             created_at=created_at,
             message="Lead submitted and assigned successfully" if allocation else "Lead submitted - no installer available in your area"
@@ -590,12 +653,14 @@ async def get_all_leads(
         # Calculate alternative installers if lead has coordinates
         if lead['latitude'] and lead['longitude']:
             allocation = allocate_lead_to_installer(
-                lead['latitude'], 
-                lead['longitude'], 
-                lead['province']
+                lead['latitude'],
+                lead['longitude'],
+                lead['province'],
+                lead
             )
-            
+
             if allocation:
+                lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
                 lead_dict['alternative_installers'] = allocation['alternative_installers']
             else:
                 lead_dict['alternative_installers'] = []
@@ -639,12 +704,14 @@ async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_cu
     # Calculate alternative installers if lead has coordinates
     if lead_dict['latitude'] and lead_dict['longitude']:
         allocation = allocate_lead_to_installer(
-            lead_dict['latitude'], 
-            lead_dict['longitude'], 
-            lead_dict['province']
+            lead_dict['latitude'],
+            lead_dict['longitude'],
+            lead_dict['province'],
+            lead_dict
         )
-        
+
         if allocation:
+            lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
             lead_dict['alternative_installers'] = allocation['alternative_installers']
         else:
             lead_dict['alternative_installers'] = []
