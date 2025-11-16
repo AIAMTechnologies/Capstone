@@ -13,7 +13,15 @@
 # python-multipart==0.0.6
 # requests==2.31.0
 
+from pathlib import Path
+from dotenv import load_dotenv
 import os
+
+# Always load the project-root .env file
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = BASE_DIR / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=False)
+
 import time
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -34,16 +42,22 @@ import requests
 # ============================================
 
 class Settings:
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:4567@localhost:5432/capstone25")
-    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    SECRET_KEY = os.getenv("SECRET_KEY", "dev-fallback-key")
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
-    
-    # Geocoding API (Google Maps or alternative)
+
+    GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")
     GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
-    GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
+
 
 settings = Settings()
+
+print("Loaded ENV:", {
+    "DATABASE_URL": os.getenv("DATABASE_URL"),
+    "GEOCODING_PROVIDER": os.getenv("GEOCODING_PROVIDER"),
+    "GEOCODING_API_KEY_EXISTS": bool(os.getenv("GEOCODING_API_KEY"))
+})
 
 # ============================================
 # FASTAPI APP SETUP
@@ -75,7 +89,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login")
 def get_db_connection():
     """Get database connection"""
     try:
-        conn = psycopg2.connect(settings.DATABASE_URL, cursor_factory=RealDictCursor)
+        conn = psycopg2.connect(
+            settings.DATABASE_URL,
+            cursor_factory=RealDictCursor
+        )
         return conn
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
