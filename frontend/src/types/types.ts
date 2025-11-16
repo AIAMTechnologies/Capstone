@@ -19,6 +19,7 @@ export interface Lead {
   allocation_score?: number;
   distance_to_installer_km?: number;
   installer_ml_probability?: number;
+  distance_review_required?: boolean;
   installer_override_id?: number;
   alternative_installers?: AlternativeInstaller[];
   created_at: string;
@@ -37,6 +38,7 @@ export interface AlternativeInstaller {
   active_leads: number;
   converted_leads?: number;
   ml_probability?: number;
+  distance_review_required?: boolean;
 }
 
 export interface LeadFormData {

@@ -105,6 +105,11 @@ def execute_query(query: str, params: tuple = None, fetch: bool = True):
 # Initialize the ML allocator once so it can be reused across requests
 ml_allocator = InstallerMLModel(execute_query)
 
+# Distance preferences used when evaluating installer suitability
+PREFERRED_DISTANCE_KM = 120
+ALTERNATIVE_DISTANCE_LIMIT_KM = 50
+MAX_DISTANCE_KM = 400
+
 # ============================================
 # PYDANTIC MODELS
 # ============================================
@@ -137,6 +142,7 @@ class AlternativeInstaller(BaseModel):
     active_leads: int
     converted_leads: Optional[int] = None
     ml_probability: Optional[float] = None
+    distance_review_required: Optional[bool] = None
 
 class LeadResponse(BaseModel):
     id: int
@@ -151,9 +157,22 @@ class LeadResponse(BaseModel):
     allocation_score: Optional[float]
     distance_to_installer_km: Optional[float]
     installer_ml_probability: Optional[float] = None
+    distance_review_required: Optional[bool] = None
     alternative_installers: Optional[List[AlternativeInstaller]]
     created_at: datetime
     message: str = "Lead submitted successfully"
+
+
+class MLStatusResponse(BaseModel):
+    trained: bool
+    last_trained_at: Optional[datetime]
+    training_rows: Optional[int]
+    last_error: Optional[str]
+    message: str = "ok"
+
+
+class MLTrainRequest(BaseModel):
+    force: bool = True
 
 class AdminUser(BaseModel):
     id: int
@@ -340,6 +359,10 @@ def allocate_lead_to_installer(
             installer['latitude'], installer['longitude']
         )
 
+        if distance_km > MAX_DISTANCE_KM:
+            # Skip installers that are far outside the supported region
+            continue
+
         installer_name = installer['name']
         probability = (
             ml_probabilities.get(installer_name)
@@ -369,19 +392,33 @@ def allocate_lead_to_installer(
             'allocation_score': round(allocation_score, 4),
             'active_leads': active_leads,
             'converted_leads': closed_leads,
-            'ml_probability': round(probability, 4)
+            'ml_probability': round(probability, 4),
+            'distance_review_required': False,
         })
 
     # Sort by allocation score (higher scores are better)
     scored_installers.sort(key=lambda x: x['allocation_score'], reverse=True)
-    
-    # Get best match
-    best_installer = scored_installers[0]
-    
+
+    if not scored_installers:
+        return None
+
+    # Prefer installers that are within the desired distance threshold
+    preferred_installers = [
+        installer for installer in scored_installers
+        if installer['distance_km'] <= PREFERRED_DISTANCE_KM
+    ]
+
+    if preferred_installers:
+        best_installer = preferred_installers[0]
+    else:
+        best_installer = scored_installers[0]
+        best_installer['distance_review_required'] = True
+
     # Get alternative installers within 50km (excluding the best one)
     alternatives = [
-        installer for installer in scored_installers[1:] 
-        if installer['distance_km'] <= 50
+        installer for installer in scored_installers
+        if installer['installer_id'] != best_installer['installer_id']
+        and installer['distance_km'] <= ALTERNATIVE_DISTANCE_LIMIT_KM
     ][:3]  # Limit to 3 alternatives
     
     return {
@@ -515,7 +552,8 @@ async def create_lead(lead: LeadCreate):
                     allocation_score=alt['allocation_score'],
                     active_leads=alt['active_leads'],
                     converted_leads=alt.get('converted_leads'),
-                    ml_probability=alt.get('ml_probability')
+                    ml_probability=alt.get('ml_probability'),
+                    distance_review_required=alt.get('distance_review_required'),
                 ) for alt in allocation['alternative_installers']
             ]
         
@@ -533,6 +571,7 @@ async def create_lead(lead: LeadCreate):
             allocation_score=allocation['best_installer']['allocation_score'] if allocation else None,
             distance_to_installer_km=allocation['best_installer']['distance_km'] if allocation else None,
             installer_ml_probability=allocation['best_installer'].get('ml_probability') if allocation else None,
+            distance_review_required=allocation['best_installer'].get('distance_review_required') if allocation else None,
             alternative_installers=alternative_installers,
             created_at=created_at,
             message="Lead submitted and assigned successfully" if allocation else "Lead submitted - no installer available in your area"
@@ -661,11 +700,14 @@ async def get_all_leads(
 
             if allocation:
                 lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
+                lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
                 lead_dict['alternative_installers'] = allocation['alternative_installers']
             else:
                 lead_dict['alternative_installers'] = []
+                lead_dict['distance_review_required'] = None
         else:
             lead_dict['alternative_installers'] = []
+            lead_dict['distance_review_required'] = None
         
         enhanced_leads.append(lead_dict)
     
@@ -712,11 +754,14 @@ async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_cu
 
         if allocation:
             lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
+            lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
             lead_dict['alternative_installers'] = allocation['alternative_installers']
         else:
             lead_dict['alternative_installers'] = []
+            lead_dict['distance_review_required'] = None
     else:
         lead_dict['alternative_installers'] = []
+        lead_dict['distance_review_required'] = None
     
     return lead_dict
 
@@ -815,6 +860,28 @@ async def get_historical_data(
         total_count = execute_query(count_query)[0]['total']
     
     return {"data": data, "count": len(data), "total": total_count}
+
+
+@app.get("/api/admin/ml/status", response_model=MLStatusResponse)
+async def get_ml_status(current_user: AdminUser = Depends(get_current_user)):
+    """Return the current ML training status for administrators."""
+
+    status = ml_allocator.status()
+    return MLStatusResponse(**status, message="ok" if status.get("trained") else "not_trained")
+
+
+@app.post("/api/admin/ml/train", response_model=MLStatusResponse)
+async def trigger_ml_training(
+    payload: Optional[MLTrainRequest] = None,
+    current_user: AdminUser = Depends(get_current_user)
+):
+    """Allow administrators to retrain the ML model on demand."""
+
+    payload = payload or MLTrainRequest()
+    success = ml_allocator.train(force=payload.force)
+    status = ml_allocator.status()
+    message = "trained" if success else "training_failed"
+    return MLStatusResponse(**status, message=message)
 
 # ============================================
 # RUN SERVER

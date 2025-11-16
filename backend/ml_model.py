@@ -38,6 +38,8 @@ class InstallerMLModel:
         self._last_trained_at: Optional[datetime] = None
         self._retrain_interval = retrain_interval
         self._min_training_rows = min_training_rows
+        self._last_row_count: Optional[int] = None
+        self._last_error: Optional[str] = None
 
     def ensure_ready(self) -> bool:
         """Train the model if it has never been trained or is stale."""
@@ -54,8 +56,34 @@ class InstallerMLModel:
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.exception("Failed to train installer ML model: %s", exc)
                 self._pipeline = None
+                self._last_error = str(exc)
                 return False
         return True
+
+    def train(self, force: bool = True) -> bool:
+        """Trigger training manually.
+
+        Parameters
+        ----------
+        force:
+            When True the model will be retrained immediately even if the
+            cached pipeline is considered fresh.  When False it behaves like
+            :py:meth:`ensure_ready`.
+        """
+
+        if force:
+            return self._train_model()
+        return self.ensure_ready()
+
+    def status(self) -> Dict[str, Optional[str]]:
+        """Return metadata describing the most recent training run."""
+
+        return {
+            "trained": self._pipeline is not None,
+            "last_trained_at": self._last_trained_at,
+            "training_rows": self._last_row_count,
+            "last_error": self._last_error,
+        }
 
     def predict_probabilities(self, features: Dict[str, Optional[float]]) -> Dict[str, float]:
         """Return probability for each dealer given project features.
@@ -98,15 +126,21 @@ class InstallerMLModel:
         """Fetch data from the database and train the estimator."""
 
         logger.info("Training installer ML model from historical data")
-        records = self._query_executor(
-            """
-            SELECT dealer_name, project_type, product_type, square_footage, current_status
-            FROM historical_data
-            WHERE dealer_name IS NOT NULL
-            """,
-            None,
-            True,
-        )
+        try:
+            records = self._query_executor(
+                """
+                SELECT dealer_name, project_type, product_type, square_footage, current_status
+                FROM historical_data
+                WHERE dealer_name IS NOT NULL
+                """,
+                None,
+                True,
+            )
+        except Exception as exc:
+            self._last_error = str(exc)
+            logger.exception("Unable to fetch historical data for ML training: %s", exc)
+            self._pipeline = None
+            return False
 
         if not records or len(records) < self._min_training_rows:
             logger.warning(
@@ -114,6 +148,8 @@ class InstallerMLModel:
                 len(records) if records else 0,
             )
             self._pipeline = None
+            self._last_row_count = len(records) if records else 0
+            self._last_error = "insufficient_training_data"
             return False
 
         frame = pd.DataFrame(records)
@@ -126,6 +162,8 @@ class InstallerMLModel:
         if frame.empty or frame["dealer_name"].nunique() < 2:
             logger.warning("Insufficient label diversity to train ML model")
             self._pipeline = None
+            self._last_row_count = len(frame)
+            self._last_error = "insufficient_label_diversity"
             return False
 
         features = frame[["project_type", "product_type", "square_footage", "current_status"]]
@@ -174,5 +212,7 @@ class InstallerMLModel:
         pipeline.fit(features, labels)
         self._pipeline = pipeline
         self._last_trained_at = datetime.utcnow()
+        self._last_row_count = len(frame)
+        self._last_error = None
         logger.info("Installer ML model trained on %s rows", len(frame))
         return True
