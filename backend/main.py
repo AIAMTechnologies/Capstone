@@ -13,15 +13,27 @@
 # python-multipart==0.0.6
 # requests==2.31.0
 
+from pathlib import Path
+from dotenv import load_dotenv
 import os
+
+# Always load the project-root .env file
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = BASE_DIR / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=False)
+
+print("Loaded ENV:", {
+    "DATABASE_URL": os.getenv("DATABASE_URL"),
+    "GEOCODING_PROVIDER": os.getenv("GEOCODING_PROVIDER"),
+    "GEOCODING_API_KEY_EXISTS": bool(os.getenv("GEOCODING_API_KEY"))
+})
+
 import secrets
 import time
 from datetime import datetime, timedelta
 from typing import Any, List, Optional
 from math import radians, sin, cos, sqrt, atan2
-from pathlib import Path
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, status, Query, Header
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,27 +46,20 @@ import requests
 
 from ml_model import InstallerMLModel
 
-# Load environment variables from a project-level .env file when running locally
-BASE_DIR = Path(__file__).resolve().parent.parent
-ENV_PATH = BASE_DIR / ".env"
-if ENV_PATH.exists():
-    load_dotenv(ENV_PATH)
-
 # ============================================
 # CONFIGURATION
 # ============================================
 
 class Settings:
-    #DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:4567@localhost:5432/capstone25")
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://q4gems_admin:890*()iopIOP@capstone25.postgres.database.azure.com:5432/capstone25db")  #Azure specific
-    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    SECRET_KEY = os.getenv("SECRET_KEY", "dev-fallback-key")
     ALGORITHM = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
-    ML_PUBLIC_API_KEY = os.getenv("ML_PUBLIC_API_KEY")
-    
-    # Geocoding API (Google Maps or alternative)
+    ACCESS_TOKEN_EXPIRE_MINUTES = 480
+
+    GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")
     GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
-    GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")  # 'google' or 'nominatim'
+    FRONTEND_GOOGLE_MAPS_API_KEY = os.getenv("VITE_GOOGLE_MAPS_API_KEY", "").strip()
+    ML_PUBLIC_API_KEY = os.getenv("ML_PUBLIC_API_KEY")
 
 settings = Settings()
 
@@ -88,7 +93,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login")
 def get_db_connection():
     """Get database connection"""
     try:
-        conn = psycopg2.connect(settings.DATABASE_URL, cursor_factory=RealDictCursor)
+        conn = psycopg2.connect(
+            settings.DATABASE_URL,
+            cursor_factory=RealDictCursor
+        )
         return conn
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
@@ -532,6 +540,14 @@ def has_valid_ml_api_key(provided_key: Optional[str]) -> bool:
 async def root():
     """Health check endpoint"""
     return {"status": "healthy", "message": "Lead Allocation System API is running"}
+
+
+@app.get("/api/config/map-key")
+async def get_public_google_maps_key():
+    """Expose the frontend Google Maps key so the UI can recover from missing build-time envs."""
+
+    return {"googleMapsApiKey": settings.FRONTEND_GOOGLE_MAPS_API_KEY or None}
+
 
 @app.post("/api/leads", response_model=LeadResponse)
 async def create_lead(lead: LeadCreate):

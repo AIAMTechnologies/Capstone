@@ -1,6 +1,7 @@
 import axios, { AxiosError } from 'axios';
-import type { 
-  LeadFormData, 
+import { env } from '../config/env';
+import type {
+  LeadFormData,
   LoginResponse, 
   DashboardStats, 
   LeadsResponse, 
@@ -10,7 +11,7 @@ import type {
   HistoricalDataResponse
 } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
+const API_BASE_URL = env.apiUrl || 'http://localhost:8000/api';
 
 // Create axios instance
 const api = axios.create({
@@ -52,6 +53,11 @@ api.interceptors.response.use(
 export const submitLead = async (leadData: LeadFormData): Promise<Lead> => {
   const response = await api.post<Lead>('/leads', leadData);
   return response.data;
+};
+
+export const getPublicGoogleMapsApiKey = async (): Promise<string> => {
+  const response = await api.get<{ googleMapsApiKey?: string }>('/config/map-key');
+  return (response.data.googleMapsApiKey ?? '').trim();
 };
 
 // ============================================
