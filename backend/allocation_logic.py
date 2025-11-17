@@ -2,7 +2,25 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
+
+FUZZY_IMPORTANCE_WEIGHTS = {
+    # Distance must dominate, with the remaining weights mirroring the requested priority order.
+    "distance": 0.4,
+    "square_footage": 0.2,
+    "current_status": 0.2,
+    "product_type": 0.15,
+    "project_type": 0.05,
+}
+
+_ATTRIBUTE_WEIGHT_SUM = (
+    FUZZY_IMPORTANCE_WEIGHTS["square_footage"]
+    + FUZZY_IMPORTANCE_WEIGHTS["current_status"]
+    + FUZZY_IMPORTANCE_WEIGHTS["product_type"]
+    + FUZZY_IMPORTANCE_WEIGHTS["project_type"]
+)
+
+SQUARE_FOOTAGE_MAX_DELTA = 4000.0
 
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
@@ -40,6 +58,123 @@ def _distance_component(
     }
 
 
+def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _square_footage_score(
+    lead_square_footage: Optional[float],
+    average_square_footage: Optional[float],
+) -> float:
+    if lead_square_footage is None and average_square_footage is None:
+        return 0.5
+    if lead_square_footage is None:
+        return 0.55  # installer has context but the lead does not
+    if average_square_footage is None:
+        return 0.6
+
+    delta = abs(float(lead_square_footage) - float(average_square_footage))
+    if delta <= 150:
+        return 1.0
+    if delta >= SQUARE_FOOTAGE_MAX_DELTA:
+        return 0.0
+    return _clamp(1 - ((delta - 150) / (SQUARE_FOOTAGE_MAX_DELTA - 150)))
+
+
+def _ratio_score(matches: Optional[float], total: Optional[float]) -> float:
+    if not matches or not total:
+        return 0.5
+    return _clamp(float(matches) / float(total))
+
+
+def _build_fuzzy_inputs(
+    *,
+    lead_features: Dict[str, Any],
+    stats: Dict[str, Any],
+) -> Dict[str, float]:
+    total_jobs = stats.get("total_jobs") or 0
+
+    def _feature_ratio(stat_key: str, feature_key: str) -> float:
+        if not lead_features.get(feature_key):
+            return 0.5
+        return _ratio_score(stats.get(stat_key), total_jobs)
+
+    project_score = _feature_ratio("project_matches", "project_type")
+    product_score = _feature_ratio("product_matches", "product_type")
+    status_score = _feature_ratio("status_matches", "current_status")
+    square_score = _square_footage_score(
+        lead_features.get("square_footage"),
+        stats.get("avg_square_footage"),
+    )
+
+    return {
+        "project_type": project_score,
+        "product_type": product_score,
+        "current_status": status_score,
+        "square_footage": square_score,
+    }
+
+
+def _derive_membership_triple(value: float) -> Dict[str, float]:
+    balanced = _clamp(1 - abs(value - 0.6) * 2)
+    return {
+        "strong": value,
+        "balanced": balanced,
+        "weak": _clamp(1 - value),
+    }
+
+
+def _fuzzy_score(distance_score: float, fuzzy_inputs: Dict[str, float]) -> Dict[str, Any]:
+    attribute_strength = (
+        FUZZY_IMPORTANCE_WEIGHTS["square_footage"] * fuzzy_inputs["square_footage"]
+        + FUZZY_IMPORTANCE_WEIGHTS["current_status"] * fuzzy_inputs["current_status"]
+        + FUZZY_IMPORTANCE_WEIGHTS["product_type"] * fuzzy_inputs["product_type"]
+        + FUZZY_IMPORTANCE_WEIGHTS["project_type"] * fuzzy_inputs["project_type"]
+    ) / max(_ATTRIBUTE_WEIGHT_SUM, 1e-6)
+
+    distance_membership = {
+        "close": distance_score,
+        "moderate": _clamp(1 - abs(distance_score - 0.5) * 2),
+        "far": _clamp(1 - distance_score),
+    }
+    attribute_membership = _derive_membership_triple(attribute_strength)
+
+    rule_high = min(distance_membership["close"], attribute_membership["strong"])
+    rule_medium = max(
+        min(distance_membership["moderate"], attribute_membership["strong"]),
+        min(distance_membership["close"], attribute_membership["balanced"]),
+    )
+    rule_low = max(
+        min(distance_membership["far"], 1.0),
+        min(attribute_membership["weak"], 1.0),
+    )
+
+    numerator = (rule_high * 0.95) + (rule_medium * 0.6) + (rule_low * 0.25)
+    denominator = rule_high + rule_medium + rule_low
+    if denominator <= 0:
+        blended = (
+            FUZZY_IMPORTANCE_WEIGHTS["distance"] * distance_score
+            + (1 - FUZZY_IMPORTANCE_WEIGHTS["distance"]) * attribute_strength
+        )
+    else:
+        blended = numerator / denominator
+
+    return {
+        "score": _clamp(blended),
+        "attribute_strength": _clamp(attribute_strength),
+        "memberships": {
+            "distance": distance_membership,
+            "attributes": attribute_membership,
+            "rules": {
+                "high": rule_high,
+                "medium": rule_medium,
+                "low": rule_low,
+            },
+        },
+        "inputs": fuzzy_inputs,
+    }
+
+
 def score_installers(
     installers: Sequence[Dict[str, Any]],
     *,
@@ -49,8 +184,10 @@ def score_installers(
     ml_probabilities: Dict[str, float],
     max_distance_km: float,
     fallback_distance_km: float,
+    lead_features: Optional[Dict[str, Any]] = None,
+    historical_feature_stats: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Return scored installers ordered by composite rank."""
+    """Return scored installers ordered by fuzzy composite rank."""
 
     enriched: List[Dict[str, Any]] = []
     for installer in installers:
@@ -73,6 +210,8 @@ def score_installers(
     total_max = max((inst.get("total_leads") or 0) for inst in enriched) or 0
     active_max = max((inst.get("active_leads") or 0) for inst in enriched) or 0
 
+    lead_features = lead_features or {}
+    stats_lookup = {k: v for k, v in (historical_feature_stats or {}).items()}
     scored: List[Dict[str, Any]] = []
     for inst in enriched:
         installer_name = inst.get("name") or inst.get("installer_name") or ""
@@ -83,7 +222,6 @@ def score_installers(
         active = inst.get("active_leads") or 0
 
         success_rate = _safe_ratio(converted, converted + dead)
-        experience_score = _safe_ratio(total, total_max) if total_max else 0.0
         workload_ratio = _safe_ratio(active, active_max) if active_max else 0.0
 
         distance_bits = _distance_component(
@@ -93,16 +231,16 @@ def score_installers(
             has_local_installers=has_local,
         )
 
-        quality_score = round(
-            (0.55 * probability) + (0.3 * success_rate) + (0.15 * experience_score),
-            4,
+        installer_key = installer_name.strip().lower()
+        stats = stats_lookup.get(installer_key, {})
+        fuzzy_inputs = _build_fuzzy_inputs(
+            lead_features=lead_features,
+            stats=stats,
         )
+        fuzzy_result = _fuzzy_score(distance_bits["distance_score"], fuzzy_inputs)
         distance_score = distance_bits["distance_score"]
-        allocation_score = (
-            (distance_score * 0.5)
-            + (quality_score * 0.45)
-            - (workload_ratio * 0.1)
-        )
+        quality_score = round(fuzzy_result["attribute_strength"], 4)
+        allocation_score = fuzzy_result["score"] - (workload_ratio * 0.05)
         if not distance_bits["is_within_max_distance"] and has_local:
             allocation_score *= 0.5
 
@@ -119,12 +257,14 @@ def score_installers(
                 "score_breakdown": {
                     "distance_score": distance_score,
                     "quality_score": quality_score,
-                    "workload_penalty": round(workload_ratio * 0.1, 4),
+                    "workload_penalty": round(workload_ratio * 0.05, 4),
+                    "fuzzy": fuzzy_result,
                 },
                 "key_factors": [
                     f"distance:{inst['distance_km']}km",
-                    f"success_rate:{round(success_rate, 2)}",
-                    f"ml_prob:{round(float(probability), 2)}",
+                    f"sqft_fit:{round(fuzzy_inputs['square_footage'], 2)}",
+                    f"status_match:{round(fuzzy_inputs['current_status'], 2)}",
+                    f"product_match:{round(fuzzy_inputs['product_type'], 2)}",
                 ],
             }
         )

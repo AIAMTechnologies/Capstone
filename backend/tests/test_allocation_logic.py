@@ -30,6 +30,16 @@ def _build_installer(installer_id, name, latitude, longitude, **extra):
     return base
 
 
+def _build_stats(avg_sqft, project_matches, product_matches, status_matches, total_jobs=20):
+    return {
+        "avg_square_footage": avg_sqft,
+        "project_matches": project_matches,
+        "product_matches": product_matches,
+        "status_matches": status_matches,
+        "total_jobs": total_jobs,
+    }
+
+
 def test_closest_installer_is_ranked_first_when_all_else_equal():
     installers = [
         _build_installer(1, "Near", 0.0, 0.0),
@@ -45,6 +55,8 @@ def test_closest_installer_is_ranked_first_when_all_else_equal():
         ml_probabilities=probs,
         max_distance_km=200,
         fallback_distance_km=600,
+        lead_features={},
+        historical_feature_stats={},
     )
 
     assert scored[0]["installer_id"] == 1
@@ -66,6 +78,8 @@ def test_guardrail_blocks_far_option_without_probability_edge():
         ml_probabilities=probs,
         max_distance_km=200,
         fallback_distance_km=600,
+        lead_features={},
+        historical_feature_stats={},
     )
     ranked = enforce_distance_guardrail(scored, guardrail_km=40, probability_advantage=0.15)
 
@@ -88,6 +102,8 @@ def test_guardrail_allows_far_option_with_large_probability_edge():
         ml_probabilities=probs,
         max_distance_km=200,
         fallback_distance_km=600,
+        lead_features={},
+        historical_feature_stats={},
     )
     ranked = enforce_distance_guardrail(scored, guardrail_km=40, probability_advantage=0.15)
 
@@ -117,3 +133,38 @@ def test_serialization_preserves_key_fields():
     assert serialized[0]["installer_id"] == 5
     assert serialized[0]["rank"] == 1
     assert serialized[0]["key_factors"] == ["distance:25km"]
+
+
+def test_fuzzy_logic_accounts_for_feature_matches():
+    installers = [
+        _build_installer(1, "FuzzyMatch", 0.0, 0.0),
+        _build_installer(2, "Generic", 0.0, 0.0),
+    ]
+    probs = {"FuzzyMatch": 0.5, "Generic": 0.5}
+    lead_features = {
+        "project_type": "Residential",
+        "product_type": "Film",
+        "square_footage": 1200.0,
+        "current_status": "won",
+    }
+    stats_lookup = {
+        "fuzzymatch": _build_stats(1150.0, 15, 15, 16),
+        "generic": _build_stats(3000.0, 1, 1, 2),
+    }
+
+    scored = score_installers(
+        installers,
+        lead_lat=0.0,
+        lead_lon=0.0,
+        distance_fn=lambda a, b, c, d: 0.0,
+        ml_probabilities=probs,
+        max_distance_km=200,
+        fallback_distance_km=600,
+        lead_features=lead_features,
+        historical_feature_stats=stats_lookup,
+    )
+
+    assert scored[0]["installer_id"] == 1
+    fuzzy_inputs_best = scored[0]["score_breakdown"]["fuzzy"]["inputs"]
+    fuzzy_inputs_other = scored[1]["score_breakdown"]["fuzzy"]["inputs"]
+    assert fuzzy_inputs_best["square_footage"] > fuzzy_inputs_other["square_footage"]

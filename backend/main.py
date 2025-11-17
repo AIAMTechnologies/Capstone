@@ -31,7 +31,7 @@ print("Loaded ENV:", {
 import secrets
 import time
 from datetime import datetime, timedelta
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from math import radians, sin, cos, sqrt, atan2
 
 from fastapi import FastAPI, HTTPException, Depends, status, Query, Header
@@ -526,12 +526,95 @@ def build_ml_feature_payload(source: Optional[Any]) -> dict:
     else:
         payload = getattr(source, "__dict__", {})
 
+    square_value = payload.get("square_footage") or payload.get("square_feet")
     return {
         "project_type": payload.get("project_type") or payload.get("job_type"),
         "product_type": payload.get("product_type"),
-        "square_footage": payload.get("square_footage") or payload.get("square_feet"),
+        "square_footage": _coerce_square_footage(square_value),
         "current_status": payload.get("current_status") or payload.get("status"),
     }
+
+
+def fetch_installer_historical_feature_stats(
+    installers: Sequence[Dict[str, Any]],
+    lead_features: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Return per-installer aggregates from historical_data for fuzzy scoring."""
+
+    if not installers:
+        return {}
+
+    installer_names = {
+        (inst.get("installer_name") or inst.get("name") or "").strip().lower()
+        for inst in installers
+        if inst.get("installer_name") or inst.get("name")
+    }
+    if not installer_names:
+        return {}
+
+    lead_features = lead_features or {}
+    project_type = (lead_features.get("project_type") or "").strip().lower()
+    product_type = (lead_features.get("product_type") or "").strip().lower()
+    current_status = (lead_features.get("current_status") or "").strip().lower()
+
+    query = """
+        SELECT
+            LOWER(dealer_name) AS dealer_key,
+            COUNT(*)::int AS total_jobs,
+            AVG(NULLIF(REGEXP_REPLACE(square_footage::text, '[^0-9.]', '', 'g'), '')::numeric) AS avg_square_footage,
+            SUM(
+                CASE
+                    WHEN %s = '' THEN 0
+                    WHEN LOWER(project_type) = %s THEN 1
+                    ELSE 0
+                END
+            )::int AS project_matches,
+            SUM(
+                CASE
+                    WHEN %s = '' THEN 0
+                    WHEN LOWER(product_type) = %s THEN 1
+                    ELSE 0
+                END
+            )::int AS product_matches,
+            SUM(
+                CASE
+                    WHEN %s = '' THEN 0
+                    WHEN LOWER(current_status) = %s THEN 1
+                    ELSE 0
+                END
+            )::int AS status_matches
+        FROM historical_data
+        WHERE LOWER(dealer_name) = ANY(%s)
+        GROUP BY dealer_key
+    """
+
+    params = (
+        project_type,
+        project_type,
+        product_type,
+        product_type,
+        current_status,
+        current_status,
+        list(installer_names),
+    )
+
+    rows = execute_query(query, params)
+
+    stats: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        dealer_key = (row.get("dealer_key") or "").strip()
+        if not dealer_key:
+            continue
+        avg_sqft = row.get("avg_square_footage")
+        stats[dealer_key] = {
+            "total_jobs": row.get("total_jobs"),
+            "project_matches": row.get("project_matches"),
+            "product_matches": row.get("product_matches"),
+            "status_matches": row.get("status_matches"),
+            "avg_square_footage": float(avg_sqft) if avg_sqft is not None else None,
+        }
+
+    return stats
 
 # ============================================
 # LEAD ALLOCATION ALGORITHM - ENHANCED VERSION
@@ -586,6 +669,7 @@ def allocate_lead_to_installer(
     # Prepare ML probabilities for this lead
     lead_features = build_ml_feature_payload(lead_payload)
     ml_probabilities = ml_allocator.predict_probabilities(lead_features)
+    historical_stats = fetch_installer_historical_feature_stats(installers, lead_features)
 
     # Calculate scores for all installers
     scored_installers = score_installers(
@@ -596,6 +680,8 @@ def allocate_lead_to_installer(
         ml_probabilities=ml_probabilities,
         max_distance_km=MAX_DISTANCE_KM,
         fallback_distance_km=FALLBACK_DISTANCE_KM,
+        lead_features=lead_features,
+        historical_feature_stats=historical_stats,
     )
 
     if not scored_installers:
