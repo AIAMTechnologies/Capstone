@@ -126,13 +126,39 @@ class InstallerMLModel:
         """Fetch data from the database and train the estimator."""
 
         logger.info("Training installer ML model from historical data")
+        feedback_union = ""
         try:
-            records = self._query_executor(
+            feedback_table = self._query_executor(
+                "SELECT to_regclass('public.installer_feedback') AS table_name",
+                None,
+                True,
+            )
+            if feedback_table and feedback_table[0].get("table_name"):
+                feedback_union = """
+                UNION ALL
+                SELECT
+                    selected_installer_name AS dealer_name,
+                    project_type,
+                    product_type,
+                    square_footage,
+                    current_status
+                FROM installer_feedback
+                WHERE selected_installer_name IS NOT NULL
+                """
+        except Exception:
+            feedback_union = ""
+
+        try:
+            query = (
                 """
                 SELECT dealer_name, project_type, product_type, square_footage, current_status
                 FROM historical_data
                 WHERE dealer_name IS NOT NULL
-                """,
+                """
+                + feedback_union
+            )
+            records = self._query_executor(
+                query,
                 None,
                 True,
             )
@@ -216,3 +242,15 @@ class InstallerMLModel:
         self._last_error = None
         logger.info("Installer ML model trained on %s rows", len(frame))
         return True
+
+
+def retrain_installer_model(
+    query_executor: Callable[[str, Optional[tuple], bool], list],
+    *,
+    force: bool = True,
+) -> InstallerMLModel:
+    """Convenience helper used by maintenance scripts or cron jobs."""
+
+    model = InstallerMLModel(query_executor)
+    model.train(force=force)
+    return model

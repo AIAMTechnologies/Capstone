@@ -41,9 +41,14 @@ from pydantic import BaseModel, EmailStr, Field, validator
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 import requests
 
+from allocation_logic import (
+    enforce_distance_guardrail,
+    score_installers,
+    serialize_recommendations_for_logging,
+)
 from ml_model import InstallerMLModel
 
 # ============================================
@@ -120,14 +125,170 @@ def execute_query(query: str, params: tuple = None, fetch: bool = True):
         conn.close()
 
 
+FEEDBACK_TABLE_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS installer_feedback (
+        id SERIAL PRIMARY KEY,
+        lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+        selected_installer_id INTEGER NOT NULL REFERENCES installers(id),
+        selected_installer_name TEXT NOT NULL,
+        selection_source TEXT NOT NULL DEFAULT 'manual_override',
+        selection_was_suggested BOOLEAN NOT NULL DEFAULT FALSE,
+        recommended_installers JSONB NOT NULL DEFAULT '[]'::jsonb,
+        project_type TEXT,
+        product_type TEXT,
+        square_footage NUMERIC,
+        current_status TEXT,
+        notes TEXT,
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_installer_feedback_lead_id
+    ON installer_feedback (lead_id)
+    """,
+]
+
+_feedback_table_ready = False
+
+
+def ensure_feedback_table() -> None:
+    """Create the installer feedback table if it does not already exist."""
+
+    global _feedback_table_ready
+    if _feedback_table_ready:
+        return
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            for statement in FEEDBACK_TABLE_STATEMENTS:
+                cursor.execute(statement)
+        conn.commit()
+        _feedback_table_ready = True
+    except Exception as exc:  # pragma: no cover - defensive guard
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to prepare feedback table: {exc}")
+    finally:
+        conn.close()
+
+
+def _coerce_square_footage(value: Optional[Any]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def record_installer_feedback(
+    *,
+    lead_id: int,
+    selected_installer_id: int,
+    recommended_installers: Optional[List[dict]] = None,
+    lead_features: Optional[dict] = None,
+    selection_source: str = "manual_override",
+    notes: Optional[str] = None,
+) -> Optional[int]:
+    """Persist the installer choice so it can be reused for retraining."""
+
+    ensure_feedback_table()
+    installer = execute_query(
+        "SELECT name FROM installers WHERE id = %s",
+        (selected_installer_id,),
+    )
+    if not installer:
+        raise HTTPException(status_code=404, detail="Installer not found for feedback logging")
+
+    selected_name = installer[0]["name"]
+    serialized_recommendations = serialize_recommendations_for_logging(
+        recommended_installers or [],
+    )
+    selection_was_suggested = False
+    if serialized_recommendations:
+        selection_was_suggested = serialized_recommendations[0].get("installer_id") == selected_installer_id
+
+    features = lead_features or {}
+    payload = {
+        "project_type": features.get("project_type"),
+        "product_type": features.get("product_type"),
+        "square_footage": _coerce_square_footage(features.get("square_footage")),
+        "current_status": features.get("current_status"),
+    }
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO installer_feedback (
+                    lead_id,
+                    selected_installer_id,
+                    selected_installer_name,
+                    selection_source,
+                    selection_was_suggested,
+                    recommended_installers,
+                    project_type,
+                    product_type,
+                    square_footage,
+                    current_status,
+                    notes
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    lead_id,
+                    selected_installer_id,
+                    selected_name,
+                    selection_source,
+                    selection_was_suggested,
+                    Json(serialized_recommendations),
+                    payload["project_type"],
+                    payload["product_type"],
+                    payload["square_footage"],
+                    payload["current_status"],
+                    notes,
+                ),
+            )
+            new_id = cursor.fetchone()[0]
+            conn.commit()
+            return new_id
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to log installer feedback: {exc}")
+    finally:
+        conn.close()
+
+
+def snapshot_recommendations(allocation_payload: Optional[dict]) -> List[dict]:
+    """Return a list of installer dicts in the order presented to the user."""
+
+    if not allocation_payload:
+        return []
+
+    ranked = allocation_payload.get("ranked_installers")
+    if ranked:
+        return [dict(item) for item in ranked]
+
+    results: List[dict] = []
+    best = allocation_payload.get("best_installer")
+    if best:
+        results.append(dict(best))
+    for installer in allocation_payload.get("alternative_installers", []):
+        results.append(dict(installer))
+    return results
+
+
 # Initialize the ML allocator once so it can be reused across requests
 ml_allocator = InstallerMLModel(execute_query)
 
 # Distance preferences used when evaluating installer suitability
-PREFERRED_DISTANCE_KM = 120
-ALTERNATIVE_DISTANCE_LIMIT_KM = 50
-LOCAL_PRIORITY_DISTANCE_KM = 75
-MAX_DISTANCE_KM = 400
+MAX_DISTANCE_KM = 200
+FALLBACK_DISTANCE_KM = 600
+DISTANCE_GUARDRAIL_KM = 40
+PROBABILITY_ADVANTAGE_THRESHOLD = 0.15
+RANKED_INSTALLER_LIMIT = 5
 
 # ============================================
 # PYDANTIC MODELS
@@ -162,6 +323,37 @@ class AlternativeInstaller(BaseModel):
     converted_leads: Optional[int] = None
     ml_probability: Optional[float] = None
     distance_review_required: Optional[bool] = None
+    rank: Optional[int] = None
+    success_rate: Optional[float] = None
+    quality_score: Optional[float] = None
+    is_within_max_distance: Optional[bool] = None
+    is_fallback_option: Optional[bool] = None
+    score_breakdown: Optional[dict] = None
+    key_factors: Optional[List[str]] = None
+
+
+def build_alternative_model(installer: dict) -> AlternativeInstaller:
+    """Convert a scored installer dictionary into the API model."""
+
+    return AlternativeInstaller(
+        id=installer['installer_id'],
+        name=installer['installer_name'],
+        city=installer.get('city'),
+        province=installer.get('province'),
+        distance_km=installer.get('distance_km'),
+        allocation_score=installer.get('allocation_score'),
+        active_leads=installer.get('active_leads', 0),
+        converted_leads=installer.get('converted_leads'),
+        ml_probability=installer.get('ml_probability'),
+        distance_review_required=installer.get('distance_review_required'),
+        rank=installer.get('rank'),
+        success_rate=installer.get('success_rate'),
+        quality_score=installer.get('quality_score'),
+        is_within_max_distance=installer.get('is_within_max_distance'),
+        is_fallback_option=installer.get('is_fallback_option'),
+        score_breakdown=installer.get('score_breakdown'),
+        key_factors=installer.get('key_factors'),
+    )
 
 class LeadResponse(BaseModel):
     id: int
@@ -178,8 +370,35 @@ class LeadResponse(BaseModel):
     installer_ml_probability: Optional[float] = None
     distance_review_required: Optional[bool] = None
     alternative_installers: Optional[List[AlternativeInstaller]]
+    ranked_installers: Optional[List[AlternativeInstaller]] = None
     created_at: datetime
     message: str = "Lead submitted successfully"
+
+
+class InstallerRecommendationSnapshot(BaseModel):
+    installer_id: int
+    installer_name: Optional[str] = None
+    allocation_score: Optional[float] = None
+    distance_km: Optional[float] = None
+    ml_probability: Optional[float] = None
+    success_rate: Optional[float] = None
+    quality_score: Optional[float] = None
+    is_within_max_distance: Optional[bool] = None
+    is_fallback_option: Optional[bool] = None
+    score_breakdown: Optional[dict] = None
+    rank: Optional[int] = None
+
+
+class InstallerChoiceFeedback(BaseModel):
+    lead_id: int
+    selected_installer_id: int
+    selection_source: Optional[str] = "ui_feedback"
+    notes: Optional[str] = None
+    recommended_installers: Optional[List[InstallerRecommendationSnapshot]] = None
+    project_type: Optional[str] = None
+    product_type: Optional[str] = None
+    square_footage: Optional[float] = None
+    current_status: Optional[str] = None
 
 
 class MLStatusResponse(BaseModel):
@@ -338,16 +557,18 @@ def allocate_lead_to_installer(
     # Get all active installers from the same province
     query = """
         SELECT
-            i.id,
-            i.name,
+            i.id AS installer_id,
+            i.name AS installer_name,
             i.email,
             i.city,
             i.province,
             i.latitude,
             i.longitude,
             i.is_active,
+            COUNT(l.id) as total_leads,
             COUNT(CASE WHEN l.status = 'active' THEN 1 END) as active_leads,
-            COUNT(CASE WHEN l.status = 'converted' THEN 1 END) as converted_leads
+            COUNT(CASE WHEN l.status = 'converted' THEN 1 END) as converted_leads,
+            COUNT(CASE WHEN l.status = 'dead' THEN 1 END) as dead_leads
         FROM installers i
         LEFT JOIN leads l ON i.id = l.assigned_installer_id
         WHERE i.is_active = TRUE
@@ -367,105 +588,60 @@ def allocate_lead_to_installer(
     ml_probabilities = ml_allocator.predict_probabilities(lead_features)
 
     # Calculate scores for all installers
-    scored_installers = []
-    max_closed = max((installer.get('converted_leads') or 0) for installer in installers) if installers else 0
-    max_active = max((installer.get('active_leads') or 0) for installer in installers) if installers else 0
-
-    for installer in installers:
-        # Calculate distance
-        distance_km = haversine_distance(
-            lead_lat, lead_lon,
-            installer['latitude'], installer['longitude']
-        )
-
-        if distance_km > MAX_DISTANCE_KM:
-            # Skip installers that are far outside the supported region
-            continue
-
-        installer_name = installer['name']
-        probability = (
-            ml_probabilities.get(installer_name)
-            or ml_probabilities.get(installer_name.lower())
-            or 0.0
-        )
-        closed_leads = installer.get('converted_leads') or 0
-        active_leads = installer.get('active_leads') or 0
-
-        # Distance handling: aggressively down-rank far installers so local
-        # dealers are always preferred when available.
-        if distance_km <= LOCAL_PRIORITY_DISTANCE_KM:
-            distance_bucket = 0
-            distance_component = 1.0
-            local_bonus = 0.1
-            regional_bonus = 0.05
-        elif distance_km <= PREFERRED_DISTANCE_KM:
-            distance_bucket = 1
-            span = max(PREFERRED_DISTANCE_KM - LOCAL_PRIORITY_DISTANCE_KM, 1)
-            distance_component = max(0.2, 1 - ((distance_km - LOCAL_PRIORITY_DISTANCE_KM) / span))
-            local_bonus = 0.0
-            regional_bonus = 0.05
-        else:
-            distance_bucket = 2
-            span = max(MAX_DISTANCE_KM - PREFERRED_DISTANCE_KM, 1)
-            distance_component = max(0.0, 0.3 * (1 - ((distance_km - PREFERRED_DISTANCE_KM) / span)))
-            local_bonus = 0.0
-            regional_bonus = 0.0
-
-        # Scale ML probabilities by distance so that far away installers need an
-        # overwhelmingly higher ML score to beat closer dealers.
-        distance_penalty = min(distance_km / MAX_DISTANCE_KM, 0.95)
-        adjusted_probability = probability * (1 - distance_penalty)
-
-        closed_component = (closed_leads / max_closed) if max_closed else 0
-        active_component = (active_leads / max_active) if max_active else 0
-
-        allocation_score = (
-            (adjusted_probability * 0.6)
-            + (distance_component * 0.25)
-            + (closed_component * 0.15)
-            - (active_component * 0.1)
-            + local_bonus
-            + regional_bonus
-        )
-
-        scored_installers.append({
-            'installer_id': installer['id'],
-            'installer_name': installer['name'],
-            'city': installer['city'],
-            'province': installer['province'],
-            'distance_km': round(distance_km, 2),
-            'allocation_score': round(allocation_score, 4),
-            'active_leads': active_leads,
-            'converted_leads': closed_leads,
-            'ml_probability': round(probability, 4),
-            'distance_review_required': distance_bucket == 2,
-            'distance_bucket': distance_bucket,
-        })
-
-    # Sort so that closer installers are always evaluated before farther ones.
-    scored_installers.sort(key=lambda x: (x['distance_bucket'], -x['allocation_score']))
+    scored_installers = score_installers(
+        installers,
+        lead_lat=lead_lat,
+        lead_lon=lead_lon,
+        distance_fn=haversine_distance,
+        ml_probabilities=ml_probabilities,
+        max_distance_km=MAX_DISTANCE_KM,
+        fallback_distance_km=FALLBACK_DISTANCE_KM,
+    )
 
     if not scored_installers:
         return None
 
-    def sanitize(installer: dict) -> dict:
-        cleaned = dict(installer)
-        cleaned.pop('distance_bucket', None)
-        return cleaned
+    scored_installers = enforce_distance_guardrail(
+        scored_installers,
+        guardrail_km=DISTANCE_GUARDRAIL_KM,
+        probability_advantage=PROBABILITY_ADVANTAGE_THRESHOLD,
+    )
 
-    best_installer = sanitize(scored_installers[0])
+    def sanitize(installer: dict, rank: int) -> dict:
+        installer_id = installer.get('installer_id') or installer.get('id')
+        installer_name = installer.get('installer_name') or installer.get('name')
+        return {
+            'installer_id': installer_id,
+            'installer_name': installer_name,
+            'city': installer.get('city'),
+            'province': installer.get('province'),
+            'distance_km': round(installer.get('distance_km', 0.0), 2),
+            'allocation_score': round(installer.get('allocation_score', 0.0), 4),
+            'active_leads': installer.get('active_leads') or 0,
+            'converted_leads': installer.get('converted_leads') or 0,
+            'ml_probability': installer.get('ml_probability'),
+            'distance_review_required': installer.get('distance_review_required'),
+            'rank': rank,
+            'success_rate': installer.get('success_rate'),
+            'quality_score': installer.get('quality_score'),
+            'is_within_max_distance': installer.get('is_within_max_distance'),
+            'is_fallback_option': installer.get('is_fallback_option'),
+            'score_breakdown': installer.get('score_breakdown'),
+            'key_factors': installer.get('key_factors'),
+        }
 
-    # Get alternative installers within 50km (excluding the best one)
-    alternatives = [
-        sanitize(installer)
-        for installer in scored_installers
-        if installer['installer_id'] != best_installer['installer_id']
-        and installer['distance_km'] <= ALTERNATIVE_DISTANCE_LIMIT_KM
-    ][:3]  # Limit to 3 alternatives
+    sanitized_ranked = []
+    for idx, installer in enumerate(scored_installers, start=1):
+        installer['rank'] = idx
+        sanitized_ranked.append(sanitize(installer, idx))
+
+    best_installer = sanitized_ranked[0]
+    alternatives = sanitized_ranked[1:RANKED_INSTALLER_LIMIT]
 
     return {
         'best_installer': best_installer,
-        'alternative_installers': alternatives
+        'alternative_installers': alternatives,
+        'ranked_installers': sanitized_ranked[:RANKED_INSTALLER_LIMIT],
     }
 
 # ============================================
@@ -615,22 +791,17 @@ async def create_lead(lead: LeadCreate):
         
         # Step 4: Format alternative installers response
         alternative_installers = None
-        if allocation and allocation['alternative_installers']:
-            alternative_installers = [
-                AlternativeInstaller(
-                    id=alt['installer_id'],
-                    name=alt['installer_name'],
-                    city=alt['city'],
-                    province=alt['province'],
-                    distance_km=alt['distance_km'],
-                    allocation_score=alt['allocation_score'],
-                    active_leads=alt['active_leads'],
-                    converted_leads=alt.get('converted_leads'),
-                    ml_probability=alt.get('ml_probability'),
-                    distance_review_required=alt.get('distance_review_required'),
-                ) for alt in allocation['alternative_installers']
-            ]
-        
+        ranked_installers: Optional[List[AlternativeInstaller]] = None
+        if allocation:
+            if allocation.get('alternative_installers'):
+                alternative_installers = [
+                    build_alternative_model(alt)
+                    for alt in allocation['alternative_installers']
+                ]
+            ranked_payload = allocation.get('ranked_installers')
+            if ranked_payload:
+                ranked_installers = [build_alternative_model(item) for item in ranked_payload]
+
         # Step 5: Return response
         return LeadResponse(
             id=lead_id,
@@ -647,6 +818,7 @@ async def create_lead(lead: LeadCreate):
             installer_ml_probability=allocation['best_installer'].get('ml_probability') if allocation else None,
             distance_review_required=allocation['best_installer'].get('distance_review_required') if allocation else None,
             alternative_installers=alternative_installers,
+            ranked_installers=ranked_installers,
             created_at=created_at,
             message="Lead submitted and assigned successfully" if allocation else "Lead submitted - no installer available in your area"
         )
@@ -776,12 +948,15 @@ async def get_all_leads(
                 lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
                 lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
                 lead_dict['alternative_installers'] = allocation['alternative_installers']
+                lead_dict['ranked_installers'] = allocation.get('ranked_installers') or []
             else:
                 lead_dict['alternative_installers'] = []
                 lead_dict['distance_review_required'] = None
+                lead_dict['ranked_installers'] = []
         else:
             lead_dict['alternative_installers'] = []
             lead_dict['distance_review_required'] = None
+            lead_dict['ranked_installers'] = []
         
         enhanced_leads.append(lead_dict)
     
@@ -830,12 +1005,15 @@ async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_cu
             lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
             lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
             lead_dict['alternative_installers'] = allocation['alternative_installers']
+            lead_dict['ranked_installers'] = allocation.get('ranked_installers') or []
         else:
             lead_dict['alternative_installers'] = []
             lead_dict['distance_review_required'] = None
+            lead_dict['ranked_installers'] = []
     else:
         lead_dict['alternative_installers'] = []
         lead_dict['distance_review_required'] = None
+        lead_dict['ranked_installers'] = []
     
     return lead_dict
 
@@ -863,7 +1041,7 @@ async def update_installer_override(
     current_user: AdminUser = Depends(get_current_user)
 ):
     """Update installer override - allows manual assignment of alternative installers"""
-    
+
     # Validate installer exists if provided
     if installer_id:
         installer_check = execute_query(
@@ -872,18 +1050,103 @@ async def update_installer_override(
         )
         if not installer_check:
             raise HTTPException(status_code=404, detail="Installer not found or inactive")
-    
-    query = """
-        UPDATE leads 
-        SET installer_override_id = %s, updated_at = CURRENT_TIMESTAMP 
+
+    lead_record = execute_query(
+        "SELECT id, latitude, longitude, province, job_type, status FROM leads WHERE id = %s",
+        (lead_id,),
+    )
+    if not lead_record:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    lead_payload = lead_record[0]
+    allocation_snapshot = None
+    if lead_payload.get('latitude') and lead_payload.get('longitude'):
+        allocation_snapshot = allocate_lead_to_installer(
+            lead_payload['latitude'],
+            lead_payload['longitude'],
+            lead_payload['province'],
+            lead_payload,
+        )
+
+    execute_query(
+        """
+        UPDATE leads
+        SET installer_override_id = %s, updated_at = CURRENT_TIMESTAMP
         WHERE id = %s
-    """
-    execute_query(query, (installer_id, lead_id), fetch=False)
-    
+        """,
+        (installer_id, lead_id),
+        fetch=False,
+    )
+
+    feedback_id = None
+    if installer_id:
+        recommendations = snapshot_recommendations(allocation_snapshot)
+        lead_features = build_ml_feature_payload(lead_payload)
+        feedback_id = record_installer_feedback(
+            lead_id=lead_id,
+            selected_installer_id=installer_id,
+            recommended_installers=recommendations,
+            lead_features=lead_features,
+            selection_source="installer_override_endpoint",
+        )
+
     return {
-        "message": "Installer override updated successfully", 
-        "lead_id": lead_id, 
-        "installer_id": installer_id
+        "message": "Installer override updated successfully",
+        "lead_id": lead_id,
+        "installer_id": installer_id,
+        "feedback_logged": bool(feedback_id),
+        "feedback_id": feedback_id,
+    }
+
+
+@app.post("/api/admin/feedback/installer-choice")
+async def submit_installer_feedback(
+    payload: InstallerChoiceFeedback,
+    current_user: AdminUser = Depends(get_current_user),
+):
+    """Log installer selections from other UI workflows."""
+
+    lead_record = execute_query(
+        "SELECT id, latitude, longitude, province, job_type, status FROM leads WHERE id = %s",
+        (payload.lead_id,),
+    )
+    if not lead_record:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    lead_payload = lead_record[0]
+    recommendations = []
+    if payload.recommended_installers:
+        recommendations = [rec.model_dump() for rec in payload.recommended_installers]
+    else:
+        allocation_snapshot = None
+        if lead_payload.get('latitude') and lead_payload.get('longitude'):
+            allocation_snapshot = allocate_lead_to_installer(
+                lead_payload['latitude'],
+                lead_payload['longitude'],
+                lead_payload['province'],
+                lead_payload,
+            )
+        recommendations = snapshot_recommendations(allocation_snapshot)
+
+    feature_source = dict(lead_payload)
+    overrides = payload.model_dump(exclude={"recommended_installers"}, exclude_none=True)
+    feature_source.update(overrides)
+    lead_features = build_ml_feature_payload(feature_source)
+
+    feedback_id = record_installer_feedback(
+        lead_id=payload.lead_id,
+        selected_installer_id=payload.selected_installer_id,
+        recommended_installers=recommendations,
+        lead_features=lead_features,
+        selection_source=payload.selection_source or "ui_feedback",
+        notes=payload.notes,
+    )
+
+    return {
+        "message": "Feedback logged",
+        "feedback_id": feedback_id,
+        "lead_id": payload.lead_id,
+        "selected_installer_id": payload.selected_installer_id,
     }
 
 @app.get("/api/admin/installers")
