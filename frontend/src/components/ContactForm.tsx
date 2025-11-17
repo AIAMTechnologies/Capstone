@@ -1,9 +1,10 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useForm } from 'react-hook-form';
 import { Autocomplete, useLoadScript } from '@react-google-maps/api';
 import { MapPin, User, Mail, Phone, Home, MessageSquare, Send, CheckCircle } from 'lucide-react';
-import { submitLead } from '../services/api';
+import { submitLead, getPublicGoogleMapsApiKey } from '../services/api';
 import type { LeadFormData } from '../types';
+import { env } from '../config/env';
 
 const libraries: ("places")[] = ['places'];
 
@@ -326,22 +327,84 @@ const ContactFormContent: React.FC<ContactFormContentProps> = ({ googleMapsApiKe
 };
 
 const ContactForm: React.FC = () => {
-  const googleMapsApiKey = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY ?? '').trim();
+  const compileTimeKey = env.googleMapsApiKey;
+  const [resolvedKey, setResolvedKey] = useState<string | null>(compileTimeKey || null);
+  const [fetchingRuntimeKey, setFetchingRuntimeKey] = useState(!compileTimeKey);
+  const [keyError, setKeyError] = useState<string | null>(null);
 
-  if (!googleMapsApiKey) {
-    console.warn('VITE_GOOGLE_MAPS_API_KEY is missing. Ensure frontend/.env.local is configured and Vite has been restarted.');
+  useEffect(() => {
+    if (compileTimeKey) {
+      setResolvedKey(compileTimeKey);
+      setFetchingRuntimeKey(false);
+      setKeyError(null);
+      return;
+    }
+
+    let active = true;
+    setFetchingRuntimeKey(true);
+    setKeyError(null);
+
+    (async () => {
+      try {
+        const runtimeKey = await getPublicGoogleMapsApiKey();
+        if (!active) {
+          return;
+        }
+
+        if (runtimeKey) {
+          setResolvedKey(runtimeKey);
+          setKeyError(null);
+        } else {
+          setKeyError('Google Maps is temporarily unavailable because the API key is missing from the server configuration.');
+        }
+      } catch (error) {
+        if (!active) {
+          return;
+        }
+        setKeyError('Unable to load the Google Maps API key from the server. Please try again or verify backend/.env.');
+      } finally {
+        if (active) {
+          setFetchingRuntimeKey(false);
+        }
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [compileTimeKey]);
+
+  if (fetchingRuntimeKey) {
     return (
       <div className="card" style={{ maxWidth: '800px', margin: '40px auto' }}>
-        <div className="alert alert-error">
-          Google Maps is temporarily unavailable because the API key is missing. Please set VITE_GOOGLE_MAPS_API_KEY in
-          <code style={{ margin: '0 0.25rem' }}>frontend/.env.local</code>
-          and restart the frontend dev server.
+        <div className="form-group" style={{ textAlign: 'center' }}>
+          <div className="spinner" style={{ margin: '0 auto 1rem' }} />
+          <p>Loading Google Maps configuration…</p>
         </div>
       </div>
     );
   }
 
-  return <ContactFormContent googleMapsApiKey={googleMapsApiKey} />;
+  if (!resolvedKey) {
+    return (
+      <div className="card" style={{ maxWidth: '800px', margin: '40px auto' }}>
+        <div className="alert alert-error">
+          {keyError || 'Google Maps is temporarily unavailable because the API key is missing.'}
+          <div style={{ marginTop: '0.5rem' }}>
+            Ensure <code>frontend/.env.local</code> contains a valid <code>VITE_GOOGLE_MAPS_API_KEY</code> and restart the Vite dev server.
+            {env.isGoogleMapsKeyPlaceholder && (
+              <>
+                {' '}
+                The placeholder value <code>YOUR_FRONTEND_GOOGLE_KEY</code> is ignored to prevent invalid key errors.
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return <ContactFormContent googleMapsApiKey={resolvedKey} />;
 };
 
 export default ContactForm;

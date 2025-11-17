@@ -58,6 +58,7 @@ class Settings:
 
     GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")
     GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
+    FRONTEND_GOOGLE_MAPS_API_KEY = os.getenv("VITE_GOOGLE_MAPS_API_KEY", "").strip()
     ML_PUBLIC_API_KEY = os.getenv("ML_PUBLIC_API_KEY")
 
 settings = Settings()
@@ -539,6 +540,14 @@ def has_valid_ml_api_key(provided_key: Optional[str]) -> bool:
 async def root():
     """Health check endpoint"""
     return {"status": "healthy", "message": "Lead Allocation System API is running"}
+
+
+@app.get("/api/config/map-key")
+async def get_public_google_maps_key():
+    """Expose the frontend Google Maps key so the UI can recover from missing build-time envs."""
+
+    return {"googleMapsApiKey": settings.FRONTEND_GOOGLE_MAPS_API_KEY or None}
+
 
 @app.post("/api/leads", response_model=LeadResponse)
 async def create_lead(lead: LeadCreate):
