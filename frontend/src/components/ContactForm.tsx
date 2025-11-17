@@ -7,19 +7,23 @@ import type { LeadFormData } from '../types';
 
 const libraries: ("places")[] = ['places'];
 
-const ContactForm: React.FC = () => {
+interface ContactFormContentProps {
+  googleMapsApiKey: string;
+}
+
+const ContactFormContent: React.FC<ContactFormContentProps> = ({ googleMapsApiKey }) => {
   const [autocomplete, setAutocomplete] = useState<google.maps.places.Autocomplete | null>(null);
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [addressError, setAddressError] = useState('');
   const addressInputRef = useRef<HTMLInputElement>(null);
-  
+
   const { register, handleSubmit, formState: { errors }, setValue, reset } = useForm<LeadFormData>();
 
   // Load Google Maps script
   const { isLoaded, loadError } = useLoadScript({
-    googleMapsApiKey: import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '',
+    googleMapsApiKey,
     libraries,
   });
 
@@ -319,6 +323,25 @@ const ContactForm: React.FC = () => {
       </form>
     </div>
   );
+};
+
+const ContactForm: React.FC = () => {
+  const googleMapsApiKey = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY ?? '').trim();
+
+  if (!googleMapsApiKey) {
+    console.warn('VITE_GOOGLE_MAPS_API_KEY is missing. Ensure frontend/.env.local is configured and Vite has been restarted.');
+    return (
+      <div className="card" style={{ maxWidth: '800px', margin: '40px auto' }}>
+        <div className="alert alert-error">
+          Google Maps is temporarily unavailable because the API key is missing. Please set VITE_GOOGLE_MAPS_API_KEY in
+          <code style={{ margin: '0 0.25rem' }}>frontend/.env.local</code>
+          and restart the frontend dev server.
+        </div>
+      </div>
+    );
+  }
+
+  return <ContactFormContent googleMapsApiKey={googleMapsApiKey} />;
 };
 
 export default ContactForm;
