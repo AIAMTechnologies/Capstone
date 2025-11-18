@@ -289,6 +289,45 @@ FALLBACK_DISTANCE_KM = 600
 DISTANCE_GUARDRAIL_KM = 40
 PROBABILITY_ADVANTAGE_THRESHOLD = 0.15
 RANKED_INSTALLER_LIMIT = 5
+# Historical feature stats cache keeps us from querying the historical_data
+# table for every single lead that appears on the dashboard.  The values are
+# intentionally short-lived so nightly refreshes or manual overrides are
+# visible quickly while still protecting the admin dashboard from slow queries.
+HISTORICAL_STATS_CACHE_TTL_SECONDS = 300  # 5 minutes
+HISTORICAL_STATS_CACHE_LIMIT = 128
+_historical_stats_cache: Dict[
+    tuple,
+    tuple[float, Dict[str, Dict[str, Any]]],
+] = {}
+
+
+def _historical_stats_cache_key(
+    installer_names: Sequence[str],
+    project_type: str,
+    product_type: str,
+    current_status: str,
+) -> tuple:
+    return (
+        tuple(sorted(installer_names)),
+        project_type,
+        product_type,
+        current_status,
+    )
+
+
+def _clone_stats(stats: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {dealer: dict(values) for dealer, values in stats.items()}
+
+
+def _prune_historical_stats_cache(now_ts: float) -> None:
+    expired: List[tuple] = []
+    for key, (ts, _) in list(_historical_stats_cache.items()):
+        if now_ts - ts > HISTORICAL_STATS_CACHE_TTL_SECONDS:
+            expired.append(key)
+    for key in expired:
+        _historical_stats_cache.pop(key, None)
+    while len(_historical_stats_cache) > HISTORICAL_STATS_CACHE_LIMIT:
+        _historical_stats_cache.pop(next(iter(_historical_stats_cache)))
 
 # ============================================
 # PYDANTIC MODELS
@@ -557,6 +596,20 @@ def fetch_installer_historical_feature_stats(
     product_type = (lead_features.get("product_type") or "").strip().lower()
     current_status = (lead_features.get("current_status") or "").strip().lower()
 
+    cache_key = _historical_stats_cache_key(
+        tuple(installer_names),
+        project_type,
+        product_type,
+        current_status,
+    )
+    now_ts = time.time()
+    cached_entry = _historical_stats_cache.get(cache_key)
+    if cached_entry:
+        cached_ts, cached_stats = cached_entry
+        if now_ts - cached_ts <= HISTORICAL_STATS_CACHE_TTL_SECONDS:
+            return _clone_stats(cached_stats)
+        _historical_stats_cache.pop(cache_key, None)
+
     query = """
         SELECT
             LOWER(dealer_name) AS dealer_key,
@@ -614,7 +667,10 @@ def fetch_installer_historical_feature_stats(
             "avg_square_footage": float(avg_sqft) if avg_sqft is not None else None,
         }
 
-    return stats
+    if stats:
+        _prune_historical_stats_cache(now_ts)
+        _historical_stats_cache[cache_key] = (now_ts, stats)
+    return _clone_stats(stats)
 
 # ============================================
 # LEAD ALLOCATION ALGORITHM - ENHANCED VERSION
