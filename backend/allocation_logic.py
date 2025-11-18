@@ -13,6 +13,12 @@ FUZZY_IMPORTANCE_WEIGHTS = {
     "project_type": 0.05,
 }
 
+# After validating the initial fuzzy-only deployment with real leads, we saw situations where
+# attribute matches could still outweigh distance. To prevent far-away installers from beating
+# obviously closer options, we blend the final score so that distance remains the single most
+# important factor.
+DISTANCE_DOMINANCE_WEIGHT = 0.7
+
 _ATTRIBUTE_WEIGHT_SUM = (
     FUZZY_IMPORTANCE_WEIGHTS["square_footage"]
     + FUZZY_IMPORTANCE_WEIGHTS["current_status"]
@@ -82,7 +88,7 @@ def _square_footage_score(
 
 
 def _ratio_score(matches: Optional[float], total: Optional[float]) -> float:
-    if not matches or not total:
+    if matches is None or total is None or total <= 0:
         return 0.5
     return _clamp(float(matches) / float(total))
 
@@ -240,7 +246,11 @@ def score_installers(
         fuzzy_result = _fuzzy_score(distance_bits["distance_score"], fuzzy_inputs)
         distance_score = distance_bits["distance_score"]
         quality_score = round(fuzzy_result["attribute_strength"], 4)
-        allocation_score = fuzzy_result["score"] - (workload_ratio * 0.05)
+        composite_score = (
+            (DISTANCE_DOMINANCE_WEIGHT * distance_score)
+            + ((1 - DISTANCE_DOMINANCE_WEIGHT) * fuzzy_result["score"])
+        )
+        allocation_score = composite_score - (workload_ratio * 0.05)
         if not distance_bits["is_within_max_distance"] and has_local:
             allocation_score *= 0.5
 
@@ -257,6 +267,7 @@ def score_installers(
                 "score_breakdown": {
                     "distance_score": distance_score,
                     "quality_score": quality_score,
+                    "composite_score": round(composite_score, 4),
                     "workload_penalty": round(workload_ratio * 0.05, 4),
                     "fuzzy": fuzzy_result,
                 },

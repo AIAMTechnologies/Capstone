@@ -89,10 +89,20 @@ def test_guardrail_blocks_far_option_without_probability_edge():
 
 def test_guardrail_allows_far_option_with_large_probability_edge():
     installers = [
-        _build_installer(1, "Closest", 0.0, 0.0, converted_leads=1, total_leads=2, active_leads=4, dead_leads=1),
-        _build_installer(2, "Farther", 0.7, 0.0, converted_leads=20, total_leads=25, active_leads=1, dead_leads=2),
+        _build_installer(1, "CloserButMismatched", 2.25, 0.0, converted_leads=1, total_leads=2, active_leads=4, dead_leads=1),
+        _build_installer(2, "SpecialistFar", 2.97, 0.0, converted_leads=20, total_leads=25, active_leads=1, dead_leads=2),
     ]
-    probs = {"Closest": 0.3, "Farther": 0.65}
+    probs = {"CloserButMismatched": 0.05, "SpecialistFar": 0.95}
+    lead_features = {
+        "project_type": "Commercial",
+        "product_type": "Tint",
+        "square_footage": 5000.0,
+        "current_status": "won",
+    }
+    stats_lookup = {
+        "closerbutmismatched": _build_stats(0.0, 0, 0, 0, total_jobs=25),
+        "specialistfar": _build_stats(5000.0, 23, 23, 24, total_jobs=25),
+    }
 
     scored = score_installers(
         installers,
@@ -102,8 +112,8 @@ def test_guardrail_allows_far_option_with_large_probability_edge():
         ml_probabilities=probs,
         max_distance_km=200,
         fallback_distance_km=600,
-        lead_features={},
-        historical_feature_stats={},
+        lead_features=lead_features,
+        historical_feature_stats=stats_lookup,
     )
     ranked = enforce_distance_guardrail(scored, guardrail_km=40, probability_advantage=0.15)
 
