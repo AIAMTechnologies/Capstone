@@ -32,6 +32,11 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 
+from fuzzy_allocator import (
+    fetch_installer_historical_feature_stats,
+    normalize_installer_name,
+    score_installer_with_fuzzy_logic,
+)
 from ml_model import InstallerMLModel
 
 # Load environment variables from a project-level .env file when running locally
@@ -119,7 +124,8 @@ ml_allocator = InstallerMLModel(execute_query)
 PREFERRED_DISTANCE_KM = 120
 ALTERNATIVE_DISTANCE_LIMIT_KM = 50
 LOCAL_PRIORITY_DISTANCE_KM = 75
-MAX_DISTANCE_KM = 400
+FUZZY_MAX_DISTANCE_KM = 200
+ABSOLUTE_DISTANCE_LIMIT_KM = 400
 
 # ============================================
 # PYDANTIC MODELS
@@ -350,75 +356,62 @@ def allocate_lead_to_installer(
     """
     
     installers = execute_query(query, (province,))
-    
+
     if not installers:
         return None
-    
-    # Prepare ML probabilities for this lead
+
+    historical_stats = fetch_installer_historical_feature_stats(execute_query)
+
+    # Prepare ML probabilities for this lead (still exposed for debugging)
     lead_features = build_ml_feature_payload(lead_payload)
     ml_probabilities = ml_allocator.predict_probabilities(lead_features)
 
-    # Calculate scores for all installers
     scored_installers = []
     max_closed = max((installer.get('converted_leads') or 0) for installer in installers) if installers else 0
     max_active = max((installer.get('active_leads') or 0) for installer in installers) if installers else 0
 
     for installer in installers:
-        # Calculate distance
         distance_km = haversine_distance(
             lead_lat, lead_lon,
             installer['latitude'], installer['longitude']
         )
 
-        if distance_km > MAX_DISTANCE_KM:
-            # Skip installers that are far outside the supported region
+        if distance_km > ABSOLUTE_DISTANCE_LIMIT_KM:
             continue
 
-        installer_name = installer['name']
+        normalized_name = normalize_installer_name(installer.get('name'))
+        installer_stats = historical_stats.get(normalized_name, {}) if normalized_name else {}
+
+        fuzzy_score, breakdown = score_installer_with_fuzzy_logic(
+            distance_km=distance_km,
+            installer_stats=installer_stats,
+            lead_features=lead_features,
+        )
+
         probability = (
-            ml_probabilities.get(installer_name)
-            or ml_probabilities.get(installer_name.lower())
+            ml_probabilities.get(installer['name'])
+            or ml_probabilities.get((installer.get('name') or '').lower())
             or 0.0
         )
         closed_leads = installer.get('converted_leads') or 0
         active_leads = installer.get('active_leads') or 0
 
-        # Distance handling: aggressively down-rank far installers so local
-        # dealers are always preferred when available.
+        conversion_component = (closed_leads / max_closed) if max_closed else 0
+        workload_component = (active_leads / max_active) if max_active else 0
+
+        allocation_score = fuzzy_score
+        allocation_score += conversion_component * 0.05
+        allocation_score -= workload_component * 0.05
+        allocation_score = max(0.0, min(1.0, allocation_score))
+
         if distance_km <= LOCAL_PRIORITY_DISTANCE_KM:
             distance_bucket = 0
-            distance_component = 1.0
-            local_bonus = 0.1
-            regional_bonus = 0.05
         elif distance_km <= PREFERRED_DISTANCE_KM:
             distance_bucket = 1
-            span = max(PREFERRED_DISTANCE_KM - LOCAL_PRIORITY_DISTANCE_KM, 1)
-            distance_component = max(0.2, 1 - ((distance_km - LOCAL_PRIORITY_DISTANCE_KM) / span))
-            local_bonus = 0.0
-            regional_bonus = 0.05
-        else:
+        elif distance_km <= FUZZY_MAX_DISTANCE_KM:
             distance_bucket = 2
-            span = max(MAX_DISTANCE_KM - PREFERRED_DISTANCE_KM, 1)
-            distance_component = max(0.0, 0.3 * (1 - ((distance_km - PREFERRED_DISTANCE_KM) / span)))
-            local_bonus = 0.0
-            regional_bonus = 0.0
-
-        # Scale ML probabilities by distance so that far away installers need an
-        # overwhelmingly higher ML score to beat closer dealers.
-        distance_penalty = min(distance_km / MAX_DISTANCE_KM, 0.95)
-        adjusted_probability = probability * (1 - distance_penalty)
-
-        closed_component = (closed_leads / max_closed) if max_closed else 0
-        active_component = (active_leads / max_active) if max_active else 0
-
-        allocation_score = (
-            (adjusted_probability * 0.6)
-            + (distance_component * 0.25)
-            + (closed_component * 0.15)
-            - (active_component * 0.1)
-            + local_bonus
-            + regional_bonus
-        )
+        else:
+            distance_bucket = 3
 
         scored_installers.append({
             'installer_id': installer['id'],
@@ -430,30 +423,35 @@ def allocate_lead_to_installer(
             'active_leads': active_leads,
             'converted_leads': closed_leads,
             'ml_probability': round(probability, 4),
-            'distance_review_required': distance_bucket == 2,
+            'distance_review_required': distance_km > FUZZY_MAX_DISTANCE_KM,
             'distance_bucket': distance_bucket,
+            'score_breakdown': breakdown,
         })
-
-    # Sort so that closer installers are always evaluated before farther ones.
-    scored_installers.sort(key=lambda x: (x['distance_bucket'], -x['allocation_score']))
 
     if not scored_installers:
         return None
 
+    scored_installers.sort(key=lambda x: (x['distance_bucket'], -x['allocation_score']))
+
+    prioritized = [
+        installer for installer in scored_installers
+        if installer['distance_km'] <= FUZZY_MAX_DISTANCE_KM
+    ] or scored_installers
+
     def sanitize(installer: dict) -> dict:
         cleaned = dict(installer)
         cleaned.pop('distance_bucket', None)
+        cleaned.pop('score_breakdown', None)
         return cleaned
 
-    best_installer = sanitize(scored_installers[0])
+    best_installer = sanitize(prioritized[0])
 
-    # Get alternative installers within 50km (excluding the best one)
     alternatives = [
         sanitize(installer)
         for installer in scored_installers
         if installer['installer_id'] != best_installer['installer_id']
         and installer['distance_km'] <= ALTERNATIVE_DISTANCE_LIMIT_KM
-    ][:3]  # Limit to 3 alternatives
+    ][:3]
 
     return {
         'best_installer': best_installer,
