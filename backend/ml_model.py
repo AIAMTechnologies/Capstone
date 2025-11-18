@@ -91,9 +91,9 @@ class InstallerMLModel:
         Parameters
         ----------
         features:
-            Dictionary containing ``project_type``, ``product_type``,
-            ``square_footage`` and ``current_status``.  Missing values are
-            imputed using the statistics learned during training.
+            Dictionary containing ``project_type``, ``square_footage`` and
+            ``current_status``.  Missing values are imputed using the
+            statistics learned during training.
         """
 
         if not self.ensure_ready() or self._pipeline is None:
@@ -101,7 +101,6 @@ class InstallerMLModel:
 
         model_features = {
             "project_type": features.get("project_type") or "Unknown",
-            "product_type": features.get("product_type") or "Unknown",
             "square_footage": features.get("square_footage"),
             "current_status": features.get("current_status") or "Unknown",
         }
@@ -129,7 +128,7 @@ class InstallerMLModel:
         try:
             records = self._query_executor(
                 """
-                SELECT dealer_name, project_type, product_type, square_footage, current_status
+                SELECT dealer_name, project_type, square_footage, current_status
                 FROM historical_data
                 WHERE dealer_name IS NOT NULL
                 """,
@@ -155,7 +154,6 @@ class InstallerMLModel:
         frame = pd.DataFrame(records)
         frame["square_footage"] = pd.to_numeric(frame.get("square_footage"), errors="coerce")
         frame["project_type"] = frame.get("project_type", "Unknown").fillna("Unknown")
-        frame["product_type"] = frame.get("product_type", "Unknown").fillna("Unknown")
         frame["current_status"] = frame.get("current_status", "Unknown").fillna("Unknown")
         frame = frame.dropna(subset=["dealer_name"])
 
@@ -166,10 +164,10 @@ class InstallerMLModel:
             self._last_error = "insufficient_label_diversity"
             return False
 
-        features = frame[["project_type", "product_type", "square_footage", "current_status"]]
+        features = frame[["project_type", "square_footage", "current_status"]]
         labels = frame["dealer_name"].astype(str).str.strip()
 
-        categorical_features = ["project_type", "product_type", "current_status"]
+        categorical_features = ["project_type", "current_status"]
         numeric_features = ["square_footage"]
 
         categorical_transformer = Pipeline(
