@@ -14,12 +14,15 @@
 # requests==2.31.0
 
 import os
+import secrets
 import time
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Any, List, Optional
 from math import radians, sin, cos, sqrt, atan2
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Depends, status, Query, Header
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field, validator
@@ -29,15 +32,30 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 
+from fuzzy_allocator import (
+    fetch_installer_historical_feature_stats,
+    normalize_installer_name,
+    score_installer_with_fuzzy_logic,
+)
+from ml_model import InstallerMLModel
+
+# Load environment variables from a project-level .env file when running locally
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = BASE_DIR / ".env"
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+
 # ============================================
 # CONFIGURATION
 # ============================================
 
 class Settings:
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:4567@localhost:5432/capstone25")
+    #DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:4567@localhost:5432/capstone25")
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://q4gems_admin:890*()iopIOP@capstone25.postgres.database.azure.com:5432/capstone25db")  #Azure specific
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
+    ML_PUBLIC_API_KEY = os.getenv("ML_PUBLIC_API_KEY")
     
     # Geocoding API (Google Maps or alternative)
     GEOCODING_API_KEY = os.getenv("GEOCODING_API_KEY", "")
@@ -98,6 +116,17 @@ def execute_query(query: str, params: tuple = None, fetch: bool = True):
     finally:
         conn.close()
 
+
+# Initialize the ML allocator once so it can be reused across requests
+ml_allocator = InstallerMLModel(execute_query)
+
+# Distance preferences used when evaluating installer suitability
+PREFERRED_DISTANCE_KM = 120
+ALTERNATIVE_DISTANCE_LIMIT_KM = 50
+LOCAL_PRIORITY_DISTANCE_KM = 75
+FUZZY_MAX_DISTANCE_KM = 200
+ABSOLUTE_DISTANCE_LIMIT_KM = 400
+
 # ============================================
 # PYDANTIC MODELS
 # ============================================
@@ -120,6 +149,18 @@ class LeadCreate(BaseModel):
             raise ValueError(f'Province must be one of: {", ".join(valid_provinces)}')
         return v.upper()
 
+class AlternativeInstaller(BaseModel):
+    id: int
+    name: str
+    city: str
+    province: str
+    distance_km: float
+    allocation_score: float
+    active_leads: int
+    converted_leads: Optional[int] = None
+    ml_probability: Optional[float] = None
+    distance_review_required: Optional[bool] = None
+
 class LeadResponse(BaseModel):
     id: int
     name: str
@@ -132,8 +173,23 @@ class LeadResponse(BaseModel):
     assigned_installer_name: Optional[str]
     allocation_score: Optional[float]
     distance_to_installer_km: Optional[float]
+    installer_ml_probability: Optional[float] = None
+    distance_review_required: Optional[bool] = None
+    alternative_installers: Optional[List[AlternativeInstaller]]
     created_at: datetime
     message: str = "Lead submitted successfully"
+
+
+class MLStatusResponse(BaseModel):
+    trained: bool
+    last_trained_at: Optional[datetime]
+    training_rows: Optional[int]
+    last_error: Optional[str]
+    message: str = "ok"
+
+
+class MLTrainRequest(BaseModel):
+    force: bool = True
 
 class AdminUser(BaseModel):
     id: int
@@ -232,181 +288,239 @@ def geocode_address(address: str, city: str, province: str) -> tuple:
                 return (float(data[0]["lat"]), float(data[0]["lon"]))
             else:
                 raise Exception("Address not found")
-        except requests.exceptions.Timeout:
-            raise HTTPException(status_code=408, detail="Geocoding service timed out. Please try again.")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Geocoding error: {str(e)}")
 
-# ============================================
-# LEAD ALLOCATION ALGORITHM
-# ============================================
 
-def calculate_allocation_score(
-    lead_lat: float,
-    lead_lon: float,
-    lead_job_type: str,
-    installer: dict
-) -> dict:
-    """
-    Calculate allocation score for a lead-installer pair
-    
-    Scoring factors:
-    1. Distance (50% weight) - closer is better
-    2. Capacity (30% weight) - less busy is better
-    3. Success Rate (20% weight) - higher success rate is better
-    
-    Additional factors:
-    - Job type match (bonus for specialization)
-    - Travel time estimate
-    
-    Returns dict with score and metadata
-    """
-    
-    # 1. Calculate distance
-    distance_km = haversine_distance(
-        lead_lat, lead_lon,
-        float(installer['latitude']), float(installer['longitude'])
-    )
-    
-    # Distance score (0-100 scale)
-    # Normalized against service radius
-    service_radius = installer.get('service_radius_km', 100)
-    if distance_km > service_radius:
-        distance_score = 100  # Outside service area - maximum penalty
+def build_ml_feature_payload(source: Optional[Any]) -> dict:
+    """Extract ML-specific attributes from a lead or record."""
+
+    if source is None:
+        return {}
+
+    if isinstance(source, dict):
+        payload = source
+    elif hasattr(source, "model_dump"):
+        payload = source.model_dump()
     else:
-        distance_score = (distance_km / service_radius) * 50
-    
-    # 2. Capacity score (0-50 scale)
-    max_capacity = installer.get('max_capacity', 10)
-    current_capacity = installer.get('current_capacity', 0)
-    
-    if current_capacity >= max_capacity:
-        return None  # Installer at full capacity, skip
-    
-    capacity_ratio = current_capacity / max_capacity
-    capacity_score = capacity_ratio * 50
-    
-    # 3. Success rate score (0-30 scale, inverted)
-    success_rate = float(installer.get('success_rate', 0.7))
-    success_score = (1 - success_rate) * 30
-    
-    # 4. Job type match bonus
-    specialization = installer.get('specialization', [])
-    job_type_bonus = 0
-    if isinstance(specialization, list) and lead_job_type in specialization:
-        job_type_bonus = -5  # Reduce score by 5 points (bonus)
-    
-    # 5. Calculate total score
-    total_score = (
-        distance_score * 0.5 +      # 50% weight
-        capacity_score * 0.3 +       # 30% weight
-        success_score * 0.2 +        # 20% weight
-        job_type_bonus               # Bonus adjustment
-    )
-    
-    # 6. Estimate travel time (assuming 60 km/h average speed)
-    travel_time_minutes = (distance_km / 60) * 60
-    
+        payload = getattr(source, "__dict__", {})
+
     return {
-        'installer_id': installer['id'],
-        'installer_name': installer['name'],
-        'allocation_score': round(total_score, 2),
-        'distance_km': round(distance_km, 2),
-        'travel_time_minutes': round(travel_time_minutes, 2),
-        'current_capacity': current_capacity,
-        'max_capacity': max_capacity,
-        'success_rate': success_rate,
-        'specialization_match': job_type_bonus < 0
+        "project_type": payload.get("project_type") or payload.get("job_type"),
+        "product_type": payload.get("product_type"),
+        "square_footage": payload.get("square_footage") or payload.get("square_feet"),
+        "current_status": payload.get("current_status") or payload.get("status"),
     }
+
+# ============================================
+# LEAD ALLOCATION ALGORITHM - ENHANCED VERSION
+# ============================================
 
 def allocate_lead_to_installer(
     lead_lat: float,
     lead_lon: float,
-    lead_province: str,
-    lead_job_type: str
-) -> Optional[dict]:
+    province: str,
+    lead_payload: Optional[Any] = None,
+):
     """
-    Find the best installer for a lead based on multiple factors
-    Returns allocation details or None if no suitable installer found
+    Enhanced allocation algorithm that returns:
+    - Best installer (highest composite score)
+    - 2-3 alternative installers within 50km
+
+    Composite score blends:
+    - ML probability learned from historical data
+    - Geographic distance to the dealer
+    - Closed deals and currently active allocations
     """
     
-    # Fetch eligible installers from database
+    # Get all active installers from the same province
     query = """
-        SELECT id, name, city, province, latitude, longitude,
-               service_radius_km, max_capacity, current_capacity,
-               success_rate, specialization, is_active
-        FROM installers
-        WHERE is_active = TRUE
-          AND province = %s
-          AND current_capacity < max_capacity
-        ORDER BY current_capacity ASC
+        SELECT
+            i.id,
+            i.name,
+            i.email,
+            i.city,
+            i.province,
+            i.latitude,
+            i.longitude,
+            i.is_active,
+            COUNT(CASE WHEN l.status = 'active' THEN 1 END) as active_leads,
+            COUNT(CASE WHEN l.status = 'converted' THEN 1 END) as converted_leads
+        FROM installers i
+        LEFT JOIN leads l ON i.id = l.assigned_installer_id
+        WHERE i.is_active = TRUE
+            AND i.province = %s
+            AND i.latitude IS NOT NULL
+            AND i.longitude IS NOT NULL
+        GROUP BY i.id
     """
     
-    installers = execute_query(query, (lead_province,))
-    
+    installers = execute_query(query, (province,))
+
     if not installers:
-        # No installers available in this province
         return None
-    
-    # Score each installer
+
+    historical_stats = fetch_installer_historical_feature_stats(execute_query)
+
+    # Prepare ML probabilities for this lead (still exposed for debugging)
+    lead_features = build_ml_feature_payload(lead_payload)
+    ml_probabilities = ml_allocator.predict_probabilities(lead_features)
+
     scored_installers = []
+    max_closed = max((installer.get('converted_leads') or 0) for installer in installers) if installers else 0
+    max_active = max((installer.get('active_leads') or 0) for installer in installers) if installers else 0
+
     for installer in installers:
-        score_result = calculate_allocation_score(
-            lead_lat, lead_lon, lead_job_type, installer
+        distance_km = haversine_distance(
+            lead_lat, lead_lon,
+            installer['latitude'], installer['longitude']
         )
-        if score_result:  # Only include if not at capacity
-            scored_installers.append(score_result)
-    
+
+        if distance_km > ABSOLUTE_DISTANCE_LIMIT_KM:
+            continue
+
+        normalized_name = normalize_installer_name(installer.get('name'))
+        installer_stats = historical_stats.get(normalized_name, {}) if normalized_name else {}
+
+        fuzzy_score, breakdown = score_installer_with_fuzzy_logic(
+            distance_km=distance_km,
+            installer_stats=installer_stats,
+            lead_features=lead_features,
+        )
+
+        probability = (
+            ml_probabilities.get(installer['name'])
+            or ml_probabilities.get((installer.get('name') or '').lower())
+            or 0.0
+        )
+        closed_leads = installer.get('converted_leads') or 0
+        active_leads = installer.get('active_leads') or 0
+
+        conversion_component = (closed_leads / max_closed) if max_closed else 0
+        workload_component = (active_leads / max_active) if max_active else 0
+
+        allocation_score = fuzzy_score
+        allocation_score += conversion_component * 0.05
+        allocation_score -= workload_component * 0.05
+        allocation_score = max(0.0, min(1.0, allocation_score))
+
+        if distance_km <= LOCAL_PRIORITY_DISTANCE_KM:
+            distance_bucket = 0
+        elif distance_km <= PREFERRED_DISTANCE_KM:
+            distance_bucket = 1
+        elif distance_km <= FUZZY_MAX_DISTANCE_KM:
+            distance_bucket = 2
+        else:
+            distance_bucket = 3
+
+        scored_installers.append({
+            'installer_id': installer['id'],
+            'installer_name': installer['name'],
+            'city': installer['city'],
+            'province': installer['province'],
+            'distance_km': round(distance_km, 2),
+            'allocation_score': round(allocation_score, 4),
+            'active_leads': active_leads,
+            'converted_leads': closed_leads,
+            'ml_probability': round(probability, 4),
+            'distance_review_required': distance_km > FUZZY_MAX_DISTANCE_KM,
+            'distance_bucket': distance_bucket,
+            'score_breakdown': breakdown,
+        })
+
     if not scored_installers:
         return None
-    
-    # Sort by allocation score (lower is better)
-    scored_installers.sort(key=lambda x: x['allocation_score'])
-    
-    # Return best match
-    return scored_installers[0]
+
+    scored_installers.sort(key=lambda x: (x['distance_bucket'], -x['allocation_score']))
+
+    prioritized = [
+        installer for installer in scored_installers
+        if installer['distance_km'] <= FUZZY_MAX_DISTANCE_KM
+    ] or scored_installers
+
+    def sanitize(installer: dict) -> dict:
+        cleaned = dict(installer)
+        cleaned.pop('distance_bucket', None)
+        cleaned.pop('score_breakdown', None)
+        return cleaned
+
+    best_installer = sanitize(prioritized[0])
+
+    alternatives = [
+        sanitize(installer)
+        for installer in scored_installers
+        if installer['installer_id'] != best_installer['installer_id']
+        and installer['distance_km'] <= ALTERNATIVE_DISTANCE_LIMIT_KM
+    ][:3]
+
+    return {
+        'best_installer': best_installer,
+        'alternative_installers': alternatives
+    }
 
 # ============================================
-# AUTHENTICATION
+# AUTHENTICATION & AUTHORIZATION
 # ============================================
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify password against hash"""
     return pwd_context.verify(plain_password, hashed_password)
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+def create_access_token(data: dict) -> str:
     """Create JWT access token"""
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
 
+def resolve_admin_user_from_token(token: str) -> Optional[AdminUser]:
+    """Return an AdminUser from a JWT token, or None if invalid."""
+
+    if not token:
+        return None
+
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username: Optional[str] = payload.get("sub")
+        if not username:
+            return None
+    except JWTError:
+        return None
+
+    query = "SELECT id, username, email, last_name, role FROM admin_users WHERE username = %s AND is_active = TRUE"
+    user = execute_query(query, (username,))
+
+    if not user:
+        return None
+
+    return AdminUser(**user[0])
+
+
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> AdminUser:
-    """Get current authenticated user from JWT token"""
+    """Require a valid authenticated user."""
+
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    
-    query = "SELECT id, username, email, last_name, role FROM admin_users WHERE username = %s AND is_active = TRUE"
-    user = execute_query(query, (username,))
-    
+
+    user = resolve_admin_user_from_token(token)
     if not user:
         raise credentials_exception
-    
-    return AdminUser(**user[0])
+
+    return user
+
+
+def has_valid_ml_api_key(provided_key: Optional[str]) -> bool:
+    """Verify the optional API key for ML endpoints."""
+
+    return bool(
+        provided_key
+        and settings.ML_PUBLIC_API_KEY
+        and secrets.compare_digest(provided_key, settings.ML_PUBLIC_API_KEY)
+    )
 
 # ============================================
 # API ENDPOINTS - PUBLIC
@@ -414,86 +528,92 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> AdminUser:
 
 @app.get("/")
 async def root():
-    """API health check"""
-    return {
-        "status": "online",
-        "message": "Lead Allocation System API",
-        "version": "1.0.0"
-    }
+    """Health check endpoint"""
+    return {"status": "healthy", "message": "Lead Allocation System API is running"}
 
-@app.post("/api/leads", response_model=LeadResponse, status_code=status.HTTP_201_CREATED)
-async def submit_lead(lead: LeadCreate):
+@app.post("/api/leads", response_model=LeadResponse)
+async def create_lead(lead: LeadCreate):
     """
-    PUBLIC ENDPOINT: Submit a new lead from the client form
-    
-    Process:
-    1. Validate input data
-    2. Geocode address to coordinates
-    3. Find best installer using allocation algorithm
-    4. Store lead in database with assignment
-    5. Return lead details with assigned installer
+    Public endpoint - Submit a new lead
+    Automatically assigns to best installer using enhanced ML algorithm
+    Returns alternative installer options
     """
     
     try:
-        # Step 1: Geocode address
-        latitude, longitude = geocode_address(lead.address, lead.city, lead.province)
+        # Step 1: Geocode the lead address
+        try:
+            lead_lat, lead_lon = geocode_address(lead.address, lead.city, lead.province)
+        except HTTPException as he:
+            # If geocoding fails, still create the lead but don't assign installer
+            lead_lat, lead_lon = None, None
         
-        # Step 2: Find best installer
-        allocation = allocate_lead_to_installer(
-            latitude, longitude, lead.province, lead.job_type
-        )
+        # Step 2: Get allocation (best + alternatives) if geocoding succeeded
+        allocation = None
+        if lead_lat and lead_lon:
+            allocation = allocate_lead_to_installer(lead_lat, lead_lon, lead.province, lead)
         
         # Step 3: Insert lead into database
         conn = get_db_connection()
         try:
             with conn.cursor() as cursor:
-                if allocation:
-                    insert_query = """
-                        INSERT INTO leads (
-                            name, email, phone, address, city, province, postal_code,
-                            latitude, longitude, job_type, comments,
-                            assigned_installer_id, allocation_score, 
-                            distance_to_installer_km, estimated_travel_time_minutes,
-                            status, source, assigned_at
-                        ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP
-                        ) RETURNING id, created_at
-                    """
-                    params = (
-                        lead.name, lead.email, lead.phone, lead.address, lead.city,
-                        lead.province, lead.postal_code, latitude, longitude,
-                        lead.job_type, lead.comments, allocation['installer_id'], 
-                        allocation['allocation_score'], allocation['distance_km'], 
-                        allocation['travel_time_minutes'], 'active', 'website'
-                    )
-                else:
-                    insert_query = """
-                        INSERT INTO leads (
-                            name, email, phone, address, city, province, postal_code,
-                            latitude, longitude, job_type, comments,
-                            status, source
-                        ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                        ) RETURNING id, created_at
-                    """
-                    params = (
-                        lead.name, lead.email, lead.phone, lead.address, lead.city,
-                        lead.province, lead.postal_code, latitude, longitude,
-                        lead.job_type, lead.comments, 'active', 'website'
-                    )
+                query = """
+                    INSERT INTO leads (
+                        name, email, phone, address, city, province, postal_code,
+                        job_type, comments, status, assigned_installer_id, 
+                        allocation_score, distance_to_installer_km,
+                        latitude, longitude, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    RETURNING id, created_at
+                """
                 
-                cursor.execute(insert_query, params)
+                cursor.execute(query, (
+                    lead.name,
+                    lead.email,
+                    lead.phone,
+                    lead.address,
+                    lead.city,
+                    lead.province,
+                    lead.postal_code,
+                    lead.job_type,
+                    lead.comments,
+                    'active',
+                    allocation['best_installer']['installer_id'] if allocation else None,
+                    allocation['best_installer']['allocation_score'] if allocation else None,
+                    allocation['best_installer']['distance_km'] if allocation else None,
+                    lead_lat,
+                    lead_lon
+                ))
+                
                 result = cursor.fetchone()
                 lead_id = result['id']
                 created_at = result['created_at']
-                conn.commit()  # COMMIT THE TRANSACTION
+                
+                conn.commit()
         except Exception as e:
             conn.rollback()
             raise HTTPException(status_code=500, detail=f"Failed to insert lead: {str(e)}")
         finally:
             conn.close()
         
-        # Step 4: Return response
+        # Step 4: Format alternative installers response
+        alternative_installers = None
+        if allocation and allocation['alternative_installers']:
+            alternative_installers = [
+                AlternativeInstaller(
+                    id=alt['installer_id'],
+                    name=alt['installer_name'],
+                    city=alt['city'],
+                    province=alt['province'],
+                    distance_km=alt['distance_km'],
+                    allocation_score=alt['allocation_score'],
+                    active_leads=alt['active_leads'],
+                    converted_leads=alt.get('converted_leads'),
+                    ml_probability=alt.get('ml_probability'),
+                    distance_review_required=alt.get('distance_review_required'),
+                ) for alt in allocation['alternative_installers']
+            ]
+        
+        # Step 5: Return response
         return LeadResponse(
             id=lead_id,
             name=lead.name,
@@ -502,10 +622,13 @@ async def submit_lead(lead: LeadCreate):
             province=lead.province,
             job_type=lead.job_type,
             status='active',
-            assigned_installer_id=allocation['installer_id'] if allocation else None,
-            assigned_installer_name=allocation['installer_name'] if allocation else None,
-            allocation_score=allocation['allocation_score'] if allocation else None,
-            distance_to_installer_km=allocation['distance_km'] if allocation else None,
+            assigned_installer_id=allocation['best_installer']['installer_id'] if allocation else None,
+            assigned_installer_name=allocation['best_installer']['installer_name'] if allocation else None,
+            allocation_score=allocation['best_installer']['allocation_score'] if allocation else None,
+            distance_to_installer_km=allocation['best_installer']['distance_km'] if allocation else None,
+            installer_ml_probability=allocation['best_installer'].get('ml_probability') if allocation else None,
+            distance_review_required=allocation['best_installer'].get('distance_review_required') if allocation else None,
+            alternative_installers=alternative_installers,
             created_at=created_at,
             message="Lead submitted and assigned successfully" if allocation else "Lead submitted - no installer available in your area"
         )
@@ -593,7 +716,7 @@ async def get_all_leads(
     offset: int = 0,
     current_user: AdminUser = Depends(get_current_user)
 ):
-    """Get all leads with optional status filter"""
+    """Get all leads with optional status filter - includes alternative installers"""
     
     if status:
         query = """
@@ -617,6 +740,33 @@ async def get_all_leads(
     
     leads = execute_query(query, params)
     
+    # For each lead, calculate alternative installers if coordinates exist
+    enhanced_leads = []
+    for lead in leads:
+        lead_dict = dict(lead)
+        
+        # Calculate alternative installers if lead has coordinates
+        if lead['latitude'] and lead['longitude']:
+            allocation = allocate_lead_to_installer(
+                lead['latitude'],
+                lead['longitude'],
+                lead['province'],
+                lead
+            )
+
+            if allocation:
+                lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
+                lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
+                lead_dict['alternative_installers'] = allocation['alternative_installers']
+            else:
+                lead_dict['alternative_installers'] = []
+                lead_dict['distance_review_required'] = None
+        else:
+            lead_dict['alternative_installers'] = []
+            lead_dict['distance_review_required'] = None
+        
+        enhanced_leads.append(lead_dict)
+    
     # Also get total count
     count_query = "SELECT COUNT(*) as total FROM leads"
     if status:
@@ -625,11 +775,11 @@ async def get_all_leads(
     else:
         total_count = execute_query(count_query)[0]['total']
     
-    return {"leads": leads, "count": len(leads), "total": total_count}
+    return {"leads": enhanced_leads, "count": len(enhanced_leads), "total": total_count}
 
 @app.get("/api/admin/leads/{lead_id}")
 async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_current_user)):
-    """Get detailed information about a specific lead"""
+    """Get detailed information about a specific lead - includes alternative installers"""
     
     query = """
         SELECT l.*, 
@@ -647,7 +797,29 @@ async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_cu
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     
-    return lead[0]
+    lead_dict = dict(lead[0])
+    
+    # Calculate alternative installers if lead has coordinates
+    if lead_dict['latitude'] and lead_dict['longitude']:
+        allocation = allocate_lead_to_installer(
+            lead_dict['latitude'],
+            lead_dict['longitude'],
+            lead_dict['province'],
+            lead_dict
+        )
+
+        if allocation:
+            lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
+            lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
+            lead_dict['alternative_installers'] = allocation['alternative_installers']
+        else:
+            lead_dict['alternative_installers'] = []
+            lead_dict['distance_review_required'] = None
+    else:
+        lead_dict['alternative_installers'] = []
+        lead_dict['distance_review_required'] = None
+    
+    return lead_dict
 
 @app.patch("/api/admin/leads/{lead_id}/status")
 async def update_lead_status(
@@ -657,7 +829,7 @@ async def update_lead_status(
 ):
     """Update lead status"""
     
-    valid_statuses = ['active', 'converted', 'dead']
+    valid_statuses = ['active', 'converted', 'dead', 'follow_up']
     if status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
     
@@ -665,6 +837,36 @@ async def update_lead_status(
     execute_query(query, (status, lead_id), fetch=False)
     
     return {"message": "Lead status updated successfully", "lead_id": lead_id, "new_status": status}
+
+@app.patch("/api/admin/leads/{lead_id}/installer-override")
+async def update_installer_override(
+    lead_id: int,
+    installer_id: Optional[int] = None,
+    current_user: AdminUser = Depends(get_current_user)
+):
+    """Update installer override - allows manual assignment of alternative installers"""
+    
+    # Validate installer exists if provided
+    if installer_id:
+        installer_check = execute_query(
+            "SELECT id FROM installers WHERE id = %s AND is_active = TRUE",
+            (installer_id,)
+        )
+        if not installer_check:
+            raise HTTPException(status_code=404, detail="Installer not found or inactive")
+    
+    query = """
+        UPDATE leads 
+        SET installer_override_id = %s, updated_at = CURRENT_TIMESTAMP 
+        WHERE id = %s
+    """
+    execute_query(query, (installer_id, lead_id), fetch=False)
+    
+    return {
+        "message": "Installer override updated successfully", 
+        "lead_id": lead_id, 
+        "installer_id": installer_id
+    }
 
 @app.get("/api/admin/installers")
 async def get_installers(current_user: AdminUser = Depends(get_current_user)):
@@ -677,6 +879,129 @@ async def get_installers(current_user: AdminUser = Depends(get_current_user)):
     
     installers = execute_query(query)
     return {"installers": installers, "count": len(installers)}
+
+@app.get("/api/admin/historical-data")
+async def get_historical_data(
+    limit: int = 100,
+    offset: int = 0,
+    status: Optional[str] = None,
+    current_user: AdminUser = Depends(get_current_user)
+):
+    """Get historical data records"""
+    
+    if status and status != 'all':
+        query = """
+            SELECT * FROM historical_data
+            WHERE current_status = %s
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """
+        params = (status, limit, offset)
+    else:
+        query = """
+            SELECT * FROM historical_data
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """
+        params = (limit, offset)
+    
+    data = execute_query(query, params)
+    
+    # Get total count
+    count_query = "SELECT COUNT(*) as total FROM historical_data"
+    if status and status != 'all':
+        count_query += " WHERE current_status = %s"
+        total_count = execute_query(count_query, (status,))[0]['total']
+    else:
+        total_count = execute_query(count_query)[0]['total']
+    
+    return {"data": data, "count": len(data), "total": total_count}
+
+
+def extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
+    """Parse an Authorization header and return the bearer token when present."""
+
+    if not auth_header:
+        return None
+
+    parts = auth_header.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+
+    return None
+
+
+def resolve_request_user(
+    token_param: Optional[str],
+    auth_header: Optional[str],
+) -> Optional[AdminUser]:
+    """Resolve an AdminUser from either the query token or Authorization header."""
+
+    token_value = token_param or extract_bearer_token(auth_header)
+    if not token_value:
+        return None
+
+    return resolve_admin_user_from_token(token_value)
+
+
+def resolve_request_api_key(
+    query_api_key: Optional[str],
+    header_api_key: Optional[str],
+) -> Optional[str]:
+    """Return whichever API key source is populated (query param or header)."""
+
+    return query_api_key or header_api_key
+
+
+@app.get("/api/admin/ml/status", response_model=MLStatusResponse)
+async def get_ml_status(
+    api_key: Optional[str] = Query(None, alias="api_key"),
+    token: Optional[str] = Query(None, alias="token"),
+    header_api_key: Optional[str] = Header(None, alias="X-ML-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Return the current ML training status for administrators or API key holders."""
+
+    resolved_user = resolve_request_user(token, authorization)
+    provided_key = resolve_request_api_key(api_key, header_api_key)
+    if not (resolved_user or has_valid_ml_api_key(provided_key)):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    status_payload = ml_allocator.status()
+    return MLStatusResponse(
+        **status_payload,
+        message="ok" if status_payload.get("trained") else "not_trained",
+    )
+
+
+@app.api_route("/api/admin/ml/train", response_model=MLStatusResponse, methods=["GET", "POST"])
+async def trigger_ml_training(
+    payload: Optional[MLTrainRequest] = None,
+    force: Optional[bool] = Query(None, alias="force"),
+    api_key: Optional[str] = Query(None, alias="api_key"),
+    token: Optional[str] = Query(None, alias="token"),
+    header_api_key: Optional[str] = Header(None, alias="X-ML-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Allow administrators (or requests with the ML API key) to retrain the model on demand."""
+
+    resolved_user = resolve_request_user(token, authorization)
+    provided_key = resolve_request_api_key(api_key, header_api_key)
+    if not (resolved_user or has_valid_ml_api_key(provided_key)):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    force_value: Optional[bool] = None
+    if payload is not None:
+        force_value = payload.force
+    if force is not None:
+        force_value = force
+    if force_value is None:
+        force_value = True
+
+    success = ml_allocator.train(force=force_value)
+    status_payload = ml_allocator.status()
+    message = "trained" if success else "training_failed"
+    return MLStatusResponse(**status_payload, message=message)
 
 # ============================================
 # RUN SERVER
