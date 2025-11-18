@@ -307,7 +307,6 @@ def build_ml_feature_payload(source: Optional[Any]) -> dict:
 
     return {
         "project_type": payload.get("project_type") or payload.get("job_type"),
-        "product_type": payload.get("product_type"),
         "square_footage": payload.get("square_footage") or payload.get("square_feet"),
         "current_status": payload.get("current_status") or payload.get("status"),
     }
