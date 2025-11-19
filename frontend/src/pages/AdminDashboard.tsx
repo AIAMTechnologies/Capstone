@@ -288,6 +288,7 @@ const AdminDashboard: React.FC = () => {
                     <th>Job Type</th>
                     <th>Status</th>
                     <th>Installer (ML)</th>
+                    <th>Final Installer</th>
                     <th>Score</th>
                     <th style={{ minWidth: '200px' }}>Alternative Options</th>
                     <th>Date</th>
@@ -316,6 +317,18 @@ const AdminDashboard: React.FC = () => {
                           {lead.installer_city && (
                             <div style={{ fontSize: '12px', color: '#7f8c8d' }}>
                               {lead.installer_city}
+                            </div>
+                          )}
+                        </div>
+                      </td>
+                      <td>
+                        <div style={{ fontSize: '14px' }}>
+                          <div style={{ fontWeight: '600', color: '#2c3e50' }}>
+                            {lead.final_installer_selection || 'Pending assignment'}
+                          </div>
+                          {lead.installer_override_id && (
+                            <div style={{ fontSize: '12px', color: '#c0392b' }}>
+                              Manual override
                             </div>
                           )}
                         </div>
@@ -428,6 +441,7 @@ const AdminDashboard: React.FC = () => {
                     <th>Company</th>
                     <th>City</th>
                     <th>Dealer</th>
+                    <th>Final Installer</th>
                     <th>Project Type</th>
                     <th>Status</th>
                     <th>Job Won</th>
@@ -440,7 +454,7 @@ const AdminDashboard: React.FC = () => {
                 <tbody>
                   {historicalData.length === 0 ? (
                     <tr>
-                      <td colSpan={13} style={{ textAlign: 'center', padding: '40px', color: '#7f8c8d' }}>
+                      <td colSpan={14} style={{ textAlign: 'center', padding: '40px', color: '#7f8c8d' }}>
                         No historical data found
                       </td>
                     </tr>
@@ -453,6 +467,7 @@ const AdminDashboard: React.FC = () => {
                         <td>{record.company_name || '-'}</td>
                         <td>{record.city}, {record.province}</td>
                         <td>{record.dealer_name || '-'}</td>
+                        <td>{record.final_installer_selection || '-'}</td>
                         <td>{record.project_type || '-'}</td>
                         <td>
                           <span className={`badge ${record.current_status === 'converted' ? 'badge-converted' : 'badge-active'}`}>
@@ -584,6 +599,17 @@ const AdminDashboard: React.FC = () => {
                   <p style={styles.detailLabel}>Assigned Installer</p>
                   <p style={styles.detailValue}>
                     {selectedLead.installer_name || 'Unassigned'}
+                  </p>
+                </div>
+                <div>
+                  <p style={styles.detailLabel}>Final Installer</p>
+                  <p style={styles.detailValue}>
+                    {selectedLead.final_installer_selection || 'Pending assignment'}
+                    {selectedLead.installer_override_id && (
+                      <span style={{ color: '#c0392b', marginLeft: '6px', fontSize: '13px' }}>
+                        (Manual override)
+                      </span>
+                    )}
                   </p>
                 </div>
                 <div>

@@ -17,7 +17,7 @@ import os
 import secrets
 import time
 from datetime import datetime, timedelta
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from math import radians, sin, cos, sqrt, atan2
 from pathlib import Path
 
@@ -117,6 +117,44 @@ def execute_query(query: str, params: tuple = None, fetch: bool = True):
         conn.close()
 
 
+def insert_historical_record_from_lead(lead: Dict[str, Any]) -> None:
+    """Persist a converted lead into historical_data for future ML training."""
+
+    dealer_name = lead.get("dealer_name") or lead.get("final_installer_selection") or lead.get("assigned_installer_name")
+    final_installer = lead.get("final_installer_selection") or dealer_name
+
+    query = """
+        INSERT INTO historical_data (
+            submit_date,
+            first_name,
+            address1,
+            city,
+            province,
+            postal,
+            dealer_name,
+            project_type,
+            current_status,
+            final_installer_selection,
+            created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+    """
+
+    params = (
+        lead.get("created_at"),
+        lead.get("name"),
+        lead.get("address"),
+        lead.get("city"),
+        lead.get("province"),
+        lead.get("postal_code"),
+        dealer_name,
+        lead.get("job_type"),
+        lead.get("status"),
+        final_installer,
+    )
+
+    execute_query(query, params, fetch=False)
+
+
 # Initialize the ML allocator once so it can be reused across requests
 ml_allocator = InstallerMLModel(execute_query)
 
@@ -171,6 +209,7 @@ class LeadResponse(BaseModel):
     status: str
     assigned_installer_id: Optional[int]
     assigned_installer_name: Optional[str]
+    final_installer_selection: Optional[str]
     allocation_score: Optional[float]
     distance_to_installer_km: Optional[float]
     installer_ml_probability: Optional[float] = None
@@ -555,16 +594,19 @@ async def create_lead(lead: LeadCreate):
         conn = get_db_connection()
         try:
             with conn.cursor() as cursor:
+                assigned_installer_id = allocation['best_installer']['installer_id'] if allocation else None
+                final_installer_selection = allocation['best_installer']['installer_name'] if allocation else None
                 query = """
                     INSERT INTO leads (
                         name, email, phone, address, city, province, postal_code,
-                        job_type, comments, status, assigned_installer_id, 
+                        job_type, comments, status, assigned_installer_id,
                         allocation_score, distance_to_installer_km,
+                        final_installer_selection,
                         latitude, longitude, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     RETURNING id, created_at
                 """
-                
+
                 cursor.execute(query, (
                     lead.name,
                     lead.email,
@@ -576,9 +618,10 @@ async def create_lead(lead: LeadCreate):
                     lead.job_type,
                     lead.comments,
                     'active',
-                    allocation['best_installer']['installer_id'] if allocation else None,
+                    assigned_installer_id,
                     allocation['best_installer']['allocation_score'] if allocation else None,
                     allocation['best_installer']['distance_km'] if allocation else None,
+                    final_installer_selection,
                     lead_lat,
                     lead_lon
                 ))
@@ -623,6 +666,7 @@ async def create_lead(lead: LeadCreate):
             status='active',
             assigned_installer_id=allocation['best_installer']['installer_id'] if allocation else None,
             assigned_installer_name=allocation['best_installer']['installer_name'] if allocation else None,
+            final_installer_selection=allocation['best_installer']['installer_name'] if allocation else None,
             allocation_score=allocation['best_installer']['allocation_score'] if allocation else None,
             distance_to_installer_km=allocation['best_installer']['distance_km'] if allocation else None,
             installer_ml_probability=allocation['best_installer'].get('ml_probability') if allocation else None,
@@ -832,9 +876,30 @@ async def update_lead_status(
     if status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
     
+    lead_rows = execute_query(
+        """
+        SELECT l.*, i.name as assigned_installer_name
+        FROM leads l
+        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        WHERE l.id = %s
+        """,
+        (lead_id,),
+    )
+
+    if not lead_rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    current_lead = lead_rows[0]
+    previous_status = current_lead.get('status')
+
     query = "UPDATE leads SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s"
     execute_query(query, (status, lead_id), fetch=False)
-    
+
+    if status == 'converted' and previous_status != 'converted':
+        lead_copy: Dict[str, Any] = dict(current_lead)
+        lead_copy['status'] = status
+        insert_historical_record_from_lead(lead_copy)
+
     return {"message": "Lead status updated successfully", "lead_id": lead_id, "new_status": status}
 
 @app.patch("/api/admin/leads/{lead_id}/installer-override")
@@ -845,26 +910,47 @@ async def update_installer_override(
 ):
     """Update installer override - allows manual assignment of alternative installers"""
     
-    # Validate installer exists if provided
+    lead_rows = execute_query("SELECT id, assigned_installer_id, final_installer_selection FROM leads WHERE id = %s", (lead_id,))
+    if not lead_rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    lead_record = lead_rows[0]
+    assigned_installer_id = lead_record.get('assigned_installer_id')
+    final_installer_name = lead_record.get('final_installer_selection')
+
+    # Validate installer exists if provided and capture its name
     if installer_id:
         installer_check = execute_query(
-            "SELECT id FROM installers WHERE id = %s AND is_active = TRUE",
+            "SELECT id, name FROM installers WHERE id = %s AND is_active = TRUE",
             (installer_id,)
         )
         if not installer_check:
             raise HTTPException(status_code=404, detail="Installer not found or inactive")
-    
+        assigned_installer_id = installer_id
+        final_installer_name = installer_check[0]['name']
+    elif assigned_installer_id:
+        installer_name_row = execute_query(
+            "SELECT name FROM installers WHERE id = %s",
+            (assigned_installer_id,),
+        )
+        if installer_name_row:
+            final_installer_name = installer_name_row[0]['name']
+
     query = """
-        UPDATE leads 
-        SET installer_override_id = %s, updated_at = CURRENT_TIMESTAMP 
+        UPDATE leads
+        SET installer_override_id = %s,
+            assigned_installer_id = %s,
+            final_installer_selection = %s,
+            updated_at = CURRENT_TIMESTAMP
         WHERE id = %s
     """
-    execute_query(query, (installer_id, lead_id), fetch=False)
-    
+    execute_query(query, (installer_id, assigned_installer_id, final_installer_name, lead_id), fetch=False)
+
     return {
-        "message": "Installer override updated successfully", 
-        "lead_id": lead_id, 
-        "installer_id": installer_id
+        "message": "Installer override updated successfully",
+        "lead_id": lead_id,
+        "installer_id": installer_id,
+        "final_installer_selection": final_installer_name
     }
 
 @app.get("/api/admin/installers")

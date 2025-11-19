@@ -15,6 +15,7 @@ export interface Lead {
   assigned_installer_id?: number;
   assigned_installer_name?: string;
   installer_name?: string;
+  final_installer_selection?: string;
   installer_city?: string;
   allocation_score?: number;
   distance_to_installer_km?: number;
@@ -113,6 +114,7 @@ export interface HistoricalData {
   province?: string;
   postal?: string;
   dealer_name?: string;
+  final_installer_selection?: string;
   project_type?: string;
   product_type?: string;
   square_footage?: number;
