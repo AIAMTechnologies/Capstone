@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Users, 
   TrendingUp, 
@@ -52,6 +52,10 @@ const AdminDashboard: React.FC = () => {
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>('current');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [hasInitialized, setHasInitialized] = useState<boolean>(false);
+  const leadRequestIdRef = useRef(0);
+  const initialStatusFilterRef = useRef<LeadStatus | 'all'>(statusFilter);
+  const lastFetchedStatusRef = useRef<LeadStatus | 'all'>(statusFilter);
 
   const resolveFinalInstallerName = (lead: Lead | null): string => {
     if (!lead) {
@@ -60,17 +64,43 @@ const AdminDashboard: React.FC = () => {
     return lead.final_installer_selection || lead.installer_name || lead.assigned_installer_name || 'Pending assignment';
   };
 
-  useEffect(() => {
-    loadDashboardData();
-  }, [statusFilter]);
-
-  useEffect(() => {
-    if (activeTab === 'historical') {
-      loadHistoricalData();
+  const loadStats = useCallback(async () => {
+    try {
+      const statsData = await getDashboardStats();
+      setStats(statsData);
+    } catch (error) {
+      console.error('Error loading dashboard stats:', error);
+      setErrorMessage('Unable to load dashboard statistics. Please try again.');
     }
-  }, [activeTab, historicalStatusFilter]);
+  }, []);
 
-  const loadHistoricalData = async () => {
+  const loadLeadsForFilter = useCallback(async (filter: LeadStatus | 'all') => {
+    const requestId = ++leadRequestIdRef.current;
+    setLeadsLoading(true);
+    try {
+      const leadsData = await getLeads(filter === 'all' ? null : filter, 50, 0);
+      if (leadRequestIdRef.current === requestId) {
+        setLeads(leadsData.leads ?? []);
+      }
+    } catch (error) {
+      console.error('Error loading leads:', error);
+      setErrorMessage((prev) => prev ?? 'Unable to load the latest leads. Please try again.');
+      if (leadRequestIdRef.current === requestId) {
+        setLeads([]);
+      }
+    } finally {
+      if (leadRequestIdRef.current === requestId) {
+        setLeadsLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshLeads = useCallback(async () => {
+    await loadLeadsForFilter(statusFilter);
+    lastFetchedStatusRef.current = statusFilter;
+  }, [statusFilter, loadLeadsForFilter]);
+
+  const loadHistoricalData = useCallback(async () => {
     setHistoricalLoading(true);
     try {
       const response = await getHistoricalData(100, 0, historicalStatusFilter);
@@ -80,38 +110,55 @@ const AdminDashboard: React.FC = () => {
     } finally {
       setHistoricalLoading(false);
     }
-  };
+  }, [historicalStatusFilter]);
 
-  const loadDashboardData = async () => {
-    setLoading(true);
-    setErrorMessage(null);
+  useEffect(() => {
+    if (activeTab === 'historical') {
+      loadHistoricalData();
+    }
+  }, [activeTab, loadHistoricalData]);
 
-    try {
-      const statsData = await getDashboardStats();
-      setStats(statsData);
-    } catch (error) {
-      console.error('Error loading dashboard stats:', error);
-      setErrorMessage('Unable to load dashboard statistics. Please try again.');
+  useEffect(() => {
+    if (hasInitialized) {
+      return;
     }
 
-    setLeadsLoading(true);
-    try {
-      const leadsData = await getLeads(statusFilter === 'all' ? null : statusFilter, 100, 0);
-      setLeads(leadsData.leads ?? []);
-    } catch (error) {
-      console.error('Error loading leads:', error);
-      setErrorMessage((prev) => prev ?? 'Unable to load the latest leads. Please try again.');
-    } finally {
-      setLeadsLoading(false);
-    }
+    let isMounted = true;
+    const initializeDashboard = async () => {
+      setErrorMessage(null);
+      setLoading(true);
+      try {
+        await Promise.all([loadStats(), loadLeadsForFilter(initialStatusFilterRef.current)]);
+        lastFetchedStatusRef.current = initialStatusFilterRef.current;
+      } finally {
+        if (isMounted) {
+          setLoading(false);
+          setHasInitialized(true);
+        }
+      }
+    };
 
-    setLoading(false);
-  };
+    initializeDashboard();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [hasInitialized, loadStats, loadLeadsForFilter]);
+
+  useEffect(() => {
+    if (!hasInitialized) {
+      return;
+    }
+    if (lastFetchedStatusRef.current === statusFilter) {
+      return;
+    }
+    refreshLeads();
+  }, [statusFilter, hasInitialized, refreshLeads]);
 
   const handleStatusChange = async (leadId: number, newStatus: LeadStatus) => {
     try {
       await updateLeadStatus(leadId, newStatus);
-      loadDashboardData();
+      await Promise.all([loadStats(), refreshLeads()]);
     } catch (error) {
       console.error('Error updating status:', error);
     }
@@ -119,8 +166,31 @@ const AdminDashboard: React.FC = () => {
 
   const handleInstallerOverride = async (leadId: number, installerId: number | null) => {
     try {
-      await updateInstallerOverride(leadId, installerId);
-      loadDashboardData();
+      const response = await updateInstallerOverride(leadId, installerId);
+      setLeads((prevLeads) =>
+        prevLeads.map((lead) =>
+          lead.id === leadId
+            ? {
+                ...lead,
+                installer_override_id: response.installer_id ?? undefined,
+                assigned_installer_id: response.installer_id ?? lead.assigned_installer_id,
+                final_installer_selection:
+                  response.final_installer_selection || resolveFinalInstallerName(lead),
+              }
+            : lead
+        )
+      );
+      setSelectedLead((prev) =>
+        prev && prev.id === leadId
+          ? {
+              ...prev,
+              installer_override_id: response.installer_id ?? undefined,
+              assigned_installer_id: response.installer_id ?? prev.assigned_installer_id,
+              final_installer_selection:
+                response.final_installer_selection || resolveFinalInstallerName(prev),
+            }
+          : prev
+      );
     } catch (error) {
       console.error('Error updating installer override:', error);
       alert('Failed to update installer assignment');

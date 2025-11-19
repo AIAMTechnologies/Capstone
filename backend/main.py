@@ -17,6 +17,7 @@ import logging
 import os
 import secrets
 import time
+from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from math import radians, sin, cos, sqrt, atan2
@@ -182,6 +183,10 @@ ALTERNATIVE_DISTANCE_LIMIT_KM = 50
 LOCAL_PRIORITY_DISTANCE_KM = 75
 FUZZY_MAX_DISTANCE_KM = 200
 ABSOLUTE_DISTANCE_LIMIT_KM = 400
+
+# Lightweight in-memory cache for installer pools per province
+INSTALLER_CACHE_TTL = timedelta(minutes=5)
+_INSTALLER_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ============================================
 # PYDANTIC MODELS
@@ -376,7 +381,12 @@ def build_ml_feature_payload(source: Optional[Any]) -> dict:
 # ============================================
 
 def fetch_active_installers_by_province(province: str) -> List[Dict[str, Any]]:
-    """Return active installers for the provided province."""
+    """Return active installers for the provided province (with caching)."""
+
+    now = datetime.utcnow()
+    cached_entry = _INSTALLER_CACHE.get(province)
+    if cached_entry and cached_entry["expires_at"] > now:
+        return deepcopy(cached_entry["payload"])
 
     query = """
         SELECT
@@ -399,7 +409,12 @@ def fetch_active_installers_by_province(province: str) -> List[Dict[str, Any]]:
         GROUP BY i.id
     """
 
-    return execute_query(query, (province,))
+    installers = execute_query(query, (province,))
+    _INSTALLER_CACHE[province] = {
+        "payload": deepcopy(installers),
+        "expires_at": now + INSTALLER_CACHE_TTL,
+    }
+    return installers
 
 
 def allocate_lead_to_installer(
@@ -830,7 +845,14 @@ async def get_all_leads(
         lead_dict = dict(lead)
 
         allocation = None
-        if lead['latitude'] and lead['longitude']:
+        lead_lat = lead.get('latitude')
+        lead_lon = lead.get('longitude')
+        should_score_alternatives = (
+            lead.get('status') == 'active'
+            and lead_lat is not None
+            and lead_lon is not None
+        )
+        if should_score_alternatives:
             province_key = lead.get('province')
             installer_pool: Optional[List[Dict[str, Any]]] = None
             if province_key:
@@ -847,9 +869,9 @@ async def get_all_leads(
                 installer_pool = installer_cache.get(province_key)
             try:
                 allocation = allocate_lead_to_installer(
-                    lead['latitude'],
-                    lead['longitude'],
-                    lead['province'],
+                    lead_lat,
+                    lead_lon,
+                    lead.get('province'),
                     lead,
                     installer_pool=installer_pool,
                     historical_stats=historical_stats,
