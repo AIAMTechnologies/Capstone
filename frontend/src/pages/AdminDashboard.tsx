@@ -53,6 +53,13 @@ const AdminDashboard: React.FC = () => {
   const [activeTab, setActiveTab] = useState<TabType>('current');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  const resolveFinalInstallerName = (lead: Lead | null): string => {
+    if (!lead) {
+      return 'Pending assignment';
+    }
+    return lead.final_installer_selection || lead.installer_name || lead.assigned_installer_name || 'Pending assignment';
+  };
+
   useEffect(() => {
     loadDashboardData();
   }, [statusFilter]);
@@ -363,7 +370,7 @@ const AdminDashboard: React.FC = () => {
                         <td>
                           <div style={{ fontSize: '14px' }}>
                             <div style={{ fontWeight: '600', color: '#2c3e50' }}>
-                              {lead.final_installer_selection || 'Pending assignment'}
+                              {resolveFinalInstallerName(lead)}
                             </div>
                             {lead.installer_override_id && (
                               <div style={{ fontSize: '12px', color: '#c0392b' }}>
@@ -507,7 +514,7 @@ const AdminDashboard: React.FC = () => {
                         <td>{record.company_name || '-'}</td>
                         <td>{record.city}, {record.province}</td>
                         <td>{record.dealer_name || '-'}</td>
-                        <td>{record.final_installer_selection || '-'}</td>
+                        <td>{record.final_installer_selection || record.dealer_name || '-'}</td>
                         <td>{record.project_type || '-'}</td>
                         <td>
                           <span className={`badge ${record.current_status === 'converted' ? 'badge-converted' : 'badge-active'}`}>
@@ -644,7 +651,7 @@ const AdminDashboard: React.FC = () => {
                 <div>
                   <p style={styles.detailLabel}>Final Installer</p>
                   <p style={styles.detailValue}>
-                    {selectedLead.final_installer_selection || 'Pending assignment'}
+                    {resolveFinalInstallerName(selectedLead)}
                     {selectedLead.installer_override_id && (
                       <span style={{ color: '#c0392b', marginLeft: '6px', fontSize: '13px' }}>
                         (Manual override)

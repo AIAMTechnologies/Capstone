@@ -120,11 +120,26 @@ def execute_query(query: str, params: tuple = None, fetch: bool = True):
         conn.close()
 
 
+def resolve_final_installer_selection(record: Dict[str, Any]) -> Optional[str]:
+    """Return the most accurate final installer name for a record."""
+
+    preferred = (record.get("final_installer_selection") or "").strip()
+    if preferred:
+        return preferred
+
+    for field in ("assigned_installer_name", "installer_name", "dealer_name"):
+        candidate = (record.get(field) or "").strip()
+        if candidate:
+            return candidate
+
+    return None
+
+
 def insert_historical_record_from_lead(lead: Dict[str, Any]) -> None:
     """Persist a converted lead into historical_data for future ML training."""
 
-    dealer_name = lead.get("dealer_name") or lead.get("final_installer_selection") or lead.get("assigned_installer_name")
-    final_installer = lead.get("final_installer_selection") or dealer_name
+    final_installer = resolve_final_installer_selection(lead)
+    dealer_name = lead.get("dealer_name") or final_installer or lead.get("assigned_installer_name")
 
     query = """
         INSERT INTO historical_data (
@@ -201,6 +216,9 @@ class AlternativeInstaller(BaseModel):
     converted_leads: Optional[int] = None
     ml_probability: Optional[float] = None
     distance_review_required: Optional[bool] = None
+
+class InstallerOverrideRequest(BaseModel):
+    installer_id: Optional[int] = None
 
 class LeadResponse(BaseModel):
     id: int
@@ -853,6 +871,10 @@ async def get_all_leads(
             lead_dict['alternative_installers'] = []
             lead_dict['distance_review_required'] = None
 
+        resolved_final = resolve_final_installer_selection(lead_dict)
+        if resolved_final:
+            lead_dict['final_installer_selection'] = resolved_final
+
         enhanced_leads.append(lead_dict)
     
     # Also get total count
@@ -913,6 +935,10 @@ async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_cu
         lead_dict['alternative_installers'] = []
         lead_dict['distance_review_required'] = None
 
+    resolved_final = resolve_final_installer_selection(lead_dict)
+    if resolved_final:
+        lead_dict['final_installer_selection'] = resolved_final
+
     return lead_dict
 
 @app.patch("/api/admin/leads/{lead_id}/status")
@@ -956,11 +982,16 @@ async def update_lead_status(
 @app.patch("/api/admin/leads/{lead_id}/installer-override")
 async def update_installer_override(
     lead_id: int,
-    installer_id: Optional[int] = None,
+    override: Optional[InstallerOverrideRequest] = None,
+    installer_id: Optional[int] = Query(default=None),
     current_user: AdminUser = Depends(get_current_user)
 ):
     """Update installer override - allows manual assignment of alternative installers"""
-    
+
+    resolved_installer_id = installer_id
+    if override and override.installer_id is not None:
+        resolved_installer_id = override.installer_id
+
     lead_rows = execute_query("SELECT id, assigned_installer_id, final_installer_selection FROM leads WHERE id = %s", (lead_id,))
     if not lead_rows:
         raise HTTPException(status_code=404, detail="Lead not found")
@@ -970,14 +1001,14 @@ async def update_installer_override(
     final_installer_name = lead_record.get('final_installer_selection')
 
     # Validate installer exists if provided and capture its name
-    if installer_id:
+    if resolved_installer_id:
         installer_check = execute_query(
             "SELECT id, name FROM installers WHERE id = %s AND is_active = TRUE",
-            (installer_id,)
+            (resolved_installer_id,)
         )
         if not installer_check:
             raise HTTPException(status_code=404, detail="Installer not found or inactive")
-        assigned_installer_id = installer_id
+        assigned_installer_id = resolved_installer_id
         final_installer_name = installer_check[0]['name']
     elif assigned_installer_id:
         installer_name_row = execute_query(
@@ -995,12 +1026,12 @@ async def update_installer_override(
             updated_at = CURRENT_TIMESTAMP
         WHERE id = %s
     """
-    execute_query(query, (installer_id, assigned_installer_id, final_installer_name, lead_id), fetch=False)
+    execute_query(query, (resolved_installer_id, assigned_installer_id, final_installer_name, lead_id), fetch=False)
 
     return {
         "message": "Installer override updated successfully",
         "lead_id": lead_id,
-        "installer_id": installer_id,
+        "installer_id": resolved_installer_id,
         "final_installer_selection": final_installer_name
     }
 
