@@ -34,7 +34,7 @@ import {
   getHistoricalData 
 } from '../services/api';
 import { format } from 'date-fns';
-import type { DashboardStats, Lead, LeadStatus, HistoricalData, AlternativeInstaller } from '../types';
+import type { DashboardStats, Lead, LeadStatus, HistoricalData } from '../types';
 
 const COLORS = ['#3498db', '#27ae60', '#e74c3c', '#f39c12'];
 
@@ -164,16 +164,34 @@ const AdminDashboard: React.FC = () => {
     }
   };
 
-  const handleInstallerOverride = async (leadId: number, installerId: number | null) => {
+  const handleInstallerOverride = async (
+    leadId: number,
+    installerId: number | null,
+    installerName?: string | null,
+    installerCity?: string | null
+  ) => {
     try {
+      console.info('Updating installer override', {
+        leadId,
+        installerId,
+        installerName,
+        installerCity
+      });
       const response = await updateInstallerOverride(leadId, installerId);
-      const normalizeFinal = (currentLead: Lead, altInstaller?: AlternativeInstaller) => {
-        return (
-          (response.final_installer_selection || '').trim() ||
-          altInstaller?.name ||
-          response.installer_name ||
-          resolveFinalInstallerName(currentLead)
-        );
+      const normalizeFinal = (currentLead: Lead, fallbackName?: string | null) => {
+        const responseFinal = (response.final_installer_selection || '').trim();
+        if (responseFinal) {
+          return responseFinal;
+        }
+        const preferred = (fallbackName || installerName || '').trim();
+        if (preferred) {
+          return preferred;
+        }
+        const responseName = (response.installer_name || '').trim();
+        if (responseName) {
+          return responseName;
+        }
+        return resolveFinalInstallerName(currentLead);
       };
       setLeads((prevLeads) =>
         prevLeads.map((lead) =>
@@ -182,18 +200,20 @@ const AdminDashboard: React.FC = () => {
                 const selectedAlt = installerId
                   ? lead.alternative_installers?.find((alt) => alt.id === installerId)
                   : undefined;
+                const fallbackName = installerName || selectedAlt?.name || null;
+                const fallbackCity = installerCity || selectedAlt?.city || null;
                 return {
                   ...lead,
-                  installer_override_id: response.installer_id ?? undefined,
+                  installer_override_id: response.installer_id ?? null,
                   assigned_installer_id:
-                    response.assigned_installer_id ?? lead.assigned_installer_id ?? response.installer_id ?? undefined,
+                    response.assigned_installer_id ?? lead.assigned_installer_id ?? response.installer_id ?? null,
                   installer_name:
-                    response.installer_name || selectedAlt?.name || lead.installer_name,
+                    response.installer_name || fallbackName || lead.installer_name,
                   installer_city:
-                    response.installer_city || selectedAlt?.city || lead.installer_city,
+                    response.installer_city || fallbackCity || lead.installer_city,
                   final_installer_selection: normalizeFinal(
                     lead,
-                    selectedAlt
+                    fallbackName
                   ),
                 };
               })()
@@ -206,18 +226,20 @@ const AdminDashboard: React.FC = () => {
               const selectedAlt = installerId
                 ? prev.alternative_installers?.find((alt) => alt.id === installerId)
                 : undefined;
+              const fallbackName = installerName || selectedAlt?.name || null;
+              const fallbackCity = installerCity || selectedAlt?.city || null;
               return {
                 ...prev,
-                installer_override_id: response.installer_id ?? undefined,
+                installer_override_id: response.installer_id ?? null,
                 assigned_installer_id:
-                  response.assigned_installer_id ?? prev.assigned_installer_id ?? response.installer_id ?? undefined,
+                  response.assigned_installer_id ?? prev.assigned_installer_id ?? response.installer_id ?? null,
                 installer_name:
-                  response.installer_name || selectedAlt?.name || prev.installer_name,
+                  response.installer_name || fallbackName || prev.installer_name,
                 installer_city:
-                  response.installer_city || selectedAlt?.city || prev.installer_city,
+                  response.installer_city || fallbackCity || prev.installer_city,
                 final_installer_selection: normalizeFinal(
                   prev,
-                  selectedAlt
+                  fallbackName
                 ),
               };
             })()
@@ -487,10 +509,15 @@ const AdminDashboard: React.FC = () => {
                           {lead.alternative_installers && lead.alternative_installers.length > 0 ? (
                             <select
                               className="form-select"
-                              value={lead.installer_override_id || ''}
+                              value={lead.installer_override_id ? String(lead.installer_override_id) : ''}
                               onChange={(e) => {
-                                const installerId = e.target.value ? Number(e.target.value) : null;
-                                handleInstallerOverride(lead.id, installerId);
+                                const selectedOption = e.target.selectedOptions[0];
+                                const dataset = selectedOption?.dataset || {};
+                                const installerIdAttr = dataset.installerId;
+                                const installerId = installerIdAttr ? Number(installerIdAttr) : null;
+                                const installerName = dataset.installerName ?? null;
+                                const installerCity = dataset.installerCity ?? null;
+                                handleInstallerOverride(lead.id, installerId, installerName, installerCity);
                               }}
                               style={{
                                 width: '100%',
@@ -502,8 +529,15 @@ const AdminDashboard: React.FC = () => {
                             >
                               <option value="">Other Installers</option>
                               {lead.alternative_installers.map((alt) => (
-                                <option key={alt.id} value={alt.id}>
-                                  {alt.name} - {alt.city} ({alt.distance_km.toFixed(1)}km, Score: {alt.allocation_score.toFixed(1)})
+                                <option
+                                  key={alt.id}
+                                  value={String(alt.id)}
+                                  data-installer-id={alt.id}
+                                  data-installer-name={alt.name}
+                                  data-installer-city={alt.city || ''}
+                                >
+                                  {alt.name}
+                                  {alt.city ? ` (${alt.city})` : ''}
                                 </option>
                               ))}
                             </select>

@@ -1037,6 +1037,15 @@ async def update_installer_override(
     assigned_installer_city = lead_record.get('assigned_installer_city')
     final_installer_name = resolve_final_installer_selection(lead_record)
 
+    if assigned_installer_id and (not assigned_installer_name or not assigned_installer_city):
+        installer_name_row = execute_query(
+            "SELECT name, city FROM installers WHERE id = %s",
+            (assigned_installer_id,),
+        )
+        if installer_name_row:
+            assigned_installer_name = installer_name_row[0]['name']
+            assigned_installer_city = installer_name_row[0].get('city')
+
     # Validate installer exists if provided and capture its name
     if resolved_installer_id:
         installer_check = execute_query(
@@ -1049,15 +1058,10 @@ async def update_installer_override(
         assigned_installer_name = installer_check[0]['name']
         assigned_installer_city = installer_check[0].get('city')
         final_installer_name = installer_check[0]['name']
-    elif assigned_installer_id and not final_installer_name:
-        installer_name_row = execute_query(
-            "SELECT name, city FROM installers WHERE id = %s",
-            (assigned_installer_id,),
-        )
-        if installer_name_row:
-            assigned_installer_name = installer_name_row[0]['name']
-            assigned_installer_city = installer_name_row[0].get('city')
-            final_installer_name = installer_name_row[0]['name']
+    elif assigned_installer_id:
+        final_installer_name = assigned_installer_name
+    else:
+        final_installer_name = None
 
     query = """
         UPDATE leads
@@ -1068,6 +1072,14 @@ async def update_installer_override(
         WHERE id = %s
     """
     execute_query(query, (resolved_installer_id, assigned_installer_id, final_installer_name, lead_id), fetch=False)
+
+    logger.info(
+        "Lead %s installer override updated by %s (override_id=%s, final_installer=%s)",
+        lead_id,
+        current_user.username,
+        resolved_installer_id,
+        final_installer_name,
+    )
 
     return {
         "message": "Installer override updated successfully",
