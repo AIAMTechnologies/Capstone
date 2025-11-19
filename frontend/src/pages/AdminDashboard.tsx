@@ -50,6 +50,7 @@ const AdminDashboard: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<LeadStatus | 'all'>('active');
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>('current');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
     loadDashboardData();
@@ -75,19 +76,25 @@ const AdminDashboard: React.FC = () => {
 
   const loadDashboardData = async () => {
     setLoading(true);
+    setErrorMessage(null);
+
     try {
-      const [statsData, leadsData] = await Promise.all([
-        getDashboardStats(),
-        getLeads(statusFilter === 'all' ? null : statusFilter, 100, 0)
-      ]);
-      
+      const statsData = await getDashboardStats();
       setStats(statsData);
+    } catch (error) {
+      console.error('Error loading dashboard stats:', error);
+      setErrorMessage('Unable to load dashboard statistics. Please try again.');
+    }
+
+    try {
+      const leadsData = await getLeads(statusFilter === 'all' ? null : statusFilter, 100, 0);
       setLeads(leadsData.leads);
     } catch (error) {
-      console.error('Error loading dashboard:', error);
-    } finally {
-      setLoading(false);
+      console.error('Error loading leads:', error);
+      setErrorMessage((prev) => prev ?? 'Unable to load the latest leads. Please try again.');
     }
+
+    setLoading(false);
   };
 
   const handleStatusChange = async (leadId: number, newStatus: LeadStatus) => {
@@ -147,6 +154,21 @@ const AdminDashboard: React.FC = () => {
       <h1 style={{ marginBottom: '32px', fontSize: '32px', fontWeight: '700' }}>
         Admin Dashboard
       </h1>
+
+      {errorMessage && (
+        <div
+          style={{
+            marginBottom: '24px',
+            padding: '16px',
+            borderRadius: '8px',
+            backgroundColor: '#fdecea',
+            color: '#c0392b',
+            border: '1px solid #f5b7b1'
+          }}
+        >
+          {errorMessage}
+        </div>
+      )}
 
       {/* Tabs */}
       <div style={styles.tabs}>

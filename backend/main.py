@@ -13,6 +13,7 @@
 # python-multipart==0.0.6
 # requests==2.31.0
 
+import logging
 import os
 import secrets
 import time
@@ -38,6 +39,8 @@ from fuzzy_allocator import (
     score_installer_with_fuzzy_logic,
 )
 from ml_model import InstallerMLModel
+
+logger = logging.getLogger("lead_allocation")
 
 # Load environment variables from a project-level .env file when running locally
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -787,27 +790,33 @@ async def get_all_leads(
     enhanced_leads = []
     for lead in leads:
         lead_dict = dict(lead)
-        
-        # Calculate alternative installers if lead has coordinates
-        if lead['latitude'] and lead['longitude']:
-            allocation = allocate_lead_to_installer(
-                lead['latitude'],
-                lead['longitude'],
-                lead['province'],
-                lead
-            )
 
-            if allocation:
-                lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
-                lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
-                lead_dict['alternative_installers'] = allocation['alternative_installers']
-            else:
-                lead_dict['alternative_installers'] = []
-                lead_dict['distance_review_required'] = None
+        allocation = None
+        if lead['latitude'] and lead['longitude']:
+            try:
+                allocation = allocate_lead_to_installer(
+                    lead['latitude'],
+                    lead['longitude'],
+                    lead['province'],
+                    lead
+                )
+            except HTTPException as exc:
+                logger.warning(
+                    "Allocation preview failed for lead %s: %s",
+                    lead.get('id'),
+                    getattr(exc, 'detail', str(exc)),
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.exception("Unexpected allocation failure for lead %s", lead.get('id'))
+
+        if allocation:
+            lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
+            lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
+            lead_dict['alternative_installers'] = allocation['alternative_installers']
         else:
             lead_dict['alternative_installers'] = []
             lead_dict['distance_review_required'] = None
-        
+
         enhanced_leads.append(lead_dict)
     
     # Also get total count
@@ -842,26 +851,32 @@ async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_cu
     
     lead_dict = dict(lead[0])
     
-    # Calculate alternative installers if lead has coordinates
+    allocation = None
     if lead_dict['latitude'] and lead_dict['longitude']:
-        allocation = allocate_lead_to_installer(
-            lead_dict['latitude'],
-            lead_dict['longitude'],
-            lead_dict['province'],
-            lead_dict
-        )
+        try:
+            allocation = allocate_lead_to_installer(
+                lead_dict['latitude'],
+                lead_dict['longitude'],
+                lead_dict['province'],
+                lead_dict
+            )
+        except HTTPException as exc:
+            logger.warning(
+                "Allocation preview failed for lead detail %s: %s",
+                lead_id,
+                getattr(exc, 'detail', str(exc)),
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.exception("Unexpected allocation failure for lead %s", lead_id)
 
-        if allocation:
-            lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
-            lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
-            lead_dict['alternative_installers'] = allocation['alternative_installers']
-        else:
-            lead_dict['alternative_installers'] = []
-            lead_dict['distance_review_required'] = None
+    if allocation:
+        lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
+        lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
+        lead_dict['alternative_installers'] = allocation['alternative_installers']
     else:
         lead_dict['alternative_installers'] = []
         lead_dict['distance_review_required'] = None
-    
+
     return lead_dict
 
 @app.patch("/api/admin/leads/{lead_id}/status")
