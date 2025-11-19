@@ -511,13 +511,17 @@ const AdminDashboard: React.FC = () => {
                               className="form-select"
                               value={lead.installer_override_id ? String(lead.installer_override_id) : ''}
                               onChange={(e) => {
-                                const selectedOption = e.target.selectedOptions[0];
-                                const dataset = selectedOption?.dataset || {};
-                                const installerIdAttr = dataset.installerId;
-                                const installerId = installerIdAttr ? Number(installerIdAttr) : null;
-                                const installerName = dataset.installerName ?? null;
-                                const installerCity = dataset.installerCity ?? null;
-                                handleInstallerOverride(lead.id, installerId, installerName, installerCity);
+                                const { value } = e.target;
+                                const installerId = value ? Number(value) : null;
+                                const selectedAlt = installerId
+                                  ? lead.alternative_installers?.find((alt) => alt.id === installerId)
+                                  : undefined;
+                                handleInstallerOverride(
+                                  lead.id,
+                                  installerId,
+                                  selectedAlt?.name ?? null,
+                                  selectedAlt?.city ?? null
+                                );
                               }}
                               style={{
                                 width: '100%',
@@ -532,12 +536,15 @@ const AdminDashboard: React.FC = () => {
                                 <option
                                   key={alt.id}
                                   value={String(alt.id)}
-                                  data-installer-id={alt.id}
-                                  data-installer-name={alt.name}
-                                  data-installer-city={alt.city || ''}
                                 >
-                                  {alt.name}
-                                  {alt.city ? ` (${alt.city})` : ''}
+                                  {[
+                                    alt.name,
+                                    [alt.city, alt.province].filter(Boolean).join(', '),
+                                    `${alt.distance_km.toFixed(1)} km`,
+                                    `Score ${alt.allocation_score.toFixed(2)}`,
+                                  ]
+                                    .filter(Boolean)
+                                    .join(' - ')}
                                 </option>
                               ))}
                             </select>

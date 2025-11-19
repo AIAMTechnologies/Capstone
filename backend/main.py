@@ -528,6 +528,18 @@ def allocate_lead_to_installer(
         cleaned = dict(installer)
         cleaned.pop('distance_bucket', None)
         cleaned.pop('score_breakdown', None)
+
+        installer_id = cleaned.get('installer_id')
+        installer_name = cleaned.get('installer_name')
+
+        # Provide both legacy keys (installer_id/installer_name) and the new
+        # consumer-friendly aliases (id/name) so the frontend dropdown can rely
+        # on a stable schema without breaking existing references.
+        if installer_id is not None:
+            cleaned.setdefault('id', installer_id)
+        if installer_name:
+            cleaned.setdefault('name', installer_name)
+
         return cleaned
 
     best_installer = sanitize(prioritized[0])
