@@ -357,24 +357,9 @@ def build_ml_feature_payload(source: Optional[Any]) -> dict:
 # LEAD ALLOCATION ALGORITHM - ENHANCED VERSION
 # ============================================
 
-def allocate_lead_to_installer(
-    lead_lat: float,
-    lead_lon: float,
-    province: str,
-    lead_payload: Optional[Any] = None,
-):
-    """
-    Enhanced allocation algorithm that returns:
-    - Best installer (highest composite score)
-    - 2-3 alternative installers within 50km
+def fetch_active_installers_by_province(province: str) -> List[Dict[str, Any]]:
+    """Return active installers for the provided province."""
 
-    Composite score blends:
-    - ML probability learned from historical data
-    - Geographic distance to the dealer
-    - Closed deals and currently active allocations
-    """
-    
-    # Get all active installers from the same province
     query = """
         SELECT
             i.id,
@@ -395,13 +380,40 @@ def allocate_lead_to_installer(
             AND i.longitude IS NOT NULL
         GROUP BY i.id
     """
+
+    return execute_query(query, (province,))
+
+
+def allocate_lead_to_installer(
+    lead_lat: float,
+    lead_lon: float,
+    province: str,
+    lead_payload: Optional[Any] = None,
+    installer_pool: Optional[List[Dict[str, Any]]] = None,
+    historical_stats: Optional[Dict[str, Dict[str, Any]]] = None,
+):
+    """
+    Enhanced allocation algorithm that returns:
+    - Best installer (highest composite score)
+    - 2-3 alternative installers within 50km
+
+    Composite score blends:
+    - ML probability learned from historical data
+    - Geographic distance to the dealer
+    - Closed deals and currently active allocations
+    """
     
-    installers = execute_query(query, (province,))
+    # Get all active installers from the same province
+    if installer_pool is not None:
+        installers = installer_pool
+    else:
+        installers = fetch_active_installers_by_province(province)
 
     if not installers:
         return None
 
-    historical_stats = fetch_installer_historical_feature_stats(execute_query)
+    if historical_stats is None:
+        historical_stats = fetch_installer_historical_feature_stats(execute_query)
 
     # Prepare ML probabilities for this lead (still exposed for debugging)
     lead_features = build_ml_feature_payload(lead_payload)
@@ -786,6 +798,14 @@ async def get_all_leads(
     
     leads = execute_query(query, params)
     
+    # Cache installers per province within this request to avoid repetitive queries
+    installer_cache: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        historical_stats = fetch_installer_historical_feature_stats(execute_query)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.warning("Unable to preload historical installer stats: %s", exc)
+        historical_stats = None
+
     # For each lead, calculate alternative installers if coordinates exist
     enhanced_leads = []
     for lead in leads:
@@ -793,12 +813,28 @@ async def get_all_leads(
 
         allocation = None
         if lead['latitude'] and lead['longitude']:
+            province_key = lead.get('province')
+            installer_pool: Optional[List[Dict[str, Any]]] = None
+            if province_key:
+                if province_key not in installer_cache:
+                    try:
+                        installer_cache[province_key] = fetch_active_installers_by_province(province_key)
+                    except HTTPException as exc:
+                        logger.warning(
+                            "Installer lookup failed for province %s: %s",
+                            province_key,
+                            getattr(exc, 'detail', str(exc)),
+                        )
+                        installer_cache[province_key] = []
+                installer_pool = installer_cache.get(province_key)
             try:
                 allocation = allocate_lead_to_installer(
                     lead['latitude'],
                     lead['longitude'],
                     lead['province'],
-                    lead
+                    lead,
+                    installer_pool=installer_pool,
+                    historical_stats=historical_stats,
                 )
             except HTTPException as exc:
                 logger.warning(
