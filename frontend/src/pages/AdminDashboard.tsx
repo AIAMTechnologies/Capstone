@@ -47,7 +47,8 @@ const AdminDashboard: React.FC = () => {
   const [historicalLoading, setHistoricalLoading] = useState<boolean>(false);
   const [historicalStatusFilter, setHistoricalStatusFilter] = useState<string>('all');
   const [loading, setLoading] = useState<boolean>(true);
-  const [statusFilter, setStatusFilter] = useState<LeadStatus | 'all'>('active');
+  const [statusFilter, setStatusFilter] = useState<LeadStatus | 'all'>('all');
+  const [leadsLoading, setLeadsLoading] = useState<boolean>(false);
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>('current');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -86,12 +87,15 @@ const AdminDashboard: React.FC = () => {
       setErrorMessage('Unable to load dashboard statistics. Please try again.');
     }
 
+    setLeadsLoading(true);
     try {
       const leadsData = await getLeads(statusFilter === 'all' ? null : statusFilter, 100, 0);
-      setLeads(leadsData.leads);
+      setLeads(leadsData.leads ?? []);
     } catch (error) {
       console.error('Error loading leads:', error);
       setErrorMessage((prev) => prev ?? 'Unable to load the latest leads. Please try again.');
+    } finally {
+      setLeadsLoading(false);
     }
 
     setLoading(false);
@@ -318,99 +322,113 @@ const AdminDashboard: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {leads.map((lead) => (
-                    <tr key={lead.id}>
-                      <td>#{lead.id}</td>
-                      <td style={{ fontWeight: '600' }}>{lead.name}</td>
-                      <td>{lead.email}</td>
-                      <td>{lead.phone}</td>
-                      <td>{lead.city}, {lead.province}</td>
-                      <td style={{ textTransform: 'capitalize' }}>{lead.job_type}</td>
-                      <td>
-                        <span className={getStatusBadgeClass(lead.status)}>
-                          {formatStatus(lead.status)}
-                        </span>
-                      </td>
-                      <td>
-                        <div style={{ fontSize: '14px' }}>
-                          <div style={{ fontWeight: '600', color: '#2c3e50' }}>
-                            {lead.installer_name || 'Unassigned'}
-                          </div>
-                          {lead.installer_city && (
-                            <div style={{ fontSize: '12px', color: '#7f8c8d' }}>
-                              {lead.installer_city}
-                            </div>
-                          )}
-                        </div>
-                      </td>
-                      <td>
-                        <div style={{ fontSize: '14px' }}>
-                          <div style={{ fontWeight: '600', color: '#2c3e50' }}>
-                            {lead.final_installer_selection || 'Pending assignment'}
-                          </div>
-                          {lead.installer_override_id && (
-                            <div style={{ fontSize: '12px', color: '#c0392b' }}>
-                              Manual override
-                            </div>
-                          )}
-                        </div>
-                      </td>
-                      <td>{lead.allocation_score ? lead.allocation_score.toFixed(1) : 'N/A'}</td>
-                      <td>
-                        {lead.alternative_installers && lead.alternative_installers.length > 0 ? (
-                          <select
-                            className="form-select"
-                            value={lead.installer_override_id || ''}
-                            onChange={(e) => {
-                              const installerId = e.target.value ? Number(e.target.value) : null;
-                              handleInstallerOverride(lead.id, installerId);
-                            }}
-                            style={{ 
-                              width: '100%', 
-                              padding: '4px 8px', 
-                              fontSize: '13px',
-                              minWidth: '180px'
-                            }}
-                            title="Select alternative installer"
-                          >
-                            <option value="">Other Installers</option>
-                            {lead.alternative_installers.map((alt) => (
-                              <option key={alt.id} value={alt.id}>
-                                {alt.name} - {alt.city} ({alt.distance_km.toFixed(1)}km, Score: {alt.allocation_score.toFixed(1)})
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          <span style={{ fontSize: '12px', color: '#95a5a6' }}>
-                            No alternatives
-                          </span>
-                        )}
-                      </td>
-                      <td>{format(new Date(lead.created_at), 'MMM dd, yyyy')}</td>
-                      <td>
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                          <select
-                            className="form-select"
-                            value={lead.status}
-                            onChange={(e) => handleStatusChange(lead.id, e.target.value as LeadStatus)}
-                            style={{ width: 'auto', padding: '4px 8px', fontSize: '14px' }}
-                          >
-                            <option value="active">Active</option>
-                            <option value="converted">Converted</option>
-                            <option value="dead">Dead</option>
-                            <option value="follow_up">Follow Up</option>
-                          </select>
-                          <button
-                            className="btn btn-outline"
-                            style={{ padding: '4px 8px' }}
-                            onClick={() => setSelectedLead(lead)}
-                          >
-                            <Eye size={16} />
-                          </button>
-                        </div>
+                  {leadsLoading ? (
+                    <tr>
+                      <td colSpan={13} style={{ textAlign: 'center', padding: '32px' }}>
+                        <div className="spinner" />
                       </td>
                     </tr>
-                  ))}
+                  ) : leads.length === 0 ? (
+                    <tr>
+                      <td colSpan={13} style={{ textAlign: 'center', padding: '32px', color: '#7f8c8d' }}>
+                        No leads found for the selected filter.
+                      </td>
+                    </tr>
+                  ) : (
+                    leads.map((lead) => (
+                      <tr key={lead.id}>
+                        <td>#{lead.id}</td>
+                        <td style={{ fontWeight: '600' }}>{lead.name}</td>
+                        <td>{lead.email}</td>
+                        <td>{lead.phone}</td>
+                        <td>{lead.city}, {lead.province}</td>
+                        <td style={{ textTransform: 'capitalize' }}>{lead.job_type}</td>
+                        <td>
+                          <span className={getStatusBadgeClass(lead.status)}>
+                            {formatStatus(lead.status)}
+                          </span>
+                        </td>
+                        <td>
+                          <div style={{ fontSize: '14px' }}>
+                            <div style={{ fontWeight: '600', color: '#2c3e50' }}>
+                              {lead.installer_name || 'Unassigned'}
+                            </div>
+                            {lead.installer_city && (
+                              <div style={{ fontSize: '12px', color: '#7f8c8d' }}>
+                                {lead.installer_city}
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                        <td>
+                          <div style={{ fontSize: '14px' }}>
+                            <div style={{ fontWeight: '600', color: '#2c3e50' }}>
+                              {lead.final_installer_selection || 'Pending assignment'}
+                            </div>
+                            {lead.installer_override_id && (
+                              <div style={{ fontSize: '12px', color: '#c0392b' }}>
+                                Manual override
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                        <td>{lead.allocation_score ? lead.allocation_score.toFixed(1) : 'N/A'}</td>
+                        <td>
+                          {lead.alternative_installers && lead.alternative_installers.length > 0 ? (
+                            <select
+                              className="form-select"
+                              value={lead.installer_override_id || ''}
+                              onChange={(e) => {
+                                const installerId = e.target.value ? Number(e.target.value) : null;
+                                handleInstallerOverride(lead.id, installerId);
+                              }}
+                              style={{
+                                width: '100%',
+                                padding: '4px 8px',
+                                fontSize: '13px',
+                                minWidth: '180px'
+                              }}
+                              title="Select alternative installer"
+                            >
+                              <option value="">Other Installers</option>
+                              {lead.alternative_installers.map((alt) => (
+                                <option key={alt.id} value={alt.id}>
+                                  {alt.name} - {alt.city} ({alt.distance_km.toFixed(1)}km, Score: {alt.allocation_score.toFixed(1)})
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            <span style={{ fontSize: '12px', color: '#95a5a6' }}>
+                              No alternatives
+                            </span>
+                          )}
+                        </td>
+                        <td>{format(new Date(lead.created_at), 'MMM dd, yyyy')}</td>
+                        <td>
+                          <div style={{ display: 'flex', gap: '8px' }}>
+                            <select
+                              className="form-select"
+                              value={lead.status}
+                              onChange={(e) => handleStatusChange(lead.id, e.target.value as LeadStatus)}
+                              style={{ width: 'auto', padding: '4px 8px', fontSize: '14px' }}
+                            >
+                              <option value="active">Active</option>
+                              <option value="converted">Converted</option>
+                              <option value="dead">Dead</option>
+                              <option value="follow_up">Follow Up</option>
+                            </select>
+                            <button
+                              className="btn btn-outline"
+                              style={{ padding: '4px 8px' }}
+                              onClick={() => setSelectedLead(lead)}
+                            >
+                              <Eye size={16} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  ) }
                 </tbody>
               </table>
             </div>
