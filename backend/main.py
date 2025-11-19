@@ -1014,30 +1014,49 @@ async def update_installer_override(
     if override and override.installer_id is not None:
         resolved_installer_id = override.installer_id
 
-    lead_rows = execute_query("SELECT id, assigned_installer_id, final_installer_selection FROM leads WHERE id = %s", (lead_id,))
+    lead_rows = execute_query(
+        """
+        SELECT l.id,
+               l.assigned_installer_id,
+               l.installer_override_id,
+               l.final_installer_selection,
+               i.name AS assigned_installer_name,
+               i.city AS assigned_installer_city
+        FROM leads l
+        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        WHERE l.id = %s
+        """,
+        (lead_id,),
+    )
     if not lead_rows:
         raise HTTPException(status_code=404, detail="Lead not found")
 
     lead_record = lead_rows[0]
     assigned_installer_id = lead_record.get('assigned_installer_id')
-    final_installer_name = lead_record.get('final_installer_selection')
+    assigned_installer_name = lead_record.get('assigned_installer_name')
+    assigned_installer_city = lead_record.get('assigned_installer_city')
+    final_installer_name = resolve_final_installer_selection(lead_record)
 
     # Validate installer exists if provided and capture its name
     if resolved_installer_id:
         installer_check = execute_query(
-            "SELECT id, name FROM installers WHERE id = %s AND is_active = TRUE",
+            "SELECT id, name, city FROM installers WHERE id = %s AND is_active = TRUE",
             (resolved_installer_id,)
         )
         if not installer_check:
             raise HTTPException(status_code=404, detail="Installer not found or inactive")
-        assigned_installer_id = resolved_installer_id
+        assigned_installer_id = installer_check[0]['id']
+        assigned_installer_name = installer_check[0]['name']
+        assigned_installer_city = installer_check[0].get('city')
         final_installer_name = installer_check[0]['name']
-    elif assigned_installer_id:
+    elif assigned_installer_id and not final_installer_name:
         installer_name_row = execute_query(
-            "SELECT name FROM installers WHERE id = %s",
+            "SELECT name, city FROM installers WHERE id = %s",
             (assigned_installer_id,),
         )
         if installer_name_row:
+            assigned_installer_name = installer_name_row[0]['name']
+            assigned_installer_city = installer_name_row[0].get('city')
             final_installer_name = installer_name_row[0]['name']
 
     query = """
@@ -1054,7 +1073,10 @@ async def update_installer_override(
         "message": "Installer override updated successfully",
         "lead_id": lead_id,
         "installer_id": resolved_installer_id,
-        "final_installer_selection": final_installer_name
+        "assigned_installer_id": assigned_installer_id,
+        "final_installer_selection": final_installer_name,
+        "installer_name": assigned_installer_name,
+        "installer_city": assigned_installer_city,
     }
 
 @app.get("/api/admin/installers")

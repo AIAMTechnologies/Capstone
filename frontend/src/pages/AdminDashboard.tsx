@@ -167,30 +167,63 @@ const AdminDashboard: React.FC = () => {
   const handleInstallerOverride = async (leadId: number, installerId: number | null) => {
     try {
       const response = await updateInstallerOverride(leadId, installerId);
+      const normalizeFinal = (currentLead: Lead, altInstaller?: AlternativeInstaller) => {
+        return (
+          (response.final_installer_selection || '').trim() ||
+          altInstaller?.name ||
+          response.installer_name ||
+          resolveFinalInstallerName(currentLead)
+        );
+      };
       setLeads((prevLeads) =>
         prevLeads.map((lead) =>
           lead.id === leadId
-            ? {
-                ...lead,
-                installer_override_id: response.installer_id ?? undefined,
-                assigned_installer_id: response.installer_id ?? lead.assigned_installer_id,
-                final_installer_selection:
-                  response.final_installer_selection || resolveFinalInstallerName(lead),
-              }
+            ? (() => {
+                const selectedAlt = installerId
+                  ? lead.alternative_installers?.find((alt) => alt.id === installerId)
+                  : undefined;
+                return {
+                  ...lead,
+                  installer_override_id: response.installer_id ?? undefined,
+                  assigned_installer_id:
+                    response.assigned_installer_id ?? lead.assigned_installer_id ?? response.installer_id ?? undefined,
+                  installer_name:
+                    response.installer_name || selectedAlt?.name || lead.installer_name,
+                  installer_city:
+                    response.installer_city || selectedAlt?.city || lead.installer_city,
+                  final_installer_selection: normalizeFinal(
+                    lead,
+                    selectedAlt
+                  ),
+                };
+              })()
             : lead
         )
       );
       setSelectedLead((prev) =>
         prev && prev.id === leadId
-          ? {
-              ...prev,
-              installer_override_id: response.installer_id ?? undefined,
-              assigned_installer_id: response.installer_id ?? prev.assigned_installer_id,
-              final_installer_selection:
-                response.final_installer_selection || resolveFinalInstallerName(prev),
-            }
+          ? (() => {
+              const selectedAlt = installerId
+                ? prev.alternative_installers?.find((alt) => alt.id === installerId)
+                : undefined;
+              return {
+                ...prev,
+                installer_override_id: response.installer_id ?? undefined,
+                assigned_installer_id:
+                  response.assigned_installer_id ?? prev.assigned_installer_id ?? response.installer_id ?? undefined,
+                installer_name:
+                  response.installer_name || selectedAlt?.name || prev.installer_name,
+                installer_city:
+                  response.installer_city || selectedAlt?.city || prev.installer_city,
+                final_installer_selection: normalizeFinal(
+                  prev,
+                  selectedAlt
+                ),
+              };
+            })()
           : prev
       );
+      await refreshLeads();
     } catch (error) {
       console.error('Error updating installer override:', error);
       alert('Failed to update installer assignment');

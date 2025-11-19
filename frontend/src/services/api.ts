@@ -123,7 +123,15 @@ export const updateLeadStatus = async (
 export const updateInstallerOverride = async (
   leadId: number,
   installerId: number | null
-): Promise<{ message: string; lead_id: number; installer_id: number | null; final_installer_selection?: string }> => {
+): Promise<{
+  message: string;
+  lead_id: number;
+  installer_id: number | null;
+  assigned_installer_id?: number | null;
+  final_installer_selection?: string;
+  installer_name?: string | null;
+  installer_city?: string | null;
+}> => {
   const response = await api.patch(`/admin/leads/${leadId}/installer-override`, {
     installer_id: installerId
   });
