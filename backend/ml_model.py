@@ -32,6 +32,7 @@ class InstallerMLModel:
         query_executor: Callable[[str, Optional[tuple], bool], list],
         retrain_interval: timedelta = timedelta(hours=6),
         min_training_rows: int = 25,
+        failure_retry_interval: timedelta = timedelta(minutes=15),
     ) -> None:
         self._query_executor = query_executor
         self._pipeline: Optional[Pipeline] = None
@@ -40,14 +41,30 @@ class InstallerMLModel:
         self._min_training_rows = min_training_rows
         self._last_row_count: Optional[int] = None
         self._last_error: Optional[str] = None
+        self._failure_retry_interval = failure_retry_interval
+        self._last_attempt_at: Optional[datetime] = None
 
     def ensure_ready(self) -> bool:
         """Train the model if it has never been trained or is stale."""
 
-        needs_training = self._pipeline is None
-        if self._last_trained_at is None:
+        now = datetime.utcnow()
+        needs_training = False
+
+        if self._pipeline is None:
             needs_training = True
-        elif datetime.utcnow() - self._last_trained_at > self._retrain_interval:
+            if (
+                self._last_attempt_at
+                and now - self._last_attempt_at < self._failure_retry_interval
+            ):
+                if self._last_error:
+                    logger.debug(
+                        "Skipping ML training attempt due to cooldown (last error: %s)",
+                        self._last_error,
+                    )
+                return False
+        elif self._last_trained_at is None:
+            needs_training = True
+        elif now - self._last_trained_at > self._retrain_interval:
             needs_training = True
 
         if needs_training:
@@ -125,6 +142,7 @@ class InstallerMLModel:
         """Fetch data from the database and train the estimator."""
 
         logger.info("Training installer ML model from historical data")
+        self._last_attempt_at = datetime.utcnow()
         try:
             records = self._query_executor(
                 """
