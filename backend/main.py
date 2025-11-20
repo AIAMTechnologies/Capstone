@@ -136,18 +136,44 @@ def resolve_final_installer_selection(record: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def insert_historical_record_from_lead(
-    lead: Dict[str, Any],
-    executor=None,
-) -> None:
-    """Persist a converted lead into historical_data for future ML training."""
+def sync_lead_to_historical(lead_id: int, executor=None) -> None:
+    """Upsert the historical_data row for a lead.
+
+    Root cause addressed: the previous implementation only wrote history when a
+    lead left the active pipeline for the first time. Once a historical row
+    existed, later status changes (e.g., converted → dead lead) never updated
+    historical_data, so downstream reporting missed the final outcome. This
+    function always updates existing rows and inserts on first conversion.
+    """
 
     executor = executor or execute_query
-    final_installer = resolve_final_installer_selection(lead)
 
-    # If the final installer name is still missing but we have an ID, fetch the
-    # authoritative installer record so historical_data always captures the
-    # resolved name.
+    lead_rows = executor(
+        """
+        SELECT l.*, ai.name AS assigned_installer_name, oi.name AS override_installer_name
+        FROM leads l
+        LEFT JOIN installers ai ON l.assigned_installer_id = ai.id
+        LEFT JOIN installers oi ON l.installer_override_id = oi.id
+        WHERE l.id = %s
+        """,
+        (lead_id,),
+    )
+
+    if not lead_rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    lead = dict(lead_rows[0])
+    normalized_status = (lead.get("status") or "").strip().lower()
+
+    final_installer = None
+    if lead.get("installer_override_id"):
+        final_installer = (lead.get("override_installer_name") or "").strip()
+    if not final_installer:
+        final_installer = resolve_final_installer_selection(lead)
+
+    # If the final installer name is still missing but we have an assigned
+    # installer id, fetch the authoritative installer record so historical_data
+    # always captures the resolved name.
     if not final_installer and lead.get("assigned_installer_id"):
         installer_row = executor(
             "SELECT name FROM installers WHERE id = %s", (lead.get("assigned_installer_id"),)
@@ -157,14 +183,22 @@ def insert_historical_record_from_lead(
 
     dealer_name = lead.get("dealer_name") or final_installer or lead.get("assigned_installer_name")
 
-    # Ensure the operational lead also persists the resolved installer name so
-    # downstream queries don't have to derive it on the fly.
-    if final_installer and not (lead.get("final_installer_selection") or "").strip():
+    # Persist the resolved final installer on the operational lead so dashboard
+    # queries don't recompute it.
+    if final_installer and final_installer != (lead.get("final_installer_selection") or "").strip():
         executor(
             "UPDATE leads SET final_installer_selection = %s WHERE id = %s",
-            (final_installer, lead.get("id")),
+            (final_installer, lead_id),
             fetch=False,
         )
+
+    existing = executor("SELECT 1 FROM historical_data WHERE id = %s", (lead_id,))
+    has_history = bool(existing)
+
+    # Only insert the first time a lead is converted; afterwards always update.
+    is_converted = normalized_status.startswith("converted")
+    if not has_history and not is_converted:
+        return
 
     query = """
         INSERT INTO historical_data (
@@ -209,29 +243,6 @@ def insert_historical_record_from_lead(
     )
 
     executor(query, params, fetch=False)
-
-
-def sync_historical_on_status_change(
-    previous_status: Optional[str], updated_lead: Dict[str, Any], executor=None
-) -> None:
-    """Upsert a historical record when a lead leaves the active pipeline."""
-
-    executor = executor or execute_query
-    old_status = (previous_status or "").strip().lower()
-    new_status = (updated_lead.get("status") or "").strip().lower()
-
-    should_write_history = old_status == "active" and new_status != "active"
-
-    # If a lead is already non-active but lacks a historical record, backfill it
-    # so reporting and training always have the latest state.
-    if new_status != "active" and not should_write_history:
-        existing = executor(
-            "SELECT 1 FROM historical_data WHERE id = %s", (updated_lead.get("id"),)
-        )
-        should_write_history = not existing
-
-    if should_write_history:
-        insert_historical_record_from_lead(updated_lead, executor=executor)
 
 
 # Initialize the ML allocator once so it can be reused across requests
@@ -1063,15 +1074,12 @@ async def update_lead_status(
     if not lead_rows:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    current_lead = lead_rows[0]
-    previous_status = current_lead.get('status')
-
     query = "UPDATE leads SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s"
     execute_query(query, (status, lead_id), fetch=False)
 
-    lead_copy: Dict[str, Any] = dict(current_lead)
-    lead_copy['status'] = status
-    sync_historical_on_status_change(previous_status, lead_copy)
+    # Re-read the lead so historical sync uses the persisted state and captures
+    # downstream changes to the final installer selection.
+    sync_lead_to_historical(lead_id)
 
     return {"message": "Lead status updated successfully", "lead_id": lead_id, "new_status": status}
 
@@ -1153,6 +1161,10 @@ async def update_installer_override(
         WHERE id = %s
     """
     execute_query(query, (resolved_installer_id, assigned_installer_id, final_installer_name, lead_id), fetch=False)
+
+    # Keep historical_data in sync with the chosen installer so overrides
+    # immediately reflect in reporting and training data.
+    sync_lead_to_historical(lead_id)
 
     logger.info(
         "Lead %s installer override updated by %s (override_id=%s, final_installer=%s)",

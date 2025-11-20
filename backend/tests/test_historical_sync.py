@@ -69,6 +69,9 @@ def memory_db(monkeypatch) -> Dict[str, Dict]:
             if installer:
                 row["assigned_installer_name"] = installer.get("name")
                 row["assigned_installer_city"] = installer.get("city")
+            override_installer = state["installers"].get(lead.get("installer_override_id"))
+            if override_installer:
+                row["override_installer_name"] = override_installer.get("name")
             return [row]
 
         if normalized.startswith("UPDATE leads SET status"):
@@ -162,6 +165,14 @@ def test_non_standard_status_allows_historical_sync(memory_db, admin_user):
 
     record = memory_db["historical"][1]
     assert record["current_status"] == "Converted Sale"
+
+
+def test_subsequent_status_updates_refresh_historical(memory_db, admin_user):
+    asyncio.run(main.update_lead_status(1, "converted", current_user=admin_user))
+    asyncio.run(main.update_lead_status(1, "dead lead", current_user=admin_user))
+
+    record = memory_db["historical"][1]
+    assert record["current_status"] == "dead lead"
 
 
 def test_override_updates_final_installer(memory_db, admin_user):
