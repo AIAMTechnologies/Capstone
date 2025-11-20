@@ -1054,6 +1054,7 @@ async def update_lead_status(
 
     return {"message": "Lead status updated successfully", "lead_id": lead_id, "new_status": status}
 
+
 @app.patch("/api/admin/leads/{lead_id}/installer-override")
 async def update_installer_override(
     lead_id: int,
@@ -1085,6 +1086,9 @@ async def update_installer_override(
         raise HTTPException(status_code=404, detail="Lead not found")
 
     lead_record = lead_rows[0]
+    # Preserve the ML recommendation; overrides should not overwrite the
+    # assigned installer id so we can distinguish the model's pick from a
+    # manual alternative.
     assigned_installer_id = lead_record.get('assigned_installer_id')
     assigned_installer_name = lead_record.get('assigned_installer_name')
     assigned_installer_city = lead_record.get('assigned_installer_city')
@@ -1103,14 +1107,17 @@ async def update_installer_override(
     if resolved_installer_id:
         installer_check = execute_query(
             "SELECT id, name, city FROM installers WHERE id = %s AND is_active = TRUE",
-            (resolved_installer_id,)
+            (resolved_installer_id,),
         )
         if not installer_check:
             raise HTTPException(status_code=404, detail="Installer not found or inactive")
-        assigned_installer_id = installer_check[0]['id']
-        assigned_installer_name = installer_check[0]['name']
-        assigned_installer_city = installer_check[0].get('city')
-        final_installer_name = installer_check[0]['name']
+        override_name = installer_check[0]['name']
+        assigned_installer_name = assigned_installer_name or override_name
+        assigned_installer_city = assigned_installer_city or installer_check[0].get('city')
+        final_installer_name = override_name
+        # Only populate the assignment when no ML recommendation exists.
+        if not assigned_installer_id:
+            assigned_installer_id = installer_check[0]['id']
     elif assigned_installer_id:
         final_installer_name = assigned_installer_name
     else:
@@ -1143,18 +1150,18 @@ async def update_installer_override(
         "installer_name": assigned_installer_name,
         "installer_city": assigned_installer_city,
     }
-
 @app.get("/api/admin/installers")
 async def get_installers(current_user: AdminUser = Depends(get_current_user)):
     """Get all installers with performance metrics"""
-    
+
     query = """
         SELECT * FROM installer_performance
         ORDER BY province, city
     """
-    
+
     installers = execute_query(query)
     return {"installers": installers, "count": len(installers)}
+
 
 @app.get("/api/admin/historical-data")
 async def get_historical_data(
@@ -1164,7 +1171,7 @@ async def get_historical_data(
     current_user: AdminUser = Depends(get_current_user)
 ):
     """Get historical data records"""
-    
+
     if status and status != 'all':
         query = """
             SELECT * FROM historical_data
@@ -1180,9 +1187,9 @@ async def get_historical_data(
             LIMIT %s OFFSET %s
         """
         params = (limit, offset)
-    
+
     data = execute_query(query, params)
-    
+
     # Get total count
     count_query = "SELECT COUNT(*) as total FROM historical_data"
     if status and status != 'all':
@@ -1190,7 +1197,7 @@ async def get_historical_data(
         total_count = execute_query(count_query, (status,))[0]['total']
     else:
         total_count = execute_query(count_query)[0]['total']
-    
+
     return {"data": data, "count": len(data), "total": total_count}
 
 

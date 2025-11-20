@@ -85,7 +85,9 @@ def memory_db(monkeypatch) -> Dict[str, Dict]:
             override_id, assigned_id, final_selection, lead_id = params
             lead = state["leads"][lead_id]
             lead["installer_override_id"] = override_id
-            lead["assigned_installer_id"] = assigned_id
+            # Preserve the ML recommendation unless it was missing.
+            if lead.get("assigned_installer_id") is None:
+                lead["assigned_installer_id"] = assigned_id
             lead["final_installer_selection"] = final_selection
             return True
 
@@ -158,6 +160,8 @@ def test_override_updates_final_installer(memory_db, admin_user):
     asyncio.run(main.update_lead_status(1, "converted", current_user=admin_user))
 
     lead = memory_db["leads"][1]
+    # ML recommendation should remain intact when an override is chosen.
+    assert lead["assigned_installer_id"] == 11
     assert lead["final_installer_selection"] == "Installer B"
 
     record = memory_db["historical"][1]
