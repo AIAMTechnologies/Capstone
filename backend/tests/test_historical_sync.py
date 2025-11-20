@@ -98,6 +98,11 @@ def memory_db(monkeypatch) -> Dict[str, Dict]:
                 return [installer]
             return []
 
+        if normalized.startswith("SELECT name FROM installers WHERE id"):
+            installer_id = params[0]
+            installer = state["installers"].get(installer_id)
+            return [installer] if installer else []
+
         if normalized.startswith("SELECT name, city FROM installers WHERE id"):
             installer_id = params[0]
             installer = state["installers"].get(installer_id)
@@ -131,6 +136,10 @@ def memory_db(monkeypatch) -> Dict[str, Dict]:
                 "final_installer_selection": final_installer_selection,
             }
             return True
+
+        if normalized.startswith("SELECT 1 FROM historical_data WHERE id"):
+            lead_id = params[0]
+            return [1] if lead_id in state["historical"] else []
 
         raise AssertionError(f"Unhandled query: {normalized}")
 
@@ -202,3 +211,32 @@ def test_training_uses_final_installer_selection_label():
     labels = set(model._pipeline.named_steps["model"].classes_)
     assert labels == {"Installer A", "Installer C"}
     assert model.status().get("training_rows") == 2
+
+
+def test_backfill_historical_when_lead_already_non_active(memory_db, admin_user):
+    memory_db["leads"][2] = {
+        "id": 2,
+        "name": "John Smith",
+        "email": "john@example.com",
+        "phone": "555",
+        "address": "789 Oak", 
+        "city": "Calgary",
+        "province": "AB",
+        "postal_code": "T2A1B3",
+        "job_type": "Commercial",
+        "status": "converted",
+        "assigned_installer_id": 11,
+        "installer_override_id": None,
+        "final_installer_selection": None,
+        "created_at": datetime(2024, 2, 1),
+    }
+
+    # Even though the lead is already converted, calling the status endpoint
+    # should backfill historical_data if the record is missing.
+    asyncio.run(main.update_lead_status(2, "converted", current_user=admin_user))
+
+    record = memory_db["historical"][2]
+    assert record["current_status"] == "converted"
+    # Fallback should capture installer name for training even when the lead
+    # lacked an explicit final_installer_selection.
+    assert record["final_installer_selection"] == "Installer A"

@@ -144,6 +144,17 @@ def insert_historical_record_from_lead(
 
     executor = executor or execute_query
     final_installer = resolve_final_installer_selection(lead)
+
+    # If the final installer name is still missing but we have an ID, fetch the
+    # authoritative installer record so historical_data always captures the
+    # resolved name.
+    if not final_installer and lead.get("assigned_installer_id"):
+        installer_row = executor(
+            "SELECT name FROM installers WHERE id = %s", (lead.get("assigned_installer_id"),)
+        )
+        if installer_row:
+            final_installer = (installer_row[0].get("name") or "").strip()
+
     dealer_name = lead.get("dealer_name") or final_installer or lead.get("assigned_installer_name")
 
     # Ensure the operational lead also persists the resolved installer name so
@@ -209,7 +220,17 @@ def sync_historical_on_status_change(
     old_status = (previous_status or "").strip().lower()
     new_status = (updated_lead.get("status") or "").strip().lower()
 
-    if old_status == "active" and new_status != "active":
+    should_write_history = old_status == "active" and new_status != "active"
+
+    # If a lead is already non-active but lacks a historical record, backfill it
+    # so reporting and training always have the latest state.
+    if new_status != "active" and not should_write_history:
+        existing = executor(
+            "SELECT 1 FROM historical_data WHERE id = %s", (updated_lead.get("id"),)
+        )
+        should_write_history = not existing
+
+    if should_write_history:
         insert_historical_record_from_lead(updated_lead, executor=executor)
 
 
