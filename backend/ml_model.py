@@ -32,6 +32,7 @@ class InstallerMLModel:
         query_executor: Callable[[str, Optional[tuple], bool], list],
         retrain_interval: timedelta = timedelta(hours=6),
         min_training_rows: int = 25,
+        failure_retry_interval: timedelta = timedelta(minutes=15),
     ) -> None:
         self._query_executor = query_executor
         self._pipeline: Optional[Pipeline] = None
@@ -40,14 +41,30 @@ class InstallerMLModel:
         self._min_training_rows = min_training_rows
         self._last_row_count: Optional[int] = None
         self._last_error: Optional[str] = None
+        self._failure_retry_interval = failure_retry_interval
+        self._last_attempt_at: Optional[datetime] = None
 
     def ensure_ready(self) -> bool:
         """Train the model if it has never been trained or is stale."""
 
-        needs_training = self._pipeline is None
-        if self._last_trained_at is None:
+        now = datetime.utcnow()
+        needs_training = False
+
+        if self._pipeline is None:
             needs_training = True
-        elif datetime.utcnow() - self._last_trained_at > self._retrain_interval:
+            if (
+                self._last_attempt_at
+                and now - self._last_attempt_at < self._failure_retry_interval
+            ):
+                if self._last_error:
+                    logger.debug(
+                        "Skipping ML training attempt due to cooldown (last error: %s)",
+                        self._last_error,
+                    )
+                return False
+        elif self._last_trained_at is None:
+            needs_training = True
+        elif now - self._last_trained_at > self._retrain_interval:
             needs_training = True
 
         if needs_training:
@@ -125,12 +142,14 @@ class InstallerMLModel:
         """Fetch data from the database and train the estimator."""
 
         logger.info("Training installer ML model from historical data")
+        self._last_attempt_at = datetime.utcnow()
         try:
             records = self._query_executor(
                 """
-                SELECT dealer_name, project_type, square_footage, current_status
+                SELECT final_installer_selection, dealer_name, project_type, square_footage, current_status
                 FROM historical_data
-                WHERE dealer_name IS NOT NULL
+                WHERE final_installer_selection IS NOT NULL
+                    OR dealer_name IS NOT NULL
                 """,
                 None,
                 True,
@@ -155,9 +174,26 @@ class InstallerMLModel:
         frame["square_footage"] = pd.to_numeric(frame.get("square_footage"), errors="coerce")
         frame["project_type"] = frame.get("project_type", "Unknown").fillna("Unknown")
         frame["current_status"] = frame.get("current_status", "Unknown").fillna("Unknown")
-        frame = frame.dropna(subset=["dealer_name"])
+        frame["final_installer_selection"] = (
+            frame.get("final_installer_selection").fillna("").astype(str).str.strip()
+        )
+        frame["dealer_name"] = frame.get("dealer_name").fillna("").astype(str).str.strip()
 
-        if frame.empty or frame["dealer_name"].nunique() < 2:
+        def _resolve_label(row):
+            preferred = row.get("final_installer_selection")
+            if preferred and preferred.lower() not in ("", "unknown"):
+                return preferred
+            fallback = row.get("dealer_name")
+            if fallback and fallback.lower() not in ("", "unknown"):
+                return fallback
+            return None
+
+        frame["label"] = frame.apply(_resolve_label, axis=1)
+        frame = frame.dropna(subset=["label"])
+        frame["label"] = frame["label"].astype(str).str.strip()
+        frame = frame[frame["label"] != ""]
+
+        if frame.empty or frame["label"].nunique() < 2:
             logger.warning("Insufficient label diversity to train ML model")
             self._pipeline = None
             self._last_row_count = len(frame)
@@ -165,7 +201,7 @@ class InstallerMLModel:
             return False
 
         features = frame[["project_type", "square_footage", "current_status"]]
-        labels = frame["dealer_name"].astype(str).str.strip()
+        labels = frame["label"].astype(str).str.strip()
 
         categorical_features = ["project_type", "current_status"]
         numeric_features = ["square_footage"]

@@ -13,11 +13,13 @@
 # python-multipart==0.0.6
 # requests==2.31.0
 
+import logging
 import os
 import secrets
 import time
+from copy import deepcopy
 from datetime import datetime, timedelta
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from math import radians, sin, cos, sqrt, atan2
 from pathlib import Path
 
@@ -38,6 +40,8 @@ from fuzzy_allocator import (
     score_installer_with_fuzzy_logic,
 )
 from ml_model import InstallerMLModel
+
+logger = logging.getLogger("lead_allocation")
 
 # Load environment variables from a project-level .env file when running locally
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -117,6 +121,59 @@ def execute_query(query: str, params: tuple = None, fetch: bool = True):
         conn.close()
 
 
+def resolve_final_installer_selection(record: Dict[str, Any]) -> Optional[str]:
+    """Return the most accurate final installer name for a record."""
+
+    preferred = (record.get("final_installer_selection") or "").strip()
+    if preferred:
+        return preferred
+
+    for field in ("assigned_installer_name", "installer_name", "dealer_name"):
+        candidate = (record.get(field) or "").strip()
+        if candidate:
+            return candidate
+
+    return None
+
+
+def insert_historical_record_from_lead(lead: Dict[str, Any]) -> None:
+    """Persist a converted lead into historical_data for future ML training."""
+
+    final_installer = resolve_final_installer_selection(lead)
+    dealer_name = lead.get("dealer_name") or final_installer or lead.get("assigned_installer_name")
+
+    query = """
+        INSERT INTO historical_data (
+            submit_date,
+            first_name,
+            address1,
+            city,
+            province,
+            postal,
+            dealer_name,
+            project_type,
+            current_status,
+            final_installer_selection,
+            created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+    """
+
+    params = (
+        lead.get("created_at"),
+        lead.get("name"),
+        lead.get("address"),
+        lead.get("city"),
+        lead.get("province"),
+        lead.get("postal_code"),
+        dealer_name,
+        lead.get("job_type"),
+        lead.get("status"),
+        final_installer,
+    )
+
+    execute_query(query, params, fetch=False)
+
+
 # Initialize the ML allocator once so it can be reused across requests
 ml_allocator = InstallerMLModel(execute_query)
 
@@ -126,6 +183,10 @@ ALTERNATIVE_DISTANCE_LIMIT_KM = 50
 LOCAL_PRIORITY_DISTANCE_KM = 75
 FUZZY_MAX_DISTANCE_KM = 200
 ABSOLUTE_DISTANCE_LIMIT_KM = 400
+
+# Lightweight in-memory cache for installer pools per province
+INSTALLER_CACHE_TTL = timedelta(minutes=5)
+_INSTALLER_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ============================================
 # PYDANTIC MODELS
@@ -161,6 +222,9 @@ class AlternativeInstaller(BaseModel):
     ml_probability: Optional[float] = None
     distance_review_required: Optional[bool] = None
 
+class InstallerOverrideRequest(BaseModel):
+    installer_id: Optional[int] = None
+
 class LeadResponse(BaseModel):
     id: int
     name: str
@@ -171,6 +235,7 @@ class LeadResponse(BaseModel):
     status: str
     assigned_installer_id: Optional[int]
     assigned_installer_name: Optional[str]
+    final_installer_selection: Optional[str]
     allocation_score: Optional[float]
     distance_to_installer_km: Optional[float]
     installer_ml_probability: Optional[float] = None
@@ -315,24 +380,14 @@ def build_ml_feature_payload(source: Optional[Any]) -> dict:
 # LEAD ALLOCATION ALGORITHM - ENHANCED VERSION
 # ============================================
 
-def allocate_lead_to_installer(
-    lead_lat: float,
-    lead_lon: float,
-    province: str,
-    lead_payload: Optional[Any] = None,
-):
-    """
-    Enhanced allocation algorithm that returns:
-    - Best installer (highest composite score)
-    - 2-3 alternative installers within 50km
+def fetch_active_installers_by_province(province: str) -> List[Dict[str, Any]]:
+    """Return active installers for the provided province (with caching)."""
 
-    Composite score blends:
-    - ML probability learned from historical data
-    - Geographic distance to the dealer
-    - Closed deals and currently active allocations
-    """
-    
-    # Get all active installers from the same province
+    now = datetime.utcnow()
+    cached_entry = _INSTALLER_CACHE.get(province)
+    if cached_entry and cached_entry["expires_at"] > now:
+        return deepcopy(cached_entry["payload"])
+
     query = """
         SELECT
             i.id,
@@ -353,13 +408,45 @@ def allocate_lead_to_installer(
             AND i.longitude IS NOT NULL
         GROUP BY i.id
     """
-    
+
     installers = execute_query(query, (province,))
+    _INSTALLER_CACHE[province] = {
+        "payload": deepcopy(installers),
+        "expires_at": now + INSTALLER_CACHE_TTL,
+    }
+    return installers
+
+
+def allocate_lead_to_installer(
+    lead_lat: float,
+    lead_lon: float,
+    province: str,
+    lead_payload: Optional[Any] = None,
+    installer_pool: Optional[List[Dict[str, Any]]] = None,
+    historical_stats: Optional[Dict[str, Dict[str, Any]]] = None,
+):
+    """
+    Enhanced allocation algorithm that returns:
+    - Best installer (highest composite score)
+    - 2-3 alternative installers within 50km
+
+    Composite score blends:
+    - ML probability learned from historical data
+    - Geographic distance to the dealer
+    - Closed deals and currently active allocations
+    """
+    
+    # Get all active installers from the same province
+    if installer_pool is not None:
+        installers = installer_pool
+    else:
+        installers = fetch_active_installers_by_province(province)
 
     if not installers:
         return None
 
-    historical_stats = fetch_installer_historical_feature_stats(execute_query)
+    if historical_stats is None:
+        historical_stats = fetch_installer_historical_feature_stats(execute_query)
 
     # Prepare ML probabilities for this lead (still exposed for debugging)
     lead_features = build_ml_feature_payload(lead_payload)
@@ -441,6 +528,18 @@ def allocate_lead_to_installer(
         cleaned = dict(installer)
         cleaned.pop('distance_bucket', None)
         cleaned.pop('score_breakdown', None)
+
+        installer_id = cleaned.get('installer_id')
+        installer_name = cleaned.get('installer_name')
+
+        # Provide both legacy keys (installer_id/installer_name) and the new
+        # consumer-friendly aliases (id/name) so the frontend dropdown can rely
+        # on a stable schema without breaking existing references.
+        if installer_id is not None:
+            cleaned.setdefault('id', installer_id)
+        if installer_name:
+            cleaned.setdefault('name', installer_name)
+
         return cleaned
 
     best_installer = sanitize(prioritized[0])
@@ -555,16 +654,19 @@ async def create_lead(lead: LeadCreate):
         conn = get_db_connection()
         try:
             with conn.cursor() as cursor:
+                assigned_installer_id = allocation['best_installer']['installer_id'] if allocation else None
+                final_installer_selection = allocation['best_installer']['installer_name'] if allocation else None
                 query = """
                     INSERT INTO leads (
                         name, email, phone, address, city, province, postal_code,
-                        job_type, comments, status, assigned_installer_id, 
+                        job_type, comments, status, assigned_installer_id,
                         allocation_score, distance_to_installer_km,
+                        final_installer_selection,
                         latitude, longitude, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     RETURNING id, created_at
                 """
-                
+
                 cursor.execute(query, (
                     lead.name,
                     lead.email,
@@ -576,9 +678,10 @@ async def create_lead(lead: LeadCreate):
                     lead.job_type,
                     lead.comments,
                     'active',
-                    allocation['best_installer']['installer_id'] if allocation else None,
+                    assigned_installer_id,
                     allocation['best_installer']['allocation_score'] if allocation else None,
                     allocation['best_installer']['distance_km'] if allocation else None,
+                    final_installer_selection,
                     lead_lat,
                     lead_lon
                 ))
@@ -623,6 +726,7 @@ async def create_lead(lead: LeadCreate):
             status='active',
             assigned_installer_id=allocation['best_installer']['installer_id'] if allocation else None,
             assigned_installer_name=allocation['best_installer']['installer_name'] if allocation else None,
+            final_installer_selection=allocation['best_installer']['installer_name'] if allocation else None,
             allocation_score=allocation['best_installer']['allocation_score'] if allocation else None,
             distance_to_installer_km=allocation['best_installer']['distance_km'] if allocation else None,
             installer_ml_probability=allocation['best_installer'].get('ml_probability') if allocation else None,
@@ -739,31 +843,72 @@ async def get_all_leads(
     
     leads = execute_query(query, params)
     
+    # Cache installers per province within this request to avoid repetitive queries
+    installer_cache: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        historical_stats = fetch_installer_historical_feature_stats(execute_query)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.warning("Unable to preload historical installer stats: %s", exc)
+        historical_stats = None
+
     # For each lead, calculate alternative installers if coordinates exist
     enhanced_leads = []
     for lead in leads:
         lead_dict = dict(lead)
-        
-        # Calculate alternative installers if lead has coordinates
-        if lead['latitude'] and lead['longitude']:
-            allocation = allocate_lead_to_installer(
-                lead['latitude'],
-                lead['longitude'],
-                lead['province'],
-                lead
-            )
 
-            if allocation:
-                lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
-                lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
-                lead_dict['alternative_installers'] = allocation['alternative_installers']
-            else:
-                lead_dict['alternative_installers'] = []
-                lead_dict['distance_review_required'] = None
+        allocation = None
+        lead_lat = lead.get('latitude')
+        lead_lon = lead.get('longitude')
+        should_score_alternatives = (
+            lead.get('status') == 'active'
+            and lead_lat is not None
+            and lead_lon is not None
+        )
+        if should_score_alternatives:
+            province_key = lead.get('province')
+            installer_pool: Optional[List[Dict[str, Any]]] = None
+            if province_key:
+                if province_key not in installer_cache:
+                    try:
+                        installer_cache[province_key] = fetch_active_installers_by_province(province_key)
+                    except HTTPException as exc:
+                        logger.warning(
+                            "Installer lookup failed for province %s: %s",
+                            province_key,
+                            getattr(exc, 'detail', str(exc)),
+                        )
+                        installer_cache[province_key] = []
+                installer_pool = installer_cache.get(province_key)
+            try:
+                allocation = allocate_lead_to_installer(
+                    lead_lat,
+                    lead_lon,
+                    lead.get('province'),
+                    lead,
+                    installer_pool=installer_pool,
+                    historical_stats=historical_stats,
+                )
+            except HTTPException as exc:
+                logger.warning(
+                    "Allocation preview failed for lead %s: %s",
+                    lead.get('id'),
+                    getattr(exc, 'detail', str(exc)),
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.exception("Unexpected allocation failure for lead %s", lead.get('id'))
+
+        if allocation:
+            lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
+            lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
+            lead_dict['alternative_installers'] = allocation['alternative_installers']
         else:
             lead_dict['alternative_installers'] = []
             lead_dict['distance_review_required'] = None
-        
+
+        resolved_final = resolve_final_installer_selection(lead_dict)
+        if resolved_final:
+            lead_dict['final_installer_selection'] = resolved_final
+
         enhanced_leads.append(lead_dict)
     
     # Also get total count
@@ -798,26 +943,36 @@ async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_cu
     
     lead_dict = dict(lead[0])
     
-    # Calculate alternative installers if lead has coordinates
+    allocation = None
     if lead_dict['latitude'] and lead_dict['longitude']:
-        allocation = allocate_lead_to_installer(
-            lead_dict['latitude'],
-            lead_dict['longitude'],
-            lead_dict['province'],
-            lead_dict
-        )
+        try:
+            allocation = allocate_lead_to_installer(
+                lead_dict['latitude'],
+                lead_dict['longitude'],
+                lead_dict['province'],
+                lead_dict
+            )
+        except HTTPException as exc:
+            logger.warning(
+                "Allocation preview failed for lead detail %s: %s",
+                lead_id,
+                getattr(exc, 'detail', str(exc)),
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.exception("Unexpected allocation failure for lead %s", lead_id)
 
-        if allocation:
-            lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
-            lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
-            lead_dict['alternative_installers'] = allocation['alternative_installers']
-        else:
-            lead_dict['alternative_installers'] = []
-            lead_dict['distance_review_required'] = None
+    if allocation:
+        lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
+        lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
+        lead_dict['alternative_installers'] = allocation['alternative_installers']
     else:
         lead_dict['alternative_installers'] = []
         lead_dict['distance_review_required'] = None
-    
+
+    resolved_final = resolve_final_installer_selection(lead_dict)
+    if resolved_final:
+        lead_dict['final_installer_selection'] = resolved_final
+
     return lead_dict
 
 @app.patch("/api/admin/leads/{lead_id}/status")
@@ -832,39 +987,120 @@ async def update_lead_status(
     if status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
     
+    lead_rows = execute_query(
+        """
+        SELECT l.*, i.name as assigned_installer_name
+        FROM leads l
+        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        WHERE l.id = %s
+        """,
+        (lead_id,),
+    )
+
+    if not lead_rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    current_lead = lead_rows[0]
+    previous_status = current_lead.get('status')
+
     query = "UPDATE leads SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s"
     execute_query(query, (status, lead_id), fetch=False)
-    
+
+    if status == 'converted' and previous_status != 'converted':
+        lead_copy: Dict[str, Any] = dict(current_lead)
+        lead_copy['status'] = status
+        insert_historical_record_from_lead(lead_copy)
+
     return {"message": "Lead status updated successfully", "lead_id": lead_id, "new_status": status}
 
 @app.patch("/api/admin/leads/{lead_id}/installer-override")
 async def update_installer_override(
     lead_id: int,
-    installer_id: Optional[int] = None,
+    override: Optional[InstallerOverrideRequest] = None,
+    installer_id: Optional[int] = Query(default=None),
     current_user: AdminUser = Depends(get_current_user)
 ):
     """Update installer override - allows manual assignment of alternative installers"""
-    
-    # Validate installer exists if provided
-    if installer_id:
+
+    resolved_installer_id = installer_id
+    if override and override.installer_id is not None:
+        resolved_installer_id = override.installer_id
+
+    lead_rows = execute_query(
+        """
+        SELECT l.id,
+               l.assigned_installer_id,
+               l.installer_override_id,
+               l.final_installer_selection,
+               i.name AS assigned_installer_name,
+               i.city AS assigned_installer_city
+        FROM leads l
+        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        WHERE l.id = %s
+        """,
+        (lead_id,),
+    )
+    if not lead_rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    lead_record = lead_rows[0]
+    assigned_installer_id = lead_record.get('assigned_installer_id')
+    assigned_installer_name = lead_record.get('assigned_installer_name')
+    assigned_installer_city = lead_record.get('assigned_installer_city')
+    final_installer_name = resolve_final_installer_selection(lead_record)
+
+    if assigned_installer_id and (not assigned_installer_name or not assigned_installer_city):
+        installer_name_row = execute_query(
+            "SELECT name, city FROM installers WHERE id = %s",
+            (assigned_installer_id,),
+        )
+        if installer_name_row:
+            assigned_installer_name = installer_name_row[0]['name']
+            assigned_installer_city = installer_name_row[0].get('city')
+
+    # Validate installer exists if provided and capture its name
+    if resolved_installer_id:
         installer_check = execute_query(
-            "SELECT id FROM installers WHERE id = %s AND is_active = TRUE",
-            (installer_id,)
+            "SELECT id, name, city FROM installers WHERE id = %s AND is_active = TRUE",
+            (resolved_installer_id,)
         )
         if not installer_check:
             raise HTTPException(status_code=404, detail="Installer not found or inactive")
-    
+        assigned_installer_id = installer_check[0]['id']
+        assigned_installer_name = installer_check[0]['name']
+        assigned_installer_city = installer_check[0].get('city')
+        final_installer_name = installer_check[0]['name']
+    elif assigned_installer_id:
+        final_installer_name = assigned_installer_name
+    else:
+        final_installer_name = None
+
     query = """
-        UPDATE leads 
-        SET installer_override_id = %s, updated_at = CURRENT_TIMESTAMP 
+        UPDATE leads
+        SET installer_override_id = %s,
+            assigned_installer_id = %s,
+            final_installer_selection = %s,
+            updated_at = CURRENT_TIMESTAMP
         WHERE id = %s
     """
-    execute_query(query, (installer_id, lead_id), fetch=False)
-    
+    execute_query(query, (resolved_installer_id, assigned_installer_id, final_installer_name, lead_id), fetch=False)
+
+    logger.info(
+        "Lead %s installer override updated by %s (override_id=%s, final_installer=%s)",
+        lead_id,
+        current_user.username,
+        resolved_installer_id,
+        final_installer_name,
+    )
+
     return {
-        "message": "Installer override updated successfully", 
-        "lead_id": lead_id, 
-        "installer_id": installer_id
+        "message": "Installer override updated successfully",
+        "lead_id": lead_id,
+        "installer_id": resolved_installer_id,
+        "assigned_installer_id": assigned_installer_id,
+        "final_installer_selection": final_installer_name,
+        "installer_name": assigned_installer_name,
+        "installer_city": assigned_installer_city,
     }
 
 @app.get("/api/admin/installers")
