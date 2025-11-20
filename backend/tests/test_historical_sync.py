@@ -144,6 +144,15 @@ def test_status_change_syncs_historical_data(memory_db, admin_user):
     assert record["final_installer_selection"] == "Installer A"
 
 
+def test_non_standard_status_allows_historical_sync(memory_db, admin_user):
+    # Frontend may send user-friendly labels; these should still flow through and
+    # create a historical record when the lead leaves the active pipeline.
+    asyncio.run(main.update_lead_status(1, "Converted Sale", current_user=admin_user))
+
+    record = memory_db["historical"][1]
+    assert record["current_status"] == "Converted Sale"
+
+
 def test_override_updates_final_installer(memory_db, admin_user):
     asyncio.run(main.update_installer_override(1, installer_id=12, current_user=admin_user))
     asyncio.run(main.update_lead_status(1, "converted", current_user=admin_user))

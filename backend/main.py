@@ -1020,11 +1020,14 @@ async def update_lead_status(
     status: str,
     current_user: AdminUser = Depends(get_current_user)
 ):
-    """Update lead status"""
-    
-    valid_statuses = ['active', 'converted', 'dead', 'follow_up']
-    if status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
+    """Update lead status.
+
+    The historical sync expects *any* non-active status change to be persisted, so we
+    intentionally avoid over-validating allowed status values here. Frontend clients
+    still send canonical options (converted, dead, follow_up), but custom labels such
+    as "Converted Sale" must continue to flow through so the historical table is
+    populated.
+    """
     
     lead_rows = execute_query(
         """
