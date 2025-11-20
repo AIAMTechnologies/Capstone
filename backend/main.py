@@ -136,14 +136,28 @@ def resolve_final_installer_selection(record: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def insert_historical_record_from_lead(lead: Dict[str, Any]) -> None:
+def insert_historical_record_from_lead(
+    lead: Dict[str, Any],
+    executor=None,
+) -> None:
     """Persist a converted lead into historical_data for future ML training."""
 
+    executor = executor or execute_query
     final_installer = resolve_final_installer_selection(lead)
     dealer_name = lead.get("dealer_name") or final_installer or lead.get("assigned_installer_name")
 
+    # Ensure the operational lead also persists the resolved installer name so
+    # downstream queries don't have to derive it on the fly.
+    if final_installer and not (lead.get("final_installer_selection") or "").strip():
+        executor(
+            "UPDATE leads SET final_installer_selection = %s WHERE id = %s",
+            (final_installer, lead.get("id")),
+            fetch=False,
+        )
+
     query = """
         INSERT INTO historical_data (
+            id,
             submit_date,
             first_name,
             address1,
@@ -155,10 +169,22 @@ def insert_historical_record_from_lead(lead: Dict[str, Any]) -> None:
             current_status,
             final_installer_selection,
             created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT (id) DO UPDATE
+        SET submit_date = EXCLUDED.submit_date,
+            first_name = EXCLUDED.first_name,
+            address1 = EXCLUDED.address1,
+            city = EXCLUDED.city,
+            province = EXCLUDED.province,
+            postal = EXCLUDED.postal,
+            dealer_name = EXCLUDED.dealer_name,
+            project_type = EXCLUDED.project_type,
+            current_status = EXCLUDED.current_status,
+            final_installer_selection = EXCLUDED.final_installer_selection
     """
 
     params = (
+        lead.get("id"),
         lead.get("created_at"),
         lead.get("name"),
         lead.get("address"),
@@ -171,7 +197,20 @@ def insert_historical_record_from_lead(lead: Dict[str, Any]) -> None:
         final_installer,
     )
 
-    execute_query(query, params, fetch=False)
+    executor(query, params, fetch=False)
+
+
+def sync_historical_on_status_change(
+    previous_status: Optional[str], updated_lead: Dict[str, Any], executor=None
+) -> None:
+    """Upsert a historical record when a lead leaves the active pipeline."""
+
+    executor = executor or execute_query
+    old_status = (previous_status or "").strip().lower()
+    new_status = (updated_lead.get("status") or "").strip().lower()
+
+    if old_status == "active" and new_status != "active":
+        insert_historical_record_from_lead(updated_lead, executor=executor)
 
 
 # Initialize the ML allocator once so it can be reused across requests
@@ -1006,10 +1045,9 @@ async def update_lead_status(
     query = "UPDATE leads SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s"
     execute_query(query, (status, lead_id), fetch=False)
 
-    if status == 'converted' and previous_status != 'converted':
-        lead_copy: Dict[str, Any] = dict(current_lead)
-        lead_copy['status'] = status
-        insert_historical_record_from_lead(lead_copy)
+    lead_copy: Dict[str, Any] = dict(current_lead)
+    lead_copy['status'] = status
+    sync_historical_on_status_change(previous_status, lead_copy)
 
     return {"message": "Lead status updated successfully", "lead_id": lead_id, "new_status": status}
 

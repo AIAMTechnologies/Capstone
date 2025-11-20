@@ -149,7 +149,6 @@ class InstallerMLModel:
                 SELECT final_installer_selection, dealer_name, project_type, square_footage, current_status
                 FROM historical_data
                 WHERE final_installer_selection IS NOT NULL
-                    OR dealer_name IS NOT NULL
                 """,
                 None,
                 True,
@@ -174,24 +173,13 @@ class InstallerMLModel:
         frame["square_footage"] = pd.to_numeric(frame.get("square_footage"), errors="coerce")
         frame["project_type"] = frame.get("project_type", "Unknown").fillna("Unknown")
         frame["current_status"] = frame.get("current_status", "Unknown").fillna("Unknown")
-        frame["final_installer_selection"] = (
-            frame.get("final_installer_selection").fillna("").astype(str).str.strip()
-        )
-        frame["dealer_name"] = frame.get("dealer_name").fillna("").astype(str).str.strip()
+        frame["final_installer_selection"] = frame.get("final_installer_selection", "").fillna("").astype(str).str.strip()
+        frame["dealer_name"] = frame.get("dealer_name", "").fillna("").astype(str).str.strip()
 
-        def _resolve_label(row):
-            preferred = row.get("final_installer_selection")
-            if preferred and preferred.lower() not in ("", "unknown"):
-                return preferred
-            fallback = row.get("dealer_name")
-            if fallback and fallback.lower() not in ("", "unknown"):
-                return fallback
-            return None
-
-        frame["label"] = frame.apply(_resolve_label, axis=1)
-        frame = frame.dropna(subset=["label"])
-        frame["label"] = frame["label"].astype(str).str.strip()
-        frame = frame[frame["label"] != ""]
+        # final_installer_selection is the ground truth label; rows without it
+        # should not influence the model so we discard them here.
+        frame = frame[frame["final_installer_selection"] != ""]
+        frame["label"] = frame["final_installer_selection"].astype(str).str.strip()
 
         if frame.empty or frame["label"].nunique() < 2:
             logger.warning("Insufficient label diversity to train ML model")
