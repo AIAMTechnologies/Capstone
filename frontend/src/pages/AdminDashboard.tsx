@@ -35,6 +35,7 @@ import {
 } from '../services/api';
 import { format } from 'date-fns';
 import type { DashboardStats, Lead, LeadStatus, HistoricalData, AlternativeInstaller } from '../types';
+import FinalSelectionDropdown from '../components/FinalSelectionDropdown';
 
 const COLORS = ['#3498db', '#27ae60', '#e74c3c', '#f39c12'];
 
@@ -277,7 +278,7 @@ const AdminDashboard: React.FC = () => {
             </div>
 
             <div className="table-container" style={{ overflowX: 'auto' }}>
-              <table className="table" style={{ minWidth: '1400px' }}>
+              <table className="table" style={{ minWidth: '1600px' }}>
                 <thead>
                   <tr>
                     <th>ID</th>
@@ -290,6 +291,7 @@ const AdminDashboard: React.FC = () => {
                     <th>Installer (ML)</th>
                     <th>Score</th>
                     <th style={{ minWidth: '200px' }}>Alternative Options</th>
+                    <th style={{ minWidth: '220px' }}>Final Selection</th>
                     <th>Date</th>
                     <th>Actions</th>
                   </tr>
@@ -350,6 +352,14 @@ const AdminDashboard: React.FC = () => {
                             No alternatives
                           </span>
                         )}
+                      </td>
+                      <td>
+                        <FinalSelectionDropdown
+                          leadId={lead.id}
+                          currentSelection={lead.final_selection}
+                          assignedInstallerId={lead.assigned_installer_id}
+                          onSelectionChange={loadDashboardData}
+                        />
                       </td>
                       <td>{format(new Date(lead.created_at), 'MMM dd, yyyy')}</td>
                       <td>

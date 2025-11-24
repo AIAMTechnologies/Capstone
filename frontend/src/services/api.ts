@@ -7,7 +7,9 @@ import type {
   Lead,
   LeadStatus,
   Installer,
-  HistoricalDataResponse
+  HistoricalDataResponse,
+  InstallerOption,
+  InstallerOptionsResponse
 } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
@@ -140,6 +142,23 @@ export const getHistoricalData = async (
   }
   
   const response = await api.get<HistoricalDataResponse>('/admin/historical-data', { params });
+  return response.data;
+};
+
+export const updateFinalSelection = async (
+  leadId: number,
+  installerId: number
+): Promise<{ message: string; lead_id: number; installer_id: number; installer_name: string }> => {
+  const response = await api.patch(`/admin/leads/${leadId}/final-selection`, null, {
+    params: { installer_id: installerId }
+  });
+  return response.data;
+};
+
+export const getInstallerOptions = async (
+  leadId: number
+): Promise<InstallerOptionsResponse> => {
+  const response = await api.get<InstallerOptionsResponse>(`/admin/leads/${leadId}/installer-options`);
   return response.data;
 };
 

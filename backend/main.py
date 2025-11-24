@@ -699,6 +699,106 @@ async def update_installer_override(
         "lead_id": lead_id, 
         "installer_id": installer_id
     }
+# Add this new endpoint to your main.py file after the update_installer_override endpoint (around line 701)
+
+@app.patch("/api/admin/leads/{lead_id}/final-selection")
+async def update_final_selection(
+    lead_id: int,
+    installer_id: int,
+    current_user: AdminUser = Depends(get_current_user)
+):
+    """
+    Update the final installer selection for a lead
+    This can be either the ML-assigned installer or one of the alternative options
+    """
+    
+    # Validate installer exists and is active
+    installer_check = execute_query(
+        "SELECT id, name FROM installers WHERE id = %s AND is_active = TRUE",
+        (installer_id,)
+    )
+    if not installer_check:
+        raise HTTPException(status_code=404, detail="Installer not found or inactive")
+    
+    # Update the final_selection column
+    query = """
+        UPDATE leads 
+        SET final_selection = %s, updated_at = CURRENT_TIMESTAMP 
+        WHERE id = %s
+    """
+    execute_query(query, (installer_id, lead_id), fetch=False)
+    
+    return {
+        "message": "Final selection updated successfully", 
+        "lead_id": lead_id, 
+        "installer_id": installer_id,
+        "installer_name": installer_check[0]['name']
+    }
+
+@app.get("/api/admin/leads/{lead_id}/installer-options")
+async def get_installer_options(
+    lead_id: int,
+    current_user: AdminUser = Depends(get_current_user)
+):
+    """
+    Get all available installer options for a lead (ML assignment + alternatives)
+    This is used to populate the dropdown in the final_selection column
+    """
+    
+    # Get lead with ML assignment
+    lead_query = """
+        SELECT l.*, 
+               i.name as assigned_installer_name,
+               i.city as assigned_installer_city,
+               i.province as assigned_installer_province
+        FROM leads l
+        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        WHERE l.id = %s
+    """
+    
+    lead = execute_query(lead_query, (lead_id,))
+    
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    
+    lead_dict = dict(lead[0])
+    
+    options = []
+    
+    # Add ML-assigned installer as first option
+    if lead_dict['assigned_installer_id']:
+        options.append({
+            "id": lead_dict['assigned_installer_id'],
+            "name": lead_dict['assigned_installer_name'],
+            "city": lead_dict['assigned_installer_city'],
+            "province": lead_dict['assigned_installer_province'],
+            "label": f"{lead_dict['assigned_installer_name']} (ML Assignment)",
+            "type": "ml_assignment"
+        })
+    
+    # Add alternative installers
+    if lead_dict['latitude'] and lead_dict['longitude']:
+        allocation = allocate_lead_to_installer(
+            lead_dict['latitude'], 
+            lead_dict['longitude'], 
+            lead_dict['province']
+        )
+        
+        if allocation and allocation.get('alternative_installers'):
+            for alt in allocation['alternative_installers']:
+                # Don't duplicate the ML-assigned installer
+                if alt['id'] != lead_dict['assigned_installer_id']:
+                    options.append({
+                        "id": alt['id'],
+                        "name": alt['name'],
+                        "city": alt['city'],
+                        "province": alt['province'],
+                        "distance_km": alt['distance_km'],
+                        "label": f"{alt['name']} ({alt['city']}) - {alt['distance_km']:.1f}km",
+                        "type": "alternative"
+                    })
+    
+    return {"options": options, "count": len(options)}
 
 @app.get("/api/admin/installers")
 async def get_installers(current_user: AdminUser = Depends(get_current_user)):
