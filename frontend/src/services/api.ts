@@ -1,6 +1,7 @@
 import axios, { AxiosError } from 'axios';
-import type { 
-  LeadFormData, 
+import { env } from '../config/env';
+import type {
+  LeadFormData,
   LoginResponse, 
   DashboardStats, 
   LeadsResponse, 
@@ -12,7 +13,7 @@ import type {
   InstallerOptionsResponse
 } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
+const API_BASE_URL = env.apiUrl || 'http://localhost:8000/api';
 
 // Create axios instance
 const api = axios.create({
@@ -54,6 +55,11 @@ api.interceptors.response.use(
 export const submitLead = async (leadData: LeadFormData): Promise<Lead> => {
   const response = await api.post<Lead>('/leads', leadData);
   return response.data;
+};
+
+export const getPublicGoogleMapsApiKey = async (): Promise<string> => {
+  const response = await api.get<{ googleMapsApiKey?: string }>('/config/map-key');
+  return (response.data.googleMapsApiKey ?? '').trim();
 };
 
 // ============================================
@@ -119,9 +125,17 @@ export const updateLeadStatus = async (
 export const updateInstallerOverride = async (
   leadId: number,
   installerId: number | null
-): Promise<{ message: string; lead_id: number; installer_id: number | null }> => {
-  const response = await api.patch(`/admin/leads/${leadId}/installer-override`, null, {
-    params: { installer_id: installerId }
+): Promise<{
+  message: string;
+  lead_id: number;
+  installer_id: number | null;
+  assigned_installer_id?: number | null;
+  final_installer_selection?: string;
+  installer_name?: string | null;
+  installer_city?: string | null;
+}> => {
+  const response = await api.patch(`/admin/leads/${leadId}/installer-override`, {
+    installer_id: installerId
   });
   return response.data;
 };

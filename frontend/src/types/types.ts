@@ -12,13 +12,16 @@ export interface Lead {
   job_type: 'residential' | 'commercial';
   comments?: string;
   status: 'active' | 'converted' | 'dead'|'follow_up' ;
-  assigned_installer_id?: number;
-  assigned_installer_name?: string;
-  installer_name?: string;
-  installer_city?: string;
+  assigned_installer_id?: number | null;
+  assigned_installer_name?: string | null;
+  installer_name?: string | null;
+  final_installer_selection?: string | null;
+  installer_city?: string | null;
   allocation_score?: number;
   distance_to_installer_km?: number;
-  installer_override_id?: number;
+  installer_ml_probability?: number;
+  distance_review_required?: boolean;
+  installer_override_id?: number | null;
   alternative_installers?: AlternativeInstaller[];
   final_selection?: number;
   final_selection_name?: string;
@@ -36,6 +39,9 @@ export interface AlternativeInstaller {
   distance_km: number;
   allocation_score: number;
   active_leads: number;
+  converted_leads?: number;
+  ml_probability?: number;
+  distance_review_required?: boolean;
 }
 
 export interface LeadFormData {
@@ -110,6 +116,7 @@ export interface HistoricalData {
   province?: string;
   postal?: string;
   dealer_name?: string;
+  final_installer_selection?: string;
   project_type?: string;
   product_type?: string;
   square_footage?: number;
