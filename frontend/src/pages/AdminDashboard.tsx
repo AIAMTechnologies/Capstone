@@ -34,12 +34,7 @@ import {
   getHistoricalData 
 } from '../services/api';
 import { format } from 'date-fns';
-<<<<<<< HEAD
-import type { DashboardStats, Lead, LeadStatus, HistoricalData, AlternativeInstaller } from '../types';
-import FinalSelectionDropdown from '../components/FinalSelectionDropdown';
-=======
 import type { DashboardStats, Lead, LeadStatus, HistoricalData } from '../types';
->>>>>>> ccb600517504be1a6554195441dedc0629a92011
 
 const COLORS = ['#3498db', '#27ae60', '#e74c3c', '#f39c12'];
 
@@ -440,7 +435,7 @@ const AdminDashboard: React.FC = () => {
             </div>
 
             <div className="table-container" style={{ overflowX: 'auto' }}>
-              <table className="table" style={{ minWidth: '1600px' }}>
+              <table className="table" style={{ minWidth: '1400px' }}>
                 <thead>
                   <tr>
                     <th>ID</th>
@@ -454,105 +449,15 @@ const AdminDashboard: React.FC = () => {
                     <th>Final Installer</th>
                     <th>Score</th>
                     <th style={{ minWidth: '200px' }}>Alternative Options</th>
-                    <th style={{ minWidth: '220px' }}>Final Selection</th>
                     <th>Date</th>
                     <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-<<<<<<< HEAD
-                  {leads.map((lead) => (
-                    <tr key={lead.id}>
-                      <td>#{lead.id}</td>
-                      <td style={{ fontWeight: '600' }}>{lead.name}</td>
-                      <td>{lead.email}</td>
-                      <td>{lead.phone}</td>
-                      <td>{lead.city}, {lead.province}</td>
-                      <td style={{ textTransform: 'capitalize' }}>{lead.job_type}</td>
-                      <td>
-                        <span className={getStatusBadgeClass(lead.status)}>
-                          {formatStatus(lead.status)}
-                        </span>
-                      </td>
-                      <td>
-                        <div style={{ fontSize: '14px' }}>
-                          <div style={{ fontWeight: '600', color: '#2c3e50' }}>
-                            {lead.installer_name || 'Unassigned'}
-                          </div>
-                          {lead.installer_city && (
-                            <div style={{ fontSize: '12px', color: '#7f8c8d' }}>
-                              {lead.installer_city}
-                            </div>
-                          )}
-                        </div>
-                      </td>
-                      <td>{lead.allocation_score ? lead.allocation_score.toFixed(1) : 'N/A'}</td>
-                      <td>
-                        {lead.alternative_installers && lead.alternative_installers.length > 0 ? (
-                          <select
-                            className="form-select"
-                            value={lead.installer_override_id || ''}
-                            onChange={(e) => {
-                              const installerId = e.target.value ? Number(e.target.value) : null;
-                              handleInstallerOverride(lead.id, installerId);
-                            }}
-                            style={{ 
-                              width: '100%', 
-                              padding: '4px 8px', 
-                              fontSize: '13px',
-                              minWidth: '180px'
-                            }}
-                            title="Select alternative installer"
-                          >
-                            <option value="">Other Installers</option>
-                            {lead.alternative_installers.map((alt) => (
-                              <option key={alt.id} value={alt.id}>
-                                {alt.name} - {alt.city} ({alt.distance_km.toFixed(1)}km, Score: {alt.allocation_score.toFixed(1)})
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          <span style={{ fontSize: '12px', color: '#95a5a6' }}>
-                            No alternatives
-                          </span>
-                        )}
-                      </td>
-                      <td>
-                        <FinalSelectionDropdown
-                          leadId={lead.id}
-                          currentSelection={lead.final_selection}
-                          assignedInstallerId={lead.assigned_installer_id}
-                          onSelectionChange={loadDashboardData}
-                        />
-                      </td>
-                      <td>{format(new Date(lead.created_at), 'MMM dd, yyyy')}</td>
-                      <td>
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                          <select
-                            className="form-select"
-                            value={lead.status}
-                            onChange={(e) => handleStatusChange(lead.id, e.target.value as LeadStatus)}
-                            style={{ width: 'auto', padding: '4px 8px', fontSize: '14px' }}
-                          >
-                            <option value="active">Active</option>
-                            <option value="converted">Converted</option>
-                            <option value="dead">Dead</option>
-                            <option value="follow_up">Follow Up</option>
-                          </select>
-                          <button
-                            className="btn btn-outline"
-                            style={{ padding: '4px 8px' }}
-                            onClick={() => setSelectedLead(lead)}
-                          >
-                            <Eye size={16} />
-                          </button>
-                        </div>
-=======
                   {leadsLoading ? (
                     <tr>
                       <td colSpan={13} style={{ textAlign: 'center', padding: '32px' }}>
                         <div className="spinner" />
->>>>>>> ccb600517504be1a6554195441dedc0629a92011
                       </td>
                     </tr>
                   ) : leads.length === 0 ? (

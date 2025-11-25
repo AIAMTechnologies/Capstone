@@ -23,8 +23,6 @@ export interface Lead {
   distance_review_required?: boolean;
   installer_override_id?: number | null;
   alternative_installers?: AlternativeInstaller[];
-  final_selection?: number;
-  final_selection_name?: string;
   created_at: string;
   updated_at?: string;
   latitude?: number;
@@ -133,19 +131,4 @@ export interface HistoricalDataResponse {
   data: HistoricalData[];
   count: number;
   total: number;
-}
-
-export interface InstallerOption {
-  id: number;
-  name: string;
-  city: string;
-  province: string;
-  distance_km?: number;
-  label: string;
-  type: 'ml_assignment' | 'alternative';
-}
-
-export interface InstallerOptionsResponse {
-  options: InstallerOption[];
-  count: number;
 }
