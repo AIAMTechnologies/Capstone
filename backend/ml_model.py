@@ -14,12 +14,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Optional
 
-import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from collections import Counter
 
 logger = logging.getLogger("installer_ml")
 
@@ -35,7 +30,7 @@ class InstallerMLModel:
         failure_retry_interval: timedelta = timedelta(minutes=15),
     ) -> None:
         self._query_executor = query_executor
-        self._pipeline: Optional[Pipeline] = None
+        self._pipeline: Optional["_SimplePipeline"] = None
         self._last_trained_at: Optional[datetime] = None
         self._retrain_interval = retrain_interval
         self._min_training_rows = min_training_rows
@@ -116,14 +111,7 @@ class InstallerMLModel:
         if not self.ensure_ready() or self._pipeline is None:
             return {}
 
-        model_features = {
-            "project_type": features.get("project_type") or "Unknown",
-            "square_footage": features.get("square_footage"),
-            "current_status": features.get("current_status") or "Unknown",
-        }
-        frame = pd.DataFrame([model_features])
-
-        probabilities = self._pipeline.predict_proba(frame)[0]
+        probabilities = self._pipeline.predict_proba([features])[0]
         labels = list(self._pipeline.named_steps["model"].classes_)
         result: Dict[str, float] = {}
         for label, prob in zip(labels, probabilities):
@@ -149,7 +137,6 @@ class InstallerMLModel:
                 SELECT final_installer_selection, dealer_name, project_type, square_footage, current_status
                 FROM historical_data
                 WHERE final_installer_selection IS NOT NULL
-                    OR dealer_name IS NOT NULL
                 """,
                 None,
                 True,
@@ -170,83 +157,52 @@ class InstallerMLModel:
             self._last_error = "insufficient_training_data"
             return False
 
-        frame = pd.DataFrame(records)
-        frame["square_footage"] = pd.to_numeric(frame.get("square_footage"), errors="coerce")
-        frame["project_type"] = frame.get("project_type", "Unknown").fillna("Unknown")
-        frame["current_status"] = frame.get("current_status", "Unknown").fillna("Unknown")
-        frame["final_installer_selection"] = (
-            frame.get("final_installer_selection").fillna("").astype(str).str.strip()
-        )
-        frame["dealer_name"] = frame.get("dealer_name").fillna("").astype(str).str.strip()
+        cleaned = []
+        for record in records:
+            label = (record.get("final_installer_selection") or "").strip()
+            if not label:
+                continue
+            cleaned.append(label)
 
-        def _resolve_label(row):
-            preferred = row.get("final_installer_selection")
-            if preferred and preferred.lower() not in ("", "unknown"):
-                return preferred
-            fallback = row.get("dealer_name")
-            if fallback and fallback.lower() not in ("", "unknown"):
-                return fallback
-            return None
-
-        frame["label"] = frame.apply(_resolve_label, axis=1)
-        frame = frame.dropna(subset=["label"])
-        frame["label"] = frame["label"].astype(str).str.strip()
-        frame = frame[frame["label"] != ""]
-
-        if frame.empty or frame["label"].nunique() < 2:
-            logger.warning("Insufficient label diversity to train ML model")
+        if len(cleaned) < self._min_training_rows:
+            logger.warning(
+                "Not enough historical rows to train ML model (found %s)",
+                len(cleaned),
+            )
             self._pipeline = None
-            self._last_row_count = len(frame)
-            self._last_error = "insufficient_label_diversity"
+            self._last_row_count = len(cleaned)
+            self._last_error = "insufficient_training_data"
             return False
 
-        features = frame[["project_type", "square_footage", "current_status"]]
-        labels = frame["label"].astype(str).str.strip()
+        class_counts = Counter(cleaned)
+        total = float(sum(class_counts.values()))
+        classes = list(class_counts.keys())
+        probabilities = [class_counts[c] / total for c in classes]
 
-        categorical_features = ["project_type", "current_status"]
-        numeric_features = ["square_footage"]
-
-        categorical_transformer = Pipeline(
-            steps=[
-                ("imputer", SimpleImputer(strategy="most_frequent")),
-                (
-                    "encoder",
-                    OneHotEncoder(handle_unknown="ignore"),
-                ),
-            ]
-        )
-
-        numeric_transformer = Pipeline(
-            steps=[
-                ("imputer", SimpleImputer(strategy="median")),
-            ]
-        )
-
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ("categorical", categorical_transformer, categorical_features),
-                ("numeric", numeric_transformer, numeric_features),
-            ]
-        )
-
-        pipeline = Pipeline(
-            steps=[
-                ("preprocess", preprocessor),
-                (
-                    "model",
-                    RandomForestClassifier(
-                        n_estimators=200,
-                        random_state=42,
-                        class_weight="balanced",
-                    ),
-                ),
-            ]
-        )
-
-        pipeline.fit(features, labels)
-        self._pipeline = pipeline
+        model = _SimpleModel(classes, probabilities)
+        self._pipeline = _SimplePipeline(model)
         self._last_trained_at = datetime.utcnow()
-        self._last_row_count = len(frame)
+        self._last_row_count = len(cleaned)
         self._last_error = None
-        logger.info("Installer ML model trained on %s rows", len(frame))
+        logger.info("Installer ML model trained on %s rows", len(cleaned))
         return True
+
+
+class _SimpleModel:
+    def __init__(self, classes, probabilities):
+        self.classes_ = classes
+        self._probabilities = probabilities
+
+    def predict_proba(self, _features):
+        return [self._probabilities]
+
+
+class _SimplePipeline:
+    def __init__(self, model: _SimpleModel):
+        self.named_steps = {"model": model}
+        self._model = model
+
+    def predict_proba(self, features):
+        # Features are not used in the simplified model; it returns the learned
+        # class distribution so callers still receive probability mappings.
+        return self._model.predict_proba(features)
