@@ -13,8 +13,4 @@ pandas==2.2.2
 numpy==1.26.4
 joblib==1.4.2
 scipy==1.11.4
-<<<<<<< HEAD
 python-dotenv==1.0.0
-=======
-python-dotenv==1.0.0
->>>>>>> ccb600517504be1a6554195441dedc0629a92011
