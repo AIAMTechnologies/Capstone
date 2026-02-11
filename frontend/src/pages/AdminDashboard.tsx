@@ -29,6 +29,7 @@ import {
 import { 
   getDashboardStats, 
   getLeads, 
+  submitLead,
   updateLeadStatus, 
   updateInstallerOverride,
   getHistoricalData 
@@ -350,6 +351,8 @@ const AdminDashboard: React.FC = () => {
   const formatStatus = (status: LeadStatus): string => {
     return status === 'follow_up' ? 'Follow Up' : status.charAt(0).toUpperCase() + status.slice(1);
   };
+
+
 
   const handleAdminLeadFieldChange = (field: string, value: string) => {
     setAdminLeadForm((prev) => {
