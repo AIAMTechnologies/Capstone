@@ -29,6 +29,7 @@ import {
 import { 
   getDashboardStats, 
   getLeads, 
+  submitLead,
   updateLeadStatus, 
   updateInstallerOverride,
   getHistoricalData 
@@ -39,6 +40,88 @@ import type { DashboardStats, Lead, LeadStatus, HistoricalData } from '../types'
 const COLORS = ['#3498db', '#27ae60', '#e74c3c', '#f39c12'];
 
 type TabType = 'current' | 'historical' | 'profile';
+
+type AdminLeadFormState = Record<string, string>;
+
+const COUNTRY_OPTIONS = ['Canada', 'USA', 'Mexico'];
+
+const COUNTRY_SUBDIVISIONS: Record<string, string[]> = {
+  Canada: ['AB', 'BC', 'MB', 'NB', 'NL', 'NS', 'NT', 'NU', 'ON', 'PE', 'QC', 'SK', 'YT'],
+  USA: ['AL', 'AK', 'AZ', 'CA', 'CO', 'FL', 'GA', 'IL', 'NY', 'TX', 'WA'],
+  Mexico: ['CDMX', 'Jalisco', 'Nuevo Leon', 'Puebla', 'Yucatan']
+};
+
+const PRODUCT_SERVICE_OPTIONS = [
+  'Sun Control',
+  'Safety / Security',
+  'Graphics - Print/Cut',
+  'Privacy/Decorative',
+  'Feather Friendly',
+  'Automotive'
+];
+
+const SQUARE_FOOTAGE_OPTIONS = [
+  '1 - 499 sqft',
+  '500 - 999 sqft',
+  '1000 - 3499 sqft',
+  '3500 - 7499 sqft',
+  '7500 - 19999 sqft',
+  '20000+ sqft'
+];
+
+const LEAD_SOURCE_OPTIONS = [
+  '3M Canada',
+  'National Account',
+  'Window Film Canada',
+  'Lead 1',
+  'Lead 2',
+  'Lead 3',
+  'Lead 4',
+  'Lead 5',
+  'PM Expo 2018',
+  'TrdMag-1',
+  'Tender'
+];
+
+const PROJECT_TYPE_OPTIONS = ['Commercial', 'Residential', 'Institutional', 'Hospitality'];
+
+const INITIAL_ADMIN_LEAD_FORM: AdminLeadFormState = {
+  first_name: '',
+  last_name: '',
+  title: '',
+  primary_phone: '',
+  work_phone: '',
+  cell_phone: '',
+  email: '',
+  company: '',
+  address_line_1: '',
+  address_line_2: '',
+  city: '',
+  province: '',
+  country: '',
+  postal_code: '',
+  products_services_1: '',
+  products_services_2: '',
+  products_services_3: '',
+  square_footage: '',
+  custom_pick_1: '',
+  project_city: '',
+  project_type: '',
+  business_category: '',
+  dealer_email: '',
+  other_please_specify: '',
+  date_yyyy_mm_dd: '',
+  lead_source: '',
+  opt_in: '',
+  page_name: '',
+  url: '',
+  variant: '',
+  utm_source: '',
+  utm_medium: '',
+  utm_campaign: '',
+  utm_content: '',
+  custom_pick_3: ''
+};
 
 const AdminDashboard: React.FC = () => {
   const [stats, setStats] = useState<DashboardStats | null>(null);
@@ -52,6 +135,9 @@ const AdminDashboard: React.FC = () => {
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>('current');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [insertLeadError, setInsertLeadError] = useState<string | null>(null);
+  const [insertLeadSuccess, setInsertLeadSuccess] = useState<string | null>(null);
+  const [adminLeadForm, setAdminLeadForm] = useState<AdminLeadFormState>(INITIAL_ADMIN_LEAD_FORM);
   const [hasInitialized, setHasInitialized] = useState<boolean>(false);
   const leadRequestIdRef = useRef(0);
   const initialStatusFilterRef = useRef<LeadStatus | 'all'>(statusFilter);
@@ -266,6 +352,72 @@ const AdminDashboard: React.FC = () => {
     return status === 'follow_up' ? 'Follow Up' : status.charAt(0).toUpperCase() + status.slice(1);
   };
 
+
+
+  const handleAdminLeadFieldChange = (field: string, value: string) => {
+    setAdminLeadForm((prev) => {
+      if (field === 'country') {
+        return {
+          ...prev,
+          country: value,
+          province: ''
+        };
+      }
+      return { ...prev, [field]: value };
+    });
+  };
+
+  const handleInsertLead = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setInsertLeadError(null);
+    setInsertLeadSuccess(null);
+
+    if (!adminLeadForm.lead_source) {
+      setInsertLeadError('This is a required field. Please select a lead source.');
+      return;
+    }
+
+    const selectedProducts = [
+      adminLeadForm.products_services_1,
+      adminLeadForm.products_services_2,
+      adminLeadForm.products_services_3
+    ].filter(Boolean);
+
+    if (new Set(selectedProducts).size !== selectedProducts.length) {
+      setInsertLeadError('Please select different values for Products / Services 1-3.');
+      return;
+    }
+
+    const payload = {
+      name: `${adminLeadForm.first_name} ${adminLeadForm.last_name}`.trim() || 'Unnamed Lead',
+      email: adminLeadForm.email || adminLeadForm.dealer_email || 'unknown@example.com',
+      phone: adminLeadForm.primary_phone || adminLeadForm.cell_phone || adminLeadForm.work_phone || 'N/A',
+      address: [adminLeadForm.address_line_1, adminLeadForm.address_line_2].filter(Boolean).join(', ') || 'N/A',
+      city: adminLeadForm.city || adminLeadForm.project_city || 'N/A',
+      province: adminLeadForm.province || 'ON',
+      postal_code: adminLeadForm.postal_code || undefined,
+      job_type: adminLeadForm.project_type.toLowerCase() === 'residential' ? 'residential' as const : 'commercial' as const,
+      comments: [
+        adminLeadForm.company && `Company: ${adminLeadForm.company}`,
+        adminLeadForm.business_category && `Business Category: ${adminLeadForm.business_category}`,
+        adminLeadForm.lead_source && `Lead Source: ${adminLeadForm.lead_source}`,
+        adminLeadForm.opt_in && `Opt-In: ${adminLeadForm.opt_in}`
+      ]
+        .filter(Boolean)
+        .join(' | ') || undefined,
+    };
+
+    try {
+      await submitLead(payload);
+      await Promise.all([loadStats(), refreshLeads()]);
+      setAdminLeadForm(INITIAL_ADMIN_LEAD_FORM);
+      setInsertLeadSuccess('Lead inserted and saved to server.');
+    } catch (error) {
+      console.error('Error inserting lead:', error);
+      setInsertLeadError('Failed to save lead. Please try again.');
+    }
+  };
+
   if (loading && !stats) {
     return <div className="spinner"></div>;
   }
@@ -408,6 +560,110 @@ const AdminDashboard: React.FC = () => {
           </div>
 
           {/* Leads Table */}
+          <div className="card" style={{ marginBottom: '28px' }}>
+            <form onSubmit={handleInsertLead}>
+              <div style={{ backgroundColor: '#c91414', color: '#fff', borderRadius: '8px', padding: '14px 16px', marginBottom: '16px' }}>
+                <h2 style={{ fontSize: '24px', marginBottom: '4px' }}>Insert New Lead</h2>
+                <p>Please fill in all of the following fields</p>
+              </div>
+
+              {insertLeadError && <div className="form-error" style={{ marginBottom: '12px' }}>{insertLeadError}</div>}
+              {insertLeadSuccess && <div className="alert alert-success" style={{ marginBottom: '12px' }}>{insertLeadSuccess}</div>}
+
+              <div className="admin-lead-form-grid-3">
+                <div>
+                  <input className="form-input admin-lead-field" placeholder="First Name" value={adminLeadForm.first_name} onChange={(e) => handleAdminLeadFieldChange('first_name', e.target.value)} />
+                  <input className="form-input admin-lead-field" placeholder="Last Name" value={adminLeadForm.last_name} onChange={(e) => handleAdminLeadFieldChange('last_name', e.target.value)} />
+                  <input className="form-input admin-lead-field" placeholder="Title" value={adminLeadForm.title} onChange={(e) => handleAdminLeadFieldChange('title', e.target.value)} />
+                  <input className="form-input admin-lead-field" placeholder="Primary Phone" value={adminLeadForm.primary_phone} onChange={(e) => handleAdminLeadFieldChange('primary_phone', e.target.value)} />
+                  <input className="form-input admin-lead-field" placeholder="Work Phone" value={adminLeadForm.work_phone} onChange={(e) => handleAdminLeadFieldChange('work_phone', e.target.value)} />
+                  <input className="form-input admin-lead-field" placeholder="Cell Phone" value={adminLeadForm.cell_phone} onChange={(e) => handleAdminLeadFieldChange('cell_phone', e.target.value)} />
+                  <input type="email" className="form-input admin-lead-field" placeholder="Email" value={adminLeadForm.email} onChange={(e) => handleAdminLeadFieldChange('email', e.target.value)} />
+                </div>
+
+                <div>
+                  <input className="form-input admin-lead-field" placeholder="Company" value={adminLeadForm.company} onChange={(e) => handleAdminLeadFieldChange('company', e.target.value)} />
+                  <input className="form-input admin-lead-field" placeholder="Address Line 1" value={adminLeadForm.address_line_1} onChange={(e) => handleAdminLeadFieldChange('address_line_1', e.target.value)} />
+                  <input className="form-input admin-lead-field" placeholder="Address Line 2" value={adminLeadForm.address_line_2} onChange={(e) => handleAdminLeadFieldChange('address_line_2', e.target.value)} />
+                  <input className="form-input admin-lead-field" placeholder="City" value={adminLeadForm.city} onChange={(e) => handleAdminLeadFieldChange('city', e.target.value)} />
+                  <select className="form-select admin-lead-field" value={adminLeadForm.province} onChange={(e) => handleAdminLeadFieldChange('province', e.target.value)}>
+                    <option value="">Province</option>
+                    {(COUNTRY_SUBDIVISIONS[adminLeadForm.country] || []).map((item) => (
+                      <option key={item} value={item}>{item}</option>
+                    ))}
+                  </select>
+                  <select className="form-select admin-lead-field" value={adminLeadForm.country} onChange={(e) => handleAdminLeadFieldChange('country', e.target.value)}>
+                    <option value="">Country</option>
+                    {COUNTRY_OPTIONS.map((item) => <option key={item} value={item}>{item}</option>)}
+                  </select>
+                  <input className="form-input admin-lead-field" placeholder="Postal Code" value={adminLeadForm.postal_code} onChange={(e) => handleAdminLeadFieldChange('postal_code', e.target.value)} />
+                </div>
+
+                <div>
+                  <select className="form-select admin-lead-field" value={adminLeadForm.products_services_1} onChange={(e) => handleAdminLeadFieldChange('products_services_1', e.target.value)}>
+                    <option value="">Products / Services 1</option>
+                    {PRODUCT_SERVICE_OPTIONS.map((item) => <option key={item} value={item}>{item}</option>)}
+                  </select>
+                  <select className="form-select admin-lead-field" value={adminLeadForm.products_services_2} onChange={(e) => handleAdminLeadFieldChange('products_services_2', e.target.value)}>
+                    <option value="">Products / Services 2</option>
+                    {PRODUCT_SERVICE_OPTIONS.map((item) => <option key={item} value={item}>{item}</option>)}
+                  </select>
+                  <select className="form-select admin-lead-field" value={adminLeadForm.products_services_3} onChange={(e) => handleAdminLeadFieldChange('products_services_3', e.target.value)}>
+                    <option value="">Products / Services 3</option>
+                    {PRODUCT_SERVICE_OPTIONS.map((item) => <option key={item} value={item}>{item}</option>)}
+                  </select>
+                  <select className="form-select admin-lead-field" value={adminLeadForm.square_footage} onChange={(e) => handleAdminLeadFieldChange('square_footage', e.target.value)}>
+                    <option value="">Square Footage</option>
+                    {SQUARE_FOOTAGE_OPTIONS.map((item) => <option key={item} value={item}>{item}</option>)}
+                  </select>
+                  <input className="form-input admin-lead-field" placeholder="Custom Pick 1" value={adminLeadForm.custom_pick_1} onChange={(e) => handleAdminLeadFieldChange('custom_pick_1', e.target.value)} />
+                  <input className="form-input admin-lead-field" placeholder="Project City" value={adminLeadForm.project_city} onChange={(e) => handleAdminLeadFieldChange('project_city', e.target.value)} />
+                  <select className="form-select admin-lead-field" value={adminLeadForm.project_type} onChange={(e) => handleAdminLeadFieldChange('project_type', e.target.value)}>
+                    <option value="">Project Type</option>
+                    {PROJECT_TYPE_OPTIONS.map((item) => <option key={item} value={item}>{item}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              <div className="admin-lead-form-grid-3">
+                <div>
+                  <input className="form-input admin-lead-field" placeholder="Business Category" value={adminLeadForm.business_category} onChange={(e) => handleAdminLeadFieldChange('business_category', e.target.value)} />
+                  <input type="email" className="form-input admin-lead-field" placeholder="Dealer Email" value={adminLeadForm.dealer_email} onChange={(e) => handleAdminLeadFieldChange('dealer_email', e.target.value)} />
+                </div>
+                <div>
+                  <input className="form-input admin-lead-field" placeholder="Other Please Specify" value={adminLeadForm.other_please_specify} onChange={(e) => handleAdminLeadFieldChange('other_please_specify', e.target.value)} />
+                  <input type="date" className="form-input admin-lead-field" value={adminLeadForm.date_yyyy_mm_dd} onChange={(e) => handleAdminLeadFieldChange('date_yyyy_mm_dd', e.target.value)} />
+                </div>
+                <div>
+                  <select className="form-select admin-lead-field" value={adminLeadForm.lead_source} onChange={(e) => handleAdminLeadFieldChange('lead_source', e.target.value)}>
+                    <option value="">Lead Source *</option>
+                    {LEAD_SOURCE_OPTIONS.map((item) => <option key={item} value={item}>{item}</option>)}
+                  </select>
+                  <select className="form-select admin-lead-field" value={adminLeadForm.opt_in} onChange={(e) => handleAdminLeadFieldChange('opt_in', e.target.value)}>
+                    <option value="">Opt-In</option>
+                    <option value="Yes">Yes</option>
+                    <option value="No">No</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="admin-lead-form-grid-6">
+                <input className="form-input admin-lead-field admin-span-3" placeholder="Page Name" value={adminLeadForm.page_name} onChange={(e) => handleAdminLeadFieldChange('page_name', e.target.value)} />
+                <input className="form-input admin-lead-field admin-span-3" placeholder="URL" value={adminLeadForm.url} onChange={(e) => handleAdminLeadFieldChange('url', e.target.value)} />
+                <input className="form-input admin-lead-field admin-span-2" placeholder="Variant" value={adminLeadForm.variant} onChange={(e) => handleAdminLeadFieldChange('variant', e.target.value)} />
+                <input className="form-input admin-lead-field admin-span-2" placeholder="UTM Source" value={adminLeadForm.utm_source} onChange={(e) => handleAdminLeadFieldChange('utm_source', e.target.value)} />
+                <input className="form-input admin-lead-field admin-span-2" placeholder="UTM Medium" value={adminLeadForm.utm_medium} onChange={(e) => handleAdminLeadFieldChange('utm_medium', e.target.value)} />
+                <input className="form-input admin-lead-field admin-span-2" placeholder="UTM Campaign" value={adminLeadForm.utm_campaign} onChange={(e) => handleAdminLeadFieldChange('utm_campaign', e.target.value)} />
+                <input className="form-input admin-lead-field admin-span-2" placeholder="UTM Content" value={adminLeadForm.utm_content} onChange={(e) => handleAdminLeadFieldChange('utm_content', e.target.value)} />
+                <input className="form-input admin-lead-field admin-span-2" placeholder="Custom Pick 3" value={adminLeadForm.custom_pick_3} onChange={(e) => handleAdminLeadFieldChange('custom_pick_3', e.target.value)} />
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px' }}>
+                <button type="submit" className="btn btn-primary">Insert New Lead</button>
+              </div>
+            </form>
+          </div>
+
           <div className="card">
             <div className="card-header">
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
