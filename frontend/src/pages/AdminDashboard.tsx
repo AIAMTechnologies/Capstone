@@ -367,7 +367,7 @@ const AdminDashboard: React.FC = () => {
     });
   };
 
-  const handleInsertLead = async (event: React.FormEvent<HTMLFormElement>) => {
+  const handleInsertLead = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setInsertLeadError(null);
     setInsertLeadSuccess(null);
@@ -388,15 +388,16 @@ const AdminDashboard: React.FC = () => {
       return;
     }
 
-    const payload = {
+    const createdLead: Lead = {
+      id: Date.now(),
       name: `${adminLeadForm.first_name} ${adminLeadForm.last_name}`.trim() || 'Unnamed Lead',
-      email: adminLeadForm.email || adminLeadForm.dealer_email || 'unknown@example.com',
-      phone: adminLeadForm.primary_phone || adminLeadForm.cell_phone || adminLeadForm.work_phone || 'N/A',
-      address: [adminLeadForm.address_line_1, adminLeadForm.address_line_2].filter(Boolean).join(', ') || 'N/A',
-      city: adminLeadForm.city || adminLeadForm.project_city || 'N/A',
-      province: adminLeadForm.province || 'ON',
+      email: adminLeadForm.email || adminLeadForm.dealer_email || '-',
+      phone: adminLeadForm.primary_phone || adminLeadForm.cell_phone || adminLeadForm.work_phone || '-',
+      address: [adminLeadForm.address_line_1, adminLeadForm.address_line_2].filter(Boolean).join(', '),
+      city: adminLeadForm.city || adminLeadForm.project_city || '-',
+      province: adminLeadForm.province || '-',
       postal_code: adminLeadForm.postal_code || undefined,
-      job_type: adminLeadForm.project_type.toLowerCase() === 'residential' ? 'residential' as const : 'commercial' as const,
+      job_type: adminLeadForm.project_type.toLowerCase() === 'residential' ? 'residential' : 'commercial',
       comments: [
         adminLeadForm.company && `Company: ${adminLeadForm.company}`,
         adminLeadForm.business_category && `Business Category: ${adminLeadForm.business_category}`,
@@ -404,18 +405,15 @@ const AdminDashboard: React.FC = () => {
         adminLeadForm.opt_in && `Opt-In: ${adminLeadForm.opt_in}`
       ]
         .filter(Boolean)
-        .join(' | ') || undefined,
+        .join(' | '),
+      status: 'active',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
     };
 
-    try {
-      await submitLead(payload);
-      await Promise.all([loadStats(), refreshLeads()]);
-      setAdminLeadForm(INITIAL_ADMIN_LEAD_FORM);
-      setInsertLeadSuccess('Lead inserted and saved to server.');
-    } catch (error) {
-      console.error('Error inserting lead:', error);
-      setInsertLeadError('Failed to save lead. Please try again.');
-    }
+    setLeads((prev) => [createdLead, ...prev]);
+    setAdminLeadForm(INITIAL_ADMIN_LEAD_FORM);
+    setInsertLeadSuccess('Lead inserted into the current list.');
   };
 
   if (loading && !stats) {
