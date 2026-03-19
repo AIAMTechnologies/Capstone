@@ -44,7 +44,17 @@ class AIClient:
             cutoff = time.time() - self._cache_ttl
             self._cache = {k: v for k, v in self._cache.items() if v[1] > cutoff}
 
-    def call_json(self, system: str, user: str, model: str = "gpt-4o-mini", cache_key: str = None) -> Optional[dict]:
+    def call_json(
+        self,
+        system: str,
+        user: str,
+        model: str = "gpt-4o-mini",
+        cache_key: str = None,
+        max_tokens: int = 1000,
+        temperature: float = 0.7,
+        request_timeout: float = 20.0,
+        retries: int = 3,
+    ) -> Optional[dict]:
         """Call OpenAI and parse JSON response. Returns None on failure."""
         if not settings.OPENAI_API_KEY:
             logger.warning("OPENAI_API_KEY not set, skipping AI call")
@@ -60,7 +70,7 @@ class AIClient:
         if not client:
             return None
 
-        for attempt in range(3):
+        for attempt in range(retries):
             try:
                 response = client.chat.completions.create(
                     model=model,
@@ -69,8 +79,9 @@ class AIClient:
                         {"role": "user", "content": user}
                     ],
                     response_format={"type": "json_object"},
-                    temperature=0.7,
-                    max_tokens=1000
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=request_timeout,
                 )
                 content = response.choices[0].message.content
                 result = json.loads(content)
@@ -81,7 +92,7 @@ class AIClient:
                 logger.error(f"AI JSON parse error (attempt {attempt+1}): {e}")
             except Exception as e:
                 logger.error(f"AI API error (attempt {attempt+1}): {e}")
-                if attempt < 2:
+                if attempt < retries - 1:
                     time.sleep(1 * (attempt + 1))
         return None
 

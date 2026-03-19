@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import type { EmailSyncConfig, EmailSyncStatus, EmailSyncResult, ClosureReview, EmailMessage } from '../../types/types';
 import {
@@ -78,6 +78,7 @@ const SyncConfigSection: React.FC = () => {
   const [syncResult, setSyncResult] = useState<EmailSyncResult | null>(null);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  const prevSyncInProgress = useRef(false);
 
   const loadConfig = useCallback(async () => {
     try {
@@ -94,6 +95,12 @@ const SyncConfigSection: React.FC = () => {
     try {
       const res = await getEmailSyncStatus();
       setStatus(res);
+      if (res.last_sync_result) {
+        setSyncResult(res.last_sync_result);
+      }
+      if (res.last_sync_error) {
+        setError(res.last_sync_error);
+      }
     } catch {
       // Status endpoint may not be ready
     }
@@ -103,6 +110,24 @@ const SyncConfigSection: React.FC = () => {
     loadConfig();
     loadStatus();
   }, [loadConfig, loadStatus]);
+
+  useEffect(() => {
+    if (!status?.sync_in_progress) {
+      setSyncing(false);
+      if (prevSyncInProgress.current) {
+        loadStatus();
+      }
+      prevSyncInProgress.current = false;
+      return;
+    }
+
+    prevSyncInProgress.current = true;
+    const interval = window.setInterval(() => {
+      loadStatus();
+    }, 3000);
+
+    return () => window.clearInterval(interval);
+  }, [status?.sync_in_progress, loadStatus]);
 
   const handleSaveConfig = async () => {
     setSaving(true);
@@ -136,18 +161,29 @@ const SyncConfigSection: React.FC = () => {
 
   const handleSyncNow = async () => {
     setSyncing(true);
-    setSyncResult(null);
     setError('');
+    setSuccess('');
     try {
       const res = await triggerEmailSync();
-      setSyncResult(res);
+      if (res.result) {
+        setSyncResult(res.result);
+      } else if (res.synced !== undefined || res.matched !== undefined || res.flagged_for_review !== undefined) {
+        setSyncResult(res);
+      }
+      if (res.message) {
+        setSuccess(res.message);
+      }
       await loadStatus();
     } catch (err: any) {
       setError(getApiErrorMessage(err, 'Sync failed'));
-    } finally {
-      setSyncing(false);
+      } finally {
+      if (!status?.sync_in_progress) {
+        setSyncing(false);
+      }
     }
   };
+
+  const syncInProgress = syncing || status?.sync_in_progress;
 
   const handleToggleSync = async () => {
     const updated = { ...config, sync_enabled: !config.sync_enabled };
@@ -232,11 +268,17 @@ const SyncConfigSection: React.FC = () => {
           <div style={{ fontSize: 13, color: '#555' }}>
             <strong>Pending Reviews:</strong> {status?.pending_reviews ?? 0}
           </div>
+          {(status?.sync_in_progress || status?.sync_message) && (
+            <div style={{ fontSize: 13, color: '#555' }}>
+              <strong>Sync Status:</strong>{' '}
+              {status?.sync_in_progress ? (status.sync_message || 'Syncing...') : 'Idle'}
+            </div>
+          )}
         </div>
 
         <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-          <button onClick={handleSyncNow} disabled={syncing} style={{ ...btnPrimary, opacity: syncing ? 0.6 : 1 }}>
-            {syncing ? 'Syncing...' : 'Sync Now'}
+          <button onClick={handleSyncNow} disabled={syncInProgress} style={{ ...btnPrimary, opacity: syncInProgress ? 0.6 : 1 }}>
+            {syncInProgress ? 'Syncing...' : 'Sync Now'}
           </button>
           <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' }}>
             <input
@@ -253,7 +295,13 @@ const SyncConfigSection: React.FC = () => {
 
         {syncResult && (
           <div style={{ marginTop: 12, padding: 12, borderRadius: 6, background: '#f0fdf4', fontSize: 13 }}>
-            <strong>Sync Complete:</strong> {syncResult.synced} emails synced, {syncResult.matched} matched, {syncResult.flagged_for_review} flagged for review
+            <strong>Latest Sync:</strong> {syncResult.synced ?? 0} emails synced, {syncResult.matched ?? 0} matched, {syncResult.flagged_for_review ?? 0} flagged for review
+          </div>
+        )}
+
+        {status?.sync_in_progress && status.current_sync_counts && (
+          <div style={{ marginTop: 12, padding: 12, borderRadius: 6, background: '#eff6ff', fontSize: 13 }}>
+            <strong>In Progress:</strong> {status.current_sync_counts.synced} emails synced, {status.current_sync_counts.matched} matched so far
           </div>
         )}
       </div>

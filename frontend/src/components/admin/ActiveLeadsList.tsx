@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { getActiveLeads, archiveLead } from '../../services/api';
+import { getActiveLeads, archiveLead, getLeadDetail } from '../../services/api';
 import type { ExtendedLead } from '../../types';
 import LeadDetailModal from './LeadDetailModal';
 import LeadEditModal from './LeadEditModal';
@@ -25,6 +25,8 @@ const ActiveLeadsList: React.FC<ActiveLeadsListProps> = ({ onRefresh }) => {
   const [editLead, setEditLead] = useState<ExtendedLead | null>(null);
   const [logLeadId, setLogLeadId] = useState<number | null>(null);
   const [reassignLeadId, setReassignLeadId] = useState<number | null>(null);
+  const [detailLoadingId, setDetailLoadingId] = useState<number | null>(null);
+  const [visibleCount, setVisibleCount] = useState(100);
 
   const fetchLeads = useCallback(async () => {
     setLoading(true);
@@ -44,6 +46,10 @@ const ActiveLeadsList: React.FC<ActiveLeadsListProps> = ({ onRefresh }) => {
     fetchLeads();
   }, [fetchLeads]);
 
+  useEffect(() => {
+    setVisibleCount(100);
+  }, [leads]);
+
   const handleArchive = async (leadId: number) => {
     if (!window.confirm('Archive this lead?')) return;
     try {
@@ -51,6 +57,23 @@ const ActiveLeadsList: React.FC<ActiveLeadsListProps> = ({ onRefresh }) => {
       setLeads((prev) => prev.filter((l) => l.id !== leadId));
     } catch (err: any) {
       alert(getApiErrorMessage(err, 'Failed to archive lead.'));
+    }
+  };
+
+  const loadLeadDetail = async (leadId: number, mode: 'view' | 'edit') => {
+    setDetailLoadingId(leadId);
+    setError(null);
+    try {
+      const lead = await getLeadDetail(leadId);
+      if (mode === 'view') {
+        setViewLead(lead as ExtendedLead);
+      } else {
+        setEditLead(lead as ExtendedLead);
+      }
+    } catch (err: any) {
+      setError(getApiErrorMessage(err, 'Failed to load lead details.'));
+    } finally {
+      setDetailLoadingId(null);
     }
   };
 
@@ -109,7 +132,7 @@ const ActiveLeadsList: React.FC<ActiveLeadsListProps> = ({ onRefresh }) => {
         </div>
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 12 }}>
-          {leads.map((lead) => (
+          {leads.slice(0, visibleCount).map((lead) => (
             <div
               key={lead.id}
               style={{
@@ -163,16 +186,18 @@ const ActiveLeadsList: React.FC<ActiveLeadsListProps> = ({ onRefresh }) => {
 
               <div style={{ display: 'flex', gap: 6, marginTop: 12, flexWrap: 'wrap' }}>
                 <button
-                  onClick={() => setViewLead(lead)}
+                  onClick={() => loadLeadDetail(lead.id, 'view')}
                   style={{ ...btnBase, background: '#3498db', color: 'white' }}
+                  disabled={detailLoadingId === lead.id}
                 >
-                  View
+                  {detailLoadingId === lead.id ? 'Loading...' : 'View'}
                 </button>
                 <button
-                  onClick={() => setEditLead(lead)}
+                  onClick={() => loadLeadDetail(lead.id, 'edit')}
                   style={{ ...btnBase, background: '#f0f0f0', color: '#333' }}
+                  disabled={detailLoadingId === lead.id}
                 >
-                  Edit
+                  {detailLoadingId === lead.id ? 'Loading...' : 'Edit'}
                 </button>
                 <button
                   onClick={() => setLogLeadId(lead.id)}
@@ -195,6 +220,17 @@ const ActiveLeadsList: React.FC<ActiveLeadsListProps> = ({ onRefresh }) => {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {leads.length > visibleCount && (
+        <div style={{ display: 'flex', justifyContent: 'center', marginTop: 16 }}>
+          <button
+            onClick={() => setVisibleCount((count) => count + 100)}
+            style={{ ...btnBase, background: 'white', color: '#333', border: '1px solid #ddd' }}
+          >
+            Show 100 More
+          </button>
         </div>
       )}
 

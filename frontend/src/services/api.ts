@@ -43,7 +43,7 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
-  timeout: 10000, // 10 second timeout
+  timeout: 30000,
 });
 
 // Add token to requests if available
@@ -186,12 +186,12 @@ export const getHistoricalData = async (
 // ============================================
 
 export const getUnassignedLeads = async (): Promise<{ leads: ExtendedLead[]; count: number }> => {
-  const response = await api.get('/admin/unassigned-leads');
+  const response = await api.get('/admin/unassigned-leads', { timeout: 60000 });
   return response.data;
 };
 
 export const getActiveLeads = async (): Promise<{ leads: ExtendedLead[]; count: number }> => {
-  const response = await api.get('/admin/active-leads');
+  const response = await api.get('/admin/active-leads', { timeout: 60000 });
   return response.data;
 };
 
@@ -417,7 +417,7 @@ export const predictConversionAI = async (leadId: number): Promise<AIConversionP
 };
 
 export const getAIInsights = async (): Promise<{ insights: AIInsight[] }> => {
-  const response = await api.get('/ai/insights');
+  const response = await api.get('/ai/insights', { timeout: 60000 });
   return response.data;
 };
 

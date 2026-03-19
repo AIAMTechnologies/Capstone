@@ -381,12 +381,31 @@ export interface EmailSyncStatus {
   total_emails: number;
   matched_emails: number;
   pending_reviews: number;
+  sync_in_progress?: boolean;
+  sync_started_at?: string | null;
+  sync_finished_at?: string | null;
+  sync_message?: string | null;
+  last_sync_error?: string | null;
+  last_sync_result?: EmailSyncResult | null;
+  current_sync_counts?: {
+    synced: number;
+    matched: number;
+    flagged_for_review: number;
+  } | null;
 }
 
 export interface EmailSyncResult {
-  synced: number;
-  matched: number;
-  flagged_for_review: number;
+  synced?: number;
+  matched?: number;
+  flagged_for_review?: number;
+  started?: boolean;
+  sync_in_progress?: boolean;
+  message?: string;
+  result?: {
+    synced: number;
+    matched: number;
+    flagged_for_review: number;
+  } | null;
 }
 
 // ============================================

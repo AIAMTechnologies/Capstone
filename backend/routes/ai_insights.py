@@ -44,7 +44,11 @@ async def get_insights(current_user: AdminUser = Depends(get_current_user)):
     result = ai_client.call_json(
         system="You are a business intelligence AI for Window Film Canada. Generate 2-4 actionable insights based on the data. Return JSON: {\"insights\": [{\"type\": \"warning|trend|alert\", \"title\": \"short title\", \"body\": \"1-2 sentence insight\", \"action\": \"suggested action text\"}]}",
         user=f"Current data summary:\n{summary}",
-        cache_key=f"insights_{aging_count}_{len(province_stats or [])}"
+        cache_key=f"insights_{aging_count}_{len(province_stats or [])}",
+        max_tokens=250,
+        temperature=0.2,
+        request_timeout=6.0,
+        retries=1,
     )
 
     if result and 'insights' in result:

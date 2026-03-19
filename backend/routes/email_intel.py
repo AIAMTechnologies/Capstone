@@ -3,8 +3,11 @@ import os
 import logging
 import hashlib
 import html
+import threading
+import asyncio
 from datetime import datetime, timedelta
 from math import sqrt
+from copy import deepcopy
 from typing import Optional, List, Tuple
 from urllib.parse import urlencode
 
@@ -109,6 +112,41 @@ def audit_log(action: str, details: str = "", user: str = ""):
 # ---------------------------------------------------------------------------
 
 _last_sync_time = None
+_sync_state_lock = threading.Lock()
+_sync_state = {
+    "is_running": False,
+    "started_at": None,
+    "finished_at": None,
+    "current_phase": None,
+    "last_error": None,
+    "last_result": None,
+    "synced": 0,
+    "matched": 0,
+    "flagged_for_review": 0,
+}
+
+
+def _serialize_datetime(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _snapshot_sync_state() -> dict:
+    with _sync_state_lock:
+        state = deepcopy(_sync_state)
+    for key in ("started_at", "finished_at"):
+        state[key] = _serialize_datetime(state.get(key))
+    return state
+
+
+def _update_sync_state(**kwargs) -> dict:
+    with _sync_state_lock:
+        _sync_state.update(kwargs)
+        state = deepcopy(_sync_state)
+    for key in ("started_at", "finished_at"):
+        state[key] = _serialize_datetime(state.get(key))
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -997,51 +1035,121 @@ async def emergency_disconnect(current_user: AdminUser = Depends(get_current_use
 
 @router.post("/sync")
 async def sync_emails(current_user: AdminUser = Depends(get_current_user)):
-    """Manually trigger an email sync from MS Graph."""
+    """Trigger an email sync from MS Graph in the background."""
     global _last_sync_time
+    current_state = _snapshot_sync_state()
+    if current_state["is_running"]:
+        return {
+            "started": False,
+            "sync_in_progress": True,
+            "message": "Email sync is already running.",
+            "result": current_state.get("last_result"),
+        }
+
     now = datetime.utcnow()
     if _last_sync_time and (now - _last_sync_time).total_seconds() < 300:
         raise HTTPException(status_code=429, detail="Sync rate limited. Wait 5 minutes between syncs.")
-    _last_sync_time = now
 
     config = _get_sync_config_decrypted()
     if not config or not config.get("access_token"):
         raise HTTPException(status_code=400, detail="OAuth not configured or not authorised.")
 
-    token = _refresh_access_token(config)
-
-    synced = 0
-    matched = 0
-
-    # --- Fetch inbound messages (with pagination) ---
-    url = (
-        f"{GRAPH_BASE}/me/messages?"
-        "$top=50&$orderby=receivedDateTime desc"
-        "&$select=id,subject,from,toRecipients,bodyPreview,body,receivedDateTime,isRead"
+    _last_sync_time = now
+    _update_sync_state(
+        is_running=True,
+        started_at=now,
+        finished_at=None,
+        current_phase="Starting sync",
+        last_error=None,
+        last_result=None,
+        synced=0,
+        matched=0,
+        flagged_for_review=0,
     )
-    synced_inbound, matched_inbound = await _sync_messages(token, url, direction="inbound")
-    synced += synced_inbound
-    matched += matched_inbound
 
-    # --- Fetch outbound (Sent Items) ---
-    url_sent = (
-        f"{GRAPH_BASE}/me/mailFolders/SentItems/messages?"
-        "$top=50&$orderby=receivedDateTime desc"
-        "&$select=id,subject,from,toRecipients,bodyPreview,body,receivedDateTime,isRead"
-    )
-    synced_outbound, matched_outbound = await _sync_messages(token, url_sent, direction="outbound")
-    synced += synced_outbound
-    matched += matched_outbound
+    def _run_sync_in_background(started_by: str):
+        asyncio.run(_perform_sync_job(started_by))
 
-    # Update last_sync_at
-    _upsert_sync_config(last_sync_at=datetime.utcnow())
+    threading.Thread(
+        target=_run_sync_in_background,
+        args=(current_user.username,),
+        daemon=True,
+    ).start()
 
-    # Check closure candidates
-    flagged = await check_closure_candidates()
+    audit_log("EMAIL_SYNC_STARTED", "Email sync started in background", current_user.username)
 
-    audit_log("EMAIL_SYNC", f"Synced {synced} emails, matched {matched}, flagged {flagged}", current_user.username)
+    return {
+        "started": True,
+        "sync_in_progress": True,
+        "message": "Email sync started in background.",
+    }
 
-    return {"synced": synced, "matched": matched, "flagged_for_review": flagged}
+
+async def _perform_sync_job(started_by: str):
+    try:
+        config = _get_sync_config_decrypted()
+        if not config or not config.get("access_token"):
+            raise RuntimeError("OAuth not configured or not authorised.")
+
+        _update_sync_state(current_phase="Refreshing access token")
+        token = _refresh_access_token(config)
+
+        synced = 0
+        matched = 0
+
+        _update_sync_state(current_phase="Syncing inbox")
+        url = (
+            f"{GRAPH_BASE}/me/messages?"
+            "$top=50&$orderby=receivedDateTime desc"
+            "&$select=id,subject,from,toRecipients,bodyPreview,body,receivedDateTime,isRead"
+        )
+        synced_inbound, matched_inbound = await _sync_messages(token, url, direction="inbound")
+        synced += synced_inbound
+        matched += matched_inbound
+        _update_sync_state(synced=synced, matched=matched)
+
+        _update_sync_state(current_phase="Syncing sent mail")
+        url_sent = (
+            f"{GRAPH_BASE}/me/mailFolders/SentItems/messages?"
+            "$top=50&$orderby=receivedDateTime desc"
+            "&$select=id,subject,from,toRecipients,bodyPreview,body,receivedDateTime,isRead"
+        )
+        synced_outbound, matched_outbound = await _sync_messages(token, url_sent, direction="outbound")
+        synced += synced_outbound
+        matched += matched_outbound
+        _update_sync_state(synced=synced, matched=matched)
+
+        _upsert_sync_config(last_sync_at=datetime.utcnow())
+
+        _update_sync_state(current_phase="Evaluating closure candidates")
+        flagged = await check_closure_candidates()
+
+        result = {
+            "synced": synced,
+            "matched": matched,
+            "flagged_for_review": flagged,
+        }
+
+        _update_sync_state(
+            is_running=False,
+            finished_at=datetime.utcnow(),
+            current_phase="Completed",
+            last_error=None,
+            last_result=result,
+            synced=synced,
+            matched=matched,
+            flagged_for_review=flagged,
+        )
+        audit_log("EMAIL_SYNC", f"Synced {synced} emails, matched {matched}, flagged {flagged}", started_by)
+    except Exception as exc:
+        logger.exception("Email sync job failed")
+        _update_sync_state(
+            is_running=False,
+            finished_at=datetime.utcnow(),
+            current_phase="Failed",
+            last_error=str(exc),
+        )
+        audit_log("EMAIL_SYNC_FAILED", str(exc), started_by)
 
 
 async def _sync_messages(token: str, url: str, direction: str = "inbound"):
@@ -1135,6 +1243,7 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
                 fetch=False,
             )
             synced += 1
+            _update_sync_state(synced=synced, matched=matched, current_phase=f"Processing {direction} email #{synced}")
 
             # Update lead email intel columns
             if lead_id:
@@ -1156,6 +1265,7 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
 async def get_sync_status(current_user: AdminUser = Depends(get_current_user)):
     """Return sync status overview."""
     config = _get_sync_config()
+    sync_state = _snapshot_sync_state()
 
     total_rows = execute_query("SELECT COUNT(*) AS cnt FROM email_messages")
     total = total_rows[0]["cnt"] if total_rows else 0
@@ -1176,6 +1286,17 @@ async def get_sync_status(current_user: AdminUser = Depends(get_current_user)):
         "total_emails": total,
         "matched_emails": matched,
         "pending_reviews": pending,
+        "sync_in_progress": sync_state.get("is_running", False),
+        "sync_started_at": sync_state.get("started_at"),
+        "sync_finished_at": sync_state.get("finished_at"),
+        "sync_message": sync_state.get("current_phase"),
+        "last_sync_error": sync_state.get("last_error"),
+        "last_sync_result": sync_state.get("last_result"),
+        "current_sync_counts": {
+            "synced": sync_state.get("synced", 0),
+            "matched": sync_state.get("matched", 0),
+            "flagged_for_review": sync_state.get("flagged_for_review", 0),
+        },
     }
 
 

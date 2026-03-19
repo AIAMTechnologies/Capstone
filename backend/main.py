@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, status, Query, Header
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, EmailStr, Field, validator
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -85,6 +86,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ============================================
 # REGISTER API ROUTE MODULES
