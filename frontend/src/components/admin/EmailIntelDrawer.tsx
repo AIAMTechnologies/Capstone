@@ -11,6 +11,15 @@ interface EmailIntelDrawerProps {
 
 const fmtDate = (d?: string | null) => d ? new Date(d).toLocaleString('en-CA') : '-';
 
+const getErrorMsg = (err: any, fallback: string): string => {
+  const detail = err?.response?.data?.detail;
+  if (!detail) return err?.message || fallback;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) return detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ');
+  if (typeof detail === 'object') return detail.msg || JSON.stringify(detail);
+  return fallback;
+};
+
 const EmailIntelDrawer: React.FC<EmailIntelDrawerProps> = ({ leadId, leadName, isOpen, onClose }) => {
   const [context, setContext] = useState<EmailLeadContext | null>(null);
   const [emails, setEmails] = useState<EmailMessage[]>([]);
@@ -32,7 +41,7 @@ const EmailIntelDrawer: React.FC<EmailIntelDrawerProps> = ({ leadId, leadName, i
       const res = await getLeadEmailContext(leadId);
       setContext(res);
     } catch (err: any) {
-      setContextError(err.response?.data?.detail || 'Failed to load AI context');
+      setContextError(getErrorMsg(err, 'Failed to load AI context'));
     } finally {
       setLoadingContext(false);
     }
@@ -41,7 +50,7 @@ const EmailIntelDrawer: React.FC<EmailIntelDrawerProps> = ({ leadId, leadName, i
       const res = await getLeadEmails(leadId);
       setEmails(res);
     } catch (err: any) {
-      setEmailsError(err.response?.data?.detail || 'Failed to load emails');
+      setEmailsError(getErrorMsg(err, 'Failed to load emails'));
     } finally {
       setLoadingEmails(false);
     }
@@ -217,8 +226,13 @@ const EmailIntelDrawer: React.FC<EmailIntelDrawerProps> = ({ leadId, leadName, i
                           <div style={{ fontSize: 11, color: '#999', marginBottom: 2 }}>{fmtDate(item.date)}</div>
                           <div style={{ fontSize: 13, color: '#333' }}>
                             {timelineSentimentDot(item.sentiment)}
-                            {item.event}
+                            {[item.direction, item.subject].filter(Boolean).join(' - ') || item.summary || 'Email activity'}
                           </div>
+                          {item.summary && (
+                            <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>
+                              {item.summary}
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -287,7 +301,7 @@ const EmailIntelDrawer: React.FC<EmailIntelDrawerProps> = ({ leadId, leadName, i
                     marginTop: 4,
                   }}
                 >
-                  {expandedEmail === email.id ? 'Hide Full Email' : 'Show Full Email'}
+                  {expandedEmail === email.id ? 'Hide Email Preview' : 'Show Email Preview'}
                 </button>
 
                 {expandedEmail === email.id && (

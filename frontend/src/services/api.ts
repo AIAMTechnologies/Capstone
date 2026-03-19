@@ -455,7 +455,7 @@ export const submitDealerWinLost = async (data: { lead_id: number; status: strin
 // ============================================
 
 export const getEmailSyncConfig = async (): Promise<EmailSyncConfig | null> => {
-  const response = await api.get('/email-intel/config');
+  const response = await api.get('/email-intel/config', { timeout: 30000 });
   return response.data;
 };
 
@@ -475,27 +475,27 @@ export const completeOAuthCallback = async (code: string): Promise<{ success: bo
 };
 
 export const triggerEmailSync = async (): Promise<EmailSyncResult> => {
-  const response = await api.post('/email-intel/sync');
+  const response = await api.post('/email-intel/sync', {}, { timeout: 120000 });
   return response.data;
 };
 
 export const getEmailSyncStatus = async (): Promise<EmailSyncStatus> => {
-  const response = await api.get('/email-intel/status');
+  const response = await api.get('/email-intel/status', { timeout: 30000 });
   return response.data;
 };
 
 export const getLeadEmails = async (leadId: number): Promise<EmailMessage[]> => {
-  const response = await api.get(`/email-intel/lead/${leadId}/emails`);
+  const response = await api.get(`/email-intel/lead/${leadId}/emails`, { timeout: 30000 });
   return response.data;
 };
 
 export const getLeadEmailContext = async (leadId: number): Promise<EmailLeadContext> => {
-  const response = await api.get(`/email-intel/lead/${leadId}/context`);
+  const response = await api.get(`/email-intel/lead/${leadId}/context`, { timeout: 30000 });
   return response.data;
 };
 
 export const getClosureReviewQueue = async (): Promise<ClosureReview[]> => {
-  const response = await api.get('/email-intel/review-queue');
+  const response = await api.get('/email-intel/review-queue', { timeout: 30000 });
   return response.data;
 };
 

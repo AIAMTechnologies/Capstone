@@ -1,8 +1,12 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import AIInsightsPanel from '../../components/admin/AIInsightsPanel';
 import InsertLeadForm from '../../components/admin/InsertLeadForm';
 import UnassignedLeadsList from '../../components/admin/UnassignedLeadsList';
 import ActiveLeadsList from '../../components/admin/ActiveLeadsList';
+import LeadDetailModal from '../../components/admin/LeadDetailModal';
+import { getLeadDetail } from '../../services/api';
+import type { ExtendedLead } from '../../types';
 
 const bannerStyle: React.CSSProperties = {
   background: '#c91414',
@@ -27,9 +31,11 @@ const sectionStyle: React.CSSProperties = {
 };
 
 const Dashboard: React.FC = () => {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [insertOpen, setInsertOpen] = useState(true);
   const [unassignedOpen, setUnassignedOpen] = useState(true);
   const [activeOpen, setActiveOpen] = useState(true);
+  const [linkedLead, setLinkedLead] = useState<ExtendedLead | null>(null);
 
   // Keys to force remount / refresh child components
   const [unassignedKey, setUnassignedKey] = useState(0);
@@ -47,6 +53,41 @@ const Dashboard: React.FC = () => {
     refreshUnassigned();
     refreshActive();
   }, [refreshUnassigned, refreshActive]);
+
+  useEffect(() => {
+    const leadId = Number(searchParams.get('lead'));
+    if (!leadId) {
+      setLinkedLead(null);
+      return;
+    }
+
+    let cancelled = false;
+    const loadLead = async () => {
+      try {
+        const lead = await getLeadDetail(leadId);
+        if (!cancelled) {
+          setLinkedLead(lead as ExtendedLead);
+        }
+      } catch {
+        if (!cancelled) {
+          setLinkedLead(null);
+        }
+      }
+    };
+
+    loadLead();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [searchParams]);
+
+  const closeLinkedLead = useCallback(() => {
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete('lead');
+    setSearchParams(nextParams, { replace: true });
+    setLinkedLead(null);
+  }, [searchParams, setSearchParams]);
 
   return (
     <div style={{ maxWidth: 1200, margin: '0 auto', padding: '40px 20px' }}>
@@ -106,6 +147,12 @@ const Dashboard: React.FC = () => {
           />
         )}
       </div>
+
+      <LeadDetailModal
+        lead={linkedLead}
+        isOpen={linkedLead !== null}
+        onClose={closeLinkedLead}
+      />
     </div>
   );
 };

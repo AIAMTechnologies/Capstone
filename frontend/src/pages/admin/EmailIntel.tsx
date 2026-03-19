@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import type { EmailSyncConfig, EmailSyncStatus, EmailSyncResult, ClosureReview, EmailMessage } from '../../types/types';
 import {
   getEmailSyncConfig,
@@ -23,10 +24,46 @@ const labelStyle: React.CSSProperties = { display: 'block', fontSize: 13, fontWe
 
 const fmtDate = (d?: string | null) => d ? new Date(d).toLocaleString('en-CA') : '-';
 
+// Safely extract error message string from axios errors (FastAPI validation errors are objects/arrays)
+const getErrorMsg = (err: any, fallback: string): string => {
+  const detail = err?.response?.data?.detail;
+  if (!detail) return err?.message || fallback;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) return detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ');
+  if (typeof detail === 'object') return detail.msg || JSON.stringify(detail);
+  return fallback;
+};
+
 const EmailIntel: React.FC = () => {
+  const [oauthMsg, setOauthMsg] = useState('');
+
+  useEffect(() => {
+    // Handle OAuth redirect query params
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('oauth_success') === 'true') {
+      const email = params.get('email') || '';
+      setOauthMsg(`Connected successfully to ${email}`);
+      // Clean URL
+      window.history.replaceState({}, '', window.location.pathname);
+    } else if (params.get('oauth_error')) {
+      setOauthMsg(`OAuth error: ${params.get('oauth_error')}`);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, []);
+
   return (
     <div style={{ padding: 24 }}>
       <h1 style={{ fontSize: 24, fontWeight: 700, color: '#1a1a2e', marginBottom: 20 }}>Email Intelligence</h1>
+      {oauthMsg && (
+        <div style={{
+          padding: '12px 16px', borderRadius: 6, marginBottom: 16,
+          background: oauthMsg.includes('error') ? '#fef2f2' : '#f0fdf4',
+          color: oauthMsg.includes('error') ? '#c91414' : '#166534',
+          fontWeight: 600, fontSize: 14,
+        }}>
+          {oauthMsg}
+        </div>
+      )}
       <SyncConfigSection />
       <ReviewQueueSection />
       <RecentEmailsSection />
@@ -89,7 +126,7 @@ const SyncConfigSection: React.FC = () => {
       setSuccess('Configuration saved');
       setClientSecret('');
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to save configuration');
+      setError(getErrorMsg(err, 'Failed to save configuration'));
     } finally {
       setSaving(false);
     }
@@ -99,9 +136,10 @@ const SyncConfigSection: React.FC = () => {
     setError('');
     try {
       const res = await getOAuthAuthorizeUrl();
-      window.open(res.auth_url, '_blank', 'width=600,height=700');
+      // Redirect in same window — Microsoft OAuth works best this way
+      window.location.href = res.auth_url;
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to get authorization URL');
+      setError(getErrorMsg(err, 'Failed to get authorization URL'));
     }
   };
 
@@ -114,7 +152,7 @@ const SyncConfigSection: React.FC = () => {
       setSyncResult(res);
       await loadStatus();
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Sync failed');
+      setError(getErrorMsg(err, 'Sync failed'));
     } finally {
       setSyncing(false);
     }
@@ -127,7 +165,7 @@ const SyncConfigSection: React.FC = () => {
       await saveEmailSyncConfig({ sync_enabled: updated.sync_enabled });
     } catch (err: any) {
       setConfig(prev => ({ ...prev, sync_enabled: !updated.sync_enabled }));
-      setError(err.response?.data?.detail || 'Failed to toggle sync');
+      setError(getErrorMsg(err, 'Failed to toggle sync'));
     }
   };
 
@@ -246,7 +284,8 @@ const ReviewQueueSection: React.FC = () => {
       const res = await getClosureReviewQueue();
       setReviews(res);
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load review queue');
+      console.error('Review queue error:', err);
+      setError(getErrorMsg(err, 'Failed to load review queue'));
     } finally {
       setLoading(false);
     }
@@ -260,7 +299,7 @@ const ReviewQueueSection: React.FC = () => {
       await approveClosureReview(id);
       setReviews(prev => prev.filter(r => r.id !== id));
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to approve');
+      setError(getErrorMsg(err, 'Failed to approve'));
     } finally {
       setActionLoading(null);
     }
@@ -272,7 +311,7 @@ const ReviewQueueSection: React.FC = () => {
       await dismissClosureReview(id);
       setReviews(prev => prev.filter(r => r.id !== id));
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to dismiss');
+      setError(getErrorMsg(err, 'Failed to dismiss'));
     } finally {
       setActionLoading(null);
     }
@@ -355,7 +394,7 @@ const RecentEmailsSection: React.FC = () => {
       const res = await getLeadEmails(0);
       setEmails(res);
     } catch (err: any) {
-      // Endpoint may not exist yet; show empty state
+      setError(getErrorMsg(err, 'Failed to load recent emails'));
       setEmails([]);
     } finally {
       setLoading(false);
@@ -432,7 +471,19 @@ const RecentEmailsSection: React.FC = () => {
                 </td>
                 <td style={tdStyle}>{fmtDate(e.received_at)}</td>
                 <td style={tdStyle}>{matchBadge(e)}</td>
-                <td style={tdStyle}>{e.matched_lead_id ? `Lead #${e.matched_lead_id}` : '-'}</td>
+                <td style={tdStyle}>
+                  {e.matched_lead_id ? (
+                    <Link
+                      to={`/admin/dashboard?lead=${e.matched_lead_id}`}
+                      style={{ color: '#c91414', textDecoration: 'none', fontWeight: 600 }}
+                      title={`View lead #${e.matched_lead_id}`}
+                    >
+                      {e.lead_first_name || e.lead_last_name
+                        ? `${e.lead_first_name || ''} ${e.lead_last_name || ''}`.trim()
+                        : `Lead #${e.matched_lead_id}`}
+                    </Link>
+                  ) : '-'}
+                </td>
                 <td style={tdStyle}>{sentimentBadge(e.ai_sentiment)}</td>
               </tr>
             ))}

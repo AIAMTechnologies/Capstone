@@ -7,7 +7,12 @@ from db import settings
 logger = logging.getLogger("lead_allocation")
 
 class AIClient:
-    """OpenAI API wrapper with caching and error handling."""
+    """OpenAI API wrapper with caching and error handling.
+
+    Uses model: gpt-4o-mini (default).
+    Used by: ai_leads.py, ai_insights.py routes.
+    Email intelligence handles its own model routing in email_intel.py.
+    """
 
     def __init__(self):
         self._cache: Dict[str, tuple] = {}  # key -> (result, timestamp)

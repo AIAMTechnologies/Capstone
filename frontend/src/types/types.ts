@@ -314,7 +314,9 @@ export interface AIChurnRisk {
 // ============================================
 
 export interface EmailSyncConfig {
-  id: number;
+  id?: number;
+  configured?: boolean;
+  is_connected?: boolean;
   ms_tenant_id: string;
   ms_client_id: string;
   ms_redirect_uri: string;
@@ -331,7 +333,7 @@ export interface EmailMessage {
   sender_email: string;
   sender_name: string;
   body_preview: string;
-  body_text: string;
+  body_text?: string;
   received_at: string;
   direction: 'inbound' | 'outbound';
   matched_lead_id: number | null;
@@ -341,6 +343,9 @@ export interface EmailMessage {
   ai_sentiment: 'positive' | 'neutral' | 'negative' | null;
   ai_action_items: string[] | null;
   ai_ready_to_close: boolean;
+  lead_first_name?: string | null;
+  lead_last_name?: string | null;
+  lead_status?: string | null;
 }
 
 export interface ClosureReview {
@@ -359,7 +364,13 @@ export interface ClosureReview {
 
 export interface EmailLeadContext {
   context: string;
-  timeline: Array<{ date: string; event: string; sentiment: string }>;
+  timeline: Array<{
+    date: string;
+    direction?: string;
+    subject?: string;
+    summary?: string;
+    sentiment: string;
+  }>;
   key_insights: string[];
   recommended_action: string;
 }

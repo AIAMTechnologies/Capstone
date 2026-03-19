@@ -1,11 +1,15 @@
 import json
 import os
 import logging
+import hashlib
+import html
 from datetime import datetime, timedelta
-from typing import Optional, List
+from math import sqrt
+from typing import Optional, List, Tuple
 from urllib.parse import urlencode
 
 import requests as http_requests
+from cryptography.fernet import Fernet
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -18,7 +22,93 @@ router = APIRouter(prefix="/api/email-intel", tags=["Email Intelligence"])
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 MS_LOGIN_BASE = "https://login.microsoftonline.com"
-OAUTH_SCOPES = "Mail.Read Mail.ReadWrite offline_access User.Read"
+OAUTH_SCOPES = "Mail.Read offline_access User.Read"
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ENCRYPTION_KEY = os.getenv("EMAIL_ENCRYPTION_KEY")
+OPENAI_EMAIL_MODEL_CANDIDATES = [
+    model.strip()
+    for model in os.getenv("OPENAI_EMAIL_MODELS", "gpt-5-nano,gpt-4o-mini").split(",")
+    if model.strip()
+]
+OPENAI_REASONING_MODEL_CANDIDATES = [
+    model.strip()
+    for model in os.getenv("OPENAI_REASONING_MODELS", "gpt-5-mini,gpt-4o-mini").split(",")
+    if model.strip()
+]
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+ANTHROPIC_REASONING_MODEL = os.getenv("ANTHROPIC_REASONING_MODEL", "claude-sonnet-4-20250514")
+
+# Env-based MS config (auto-seeds DB on first access)
+MS_TENANT_ID = os.getenv("MS_TENANT_ID", "")
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
+MS_REDIRECT_URI = os.getenv("MS_REDIRECT_URI", "http://localhost:8000/api/email-intel/oauth/callback-redirect")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+MAX_EMAIL_BODY_CHARS = _env_int("EMAIL_INTEL_MAX_BODY_CHARS", 1200)
+EMBEDDING_CANDIDATE_LIMIT = _env_int("EMAIL_INTEL_EMBEDDING_CANDIDATE_LIMIT", 8)
+EMBEDDING_SCORE_THRESHOLD = _env_float("EMAIL_INTEL_EMBEDDING_SCORE_THRESHOLD", 0.45)
+EMBEDDING_GAP_THRESHOLD = _env_float("EMAIL_INTEL_EMBEDDING_GAP_THRESHOLD", 0.03)
+
+
+# ---------------------------------------------------------------------------
+# Token Encryption Helpers
+# ---------------------------------------------------------------------------
+
+def get_fernet():
+    if not ENCRYPTION_KEY:
+        raise HTTPException(status_code=500, detail="Email encryption key not configured")
+    return Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
+
+
+def encrypt_value(value: str) -> str:
+    if not value:
+        return value
+    return get_fernet().encrypt(value.encode()).decode()
+
+
+def decrypt_value(encrypted: str) -> str:
+    if not encrypted:
+        return encrypted
+    return get_fernet().decrypt(encrypted.encode()).decode()
+
+
+# ---------------------------------------------------------------------------
+# Audit Logging
+# ---------------------------------------------------------------------------
+
+def audit_log(action: str, details: str = "", user: str = ""):
+    """Log every email-related action to DB for security audit trail."""
+    try:
+        execute_query(
+            "INSERT INTO email_audit_log (action, details, performed_by, performed_at) VALUES (%s, %s, %s, CURRENT_TIMESTAMP)",
+            (action, details, user), fetch=False
+        )
+    except Exception as exc:
+        logger.warning("Email audit log write failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiting
+# ---------------------------------------------------------------------------
+
+_last_sync_time = None
 
 
 # ---------------------------------------------------------------------------
@@ -26,10 +116,12 @@ OAUTH_SCOPES = "Mail.Read Mail.ReadWrite offline_access User.Read"
 # ---------------------------------------------------------------------------
 
 class OAuthConfigIn(BaseModel):
-    ms_tenant_id: str
-    ms_client_id: str
-    ms_client_secret: str
-    ms_redirect_uri: str
+    ms_tenant_id: Optional[str] = None
+    ms_client_id: Optional[str] = None
+    ms_client_secret: Optional[str] = None
+    ms_redirect_uri: Optional[str] = None
+    sync_enabled: Optional[bool] = None
+    sync_interval_minutes: Optional[int] = None
 
 
 class OAuthCallbackIn(BaseModel):
@@ -37,16 +129,49 @@ class OAuthCallbackIn(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Helpers – DB convenience wrappers
+# Helpers -- DB convenience wrappers
 # ---------------------------------------------------------------------------
 
 def _get_sync_config() -> Optional[dict]:
     rows = execute_query("SELECT * FROM email_sync_config ORDER BY id DESC LIMIT 1")
-    return rows[0] if rows else None
+    if rows:
+        return rows[0]
+    # Auto-seed from env vars if DB is empty
+    if MS_TENANT_ID and MS_CLIENT_ID and MS_CLIENT_SECRET:
+        encrypted_secret = encrypt_value(MS_CLIENT_SECRET)
+        execute_query(
+            "INSERT INTO email_sync_config (ms_tenant_id, ms_client_id, ms_client_secret, ms_redirect_uri) VALUES (%s, %s, %s, %s)",
+            (MS_TENANT_ID, MS_CLIENT_ID, encrypted_secret, MS_REDIRECT_URI),
+            fetch=False,
+        )
+        rows = execute_query("SELECT * FROM email_sync_config ORDER BY id DESC LIMIT 1")
+        return rows[0] if rows else None
+    return None
+
+
+def _get_sync_config_decrypted() -> Optional[dict]:
+    """Get sync config with sensitive fields decrypted."""
+    config = _get_sync_config()
+    if not config:
+        return None
+    for field in ("access_token", "refresh_token", "ms_client_secret"):
+        if config.get(field):
+            try:
+                config[field] = decrypt_value(config[field])
+            except Exception as e:
+                # Value may not be encrypted yet (legacy data)
+                print(f"[EMAIL_INTEL] WARNING: Failed to decrypt field '{field}': {e}")
+                pass
+    return config
 
 
 def _upsert_sync_config(**kwargs):
-    """Insert or update the single sync-config row."""
+    """Insert or update the single sync-config row. Encrypts sensitive fields."""
+    # Encrypt sensitive values before storing
+    for field in ("access_token", "refresh_token", "ms_client_secret"):
+        if field in kwargs and kwargs[field]:
+            kwargs[field] = encrypt_value(kwargs[field])
+
     existing = _get_sync_config()
     if existing:
         set_parts = []
@@ -72,194 +197,442 @@ def _upsert_sync_config(**kwargs):
 
 
 # ---------------------------------------------------------------------------
-# AI helpers (Anthropic / Claude)
+# AI helpers — OpenAI gpt-4o-mini for bulk email analysis (cheap),
+#              Anthropic Claude for high-value lead context summaries (rare)
 # ---------------------------------------------------------------------------
 
+import re as _re
+
+_embedding_cache: dict[str, List[float]] = {}
+
+def _extract_json(text: str) -> dict:
+    """Extract JSON from AI response, handling markdown code fences."""
+    text = text.strip()
+    fence_match = _re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', text, _re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        obj_match = _re.search(r'\{.*\}', text, _re.DOTALL)
+        if obj_match:
+            candidate = obj_match.group(0)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+        raise
+
+
+def _get_openai_client():
+    """Get OpenAI client for cheap bulk email analysis."""
+    try:
+        from openai import OpenAI
+        if not OPENAI_API_KEY:
+            logger.warning("OPENAI_API_KEY not set, AI analysis unavailable")
+            return None
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except ImportError:
+        logger.error("openai package not installed")
+        return None
+
+
 def _get_anthropic_client():
+    """Get Anthropic client for high-value reasoning tasks only."""
     try:
         import anthropic
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            logger.warning("ANTHROPIC_API_KEY not set, AI analysis unavailable")
+        if not ANTHROPIC_API_KEY:
             return None
-        return anthropic.Anthropic(api_key=api_key)
+        return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     except ImportError:
-        logger.error("anthropic package not installed")
         return None
+
+
+_DEFAULT_AI_RESULT = {
+    "summary": "",
+    "sentiment": "neutral",
+    "action_items": [],
+    "is_deal_related": False,
+    "deal_stage": "inquiry",
+}
+
+
+def _normalize_email_text(value: str, max_chars: Optional[int] = None) -> str:
+    if not value:
+        return ""
+    normalized = html.unescape(value)
+    normalized = _re.sub(r"<[^>]+>", " ", normalized)
+    normalized = _re.sub(r"\s+", " ", normalized).strip()
+    if max_chars is not None:
+        return normalized[:max_chars]
+    return normalized
+
+
+def _normalize_phone(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+def _name_tokens(value: str) -> List[str]:
+    return [
+        token
+        for token in _re.findall(r"[a-zA-Z]+", (value or "").lower())
+        if len(token) >= 2 and token not in {"re", "fw", "fwd", "mr", "mrs", "ms"}
+    ]
+
+
+def _openai_json_completion(
+    system_prompt: str,
+    user_prompt: str,
+    model_candidates: List[str],
+    max_tokens: int,
+) -> Tuple[Optional[dict], Optional[str]]:
+    client = _get_openai_client()
+    if client is None:
+        return None, None
+
+    for model in model_candidates:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            content = response.choices[0].message.content or "{}"
+            return _extract_json(content), model
+        except Exception as exc:
+            logger.warning("OpenAI JSON call failed for %s: %s", model, exc)
+
+    return None, None
+
+
+def _anthropic_json_completion(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+) -> Tuple[Optional[dict], Optional[str]]:
+    client = _get_anthropic_client()
+    if client is None:
+        return None, None
+
+    try:
+        response = client.messages.create(
+            model=ANTHROPIC_REASONING_MODEL,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return _extract_json(response.content[0].text), ANTHROPIC_REASONING_MODEL
+    except Exception as exc:
+        logger.warning("Anthropic JSON call failed for %s: %s", ANTHROPIC_REASONING_MODEL, exc)
+        return None, None
+
+
+def _reasoning_json_completion(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 300,
+) -> Tuple[Optional[dict], Optional[str]]:
+    result, model = _openai_json_completion(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        model_candidates=OPENAI_REASONING_MODEL_CANDIDATES,
+        max_tokens=max_tokens,
+    )
+    if result is not None:
+        return result, model
+
+    return _anthropic_json_completion(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=max_tokens,
+    )
+
+
+def _get_embedding(text: str, cache_key: Optional[str] = None) -> Optional[List[float]]:
+    if not text.strip():
+        return None
+    if cache_key and cache_key in _embedding_cache:
+        return _embedding_cache[cache_key]
+
+    client = _get_openai_client()
+    if client is None:
+        return None
+
+    try:
+        response = client.embeddings.create(
+            model=OPENAI_EMBEDDING_MODEL,
+            input=text[:4000],
+        )
+        embedding = response.data[0].embedding
+        if cache_key:
+            _embedding_cache[cache_key] = embedding
+        return embedding
+    except Exception as exc:
+        logger.warning("OpenAI embedding call failed for %s: %s", OPENAI_EMBEDDING_MODEL, exc)
+        return None
+
+
+def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    denominator = sqrt(sum(a * a for a in vec_a)) * sqrt(sum(b * b for b in vec_b))
+    if not denominator:
+        return 0.0
+    return sum(a * b for a, b in zip(vec_a, vec_b)) / denominator
 
 
 async def analyze_email_with_ai(
     email_body: str, email_subject: str, lead_data: dict = None
 ) -> dict:
     """
-    Call Claude API (claude-sonnet-4-20250514) to analyse email content.
-
-    Returns dict with keys: summary, sentiment, action_items,
-    is_deal_related, deal_stage.
+    Use the cheapest configured OpenAI model for bulk parsing, with fallback
+    to a known working model if the preferred one is unavailable.
     """
-    client = _get_anthropic_client()
-    if client is None:
-        return {
-            "summary": "",
-            "sentiment": "neutral",
-            "action_items": [],
-            "is_deal_related": False,
-            "deal_stage": "inquiry",
-        }
-
     lead_context = ""
     if lead_data:
         lead_context = (
-            f"\n\nRelated lead context:\n"
-            f"Name: {lead_data.get('first_name', '')} {lead_data.get('last_name', '')}\n"
-            f"Email: {lead_data.get('email', '')}\n"
-            f"Phone: {lead_data.get('phone', '')}\n"
-            f"Status: {lead_data.get('status', '')}\n"
-            f"Province: {lead_data.get('province', '')}\n"
+            f"\nLead: {lead_data.get('first_name', '')} {lead_data.get('last_name', '')} "
+            f"({lead_data.get('email', '')}) Status: {lead_data.get('status', '')}"
         )
 
-    system_prompt = (
-        "You are an expert sales-email analyst. Analyse the email and return "
-        "a JSON object with exactly these keys:\n"
-        '- "summary": a brief 1-2 sentence summary\n'
-        '- "sentiment": one of "positive", "neutral", "negative"\n'
-        '- "action_items": an array of short action-item strings\n'
-        '- "is_deal_related": boolean\n'
-        '- "deal_stage": one of "inquiry", "quoting", "negotiation", "closing", "closed"\n'
-        "Return ONLY valid JSON, no markdown."
+    result, model = _openai_json_completion(
+        system_prompt=(
+            "Analyse the sales email. Return JSON: "
+            '{"summary":"1 sentence","sentiment":"positive|neutral|negative",'
+            '"action_items":["..."],"is_deal_related":true/false,'
+            '"deal_stage":"inquiry|quoting|negotiation|closing|closed"}'
+        ),
+        user_prompt=(
+            f"Subject: {email_subject}\n"
+            f"Body:\n{_normalize_email_text(email_body, MAX_EMAIL_BODY_CHARS)}"
+            f"{lead_context}"
+        ),
+        model_candidates=OPENAI_EMAIL_MODEL_CANDIDATES,
+        max_tokens=200,
     )
+    if result is None:
+        logger.error("AI email analysis failed for all configured OpenAI models")
+        return dict(_DEFAULT_AI_RESULT)
 
-    user_prompt = (
-        f"Subject: {email_subject}\n\n"
-        f"Body:\n{email_body[:3000]}"
-        f"{lead_context}"
-    )
-
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": user_prompt}],
-            system=system_prompt,
-        )
-        content = response.content[0].text
-        return json.loads(content)
-    except json.JSONDecodeError:
-        logger.error("AI returned non-JSON for email analysis")
-        return {
-            "summary": "",
-            "sentiment": "neutral",
-            "action_items": [],
-            "is_deal_related": False,
-            "deal_stage": "inquiry",
-        }
-    except Exception as e:
-        logger.error(f"AI email analysis failed: {e}")
-        return {
-            "summary": "",
-            "sentiment": "neutral",
-            "action_items": [],
-            "is_deal_related": False,
-            "deal_stage": "inquiry",
-        }
+    logger.info("Email analysis completed with model %s", model)
+    return {
+        **dict(_DEFAULT_AI_RESULT),
+        **result,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Lead matching
 # ---------------------------------------------------------------------------
 
+def _build_embedding_candidates(match_emails: List[str], sender_name: str) -> List[dict]:
+    candidates: dict[int, dict] = {}
+    email_domains = {
+        email.split("@", 1)[1]
+        for email in match_emails
+        if "@" in email and "." in email.split("@", 1)[1]
+    }
+
+    for domain in email_domains:
+        rows = execute_query(
+            "SELECT id, first_name, last_name, email, dealer_email, company_name, province, status "
+            "FROM leads "
+            "WHERE status NOT IN ('archived', 'dead') "
+            "AND ("
+            "  (email IS NOT NULL AND POSITION('@' IN email) > 0 AND LOWER(SPLIT_PART(email, '@', 2)) = %s) "
+            "  OR "
+            "  (dealer_email IS NOT NULL AND POSITION('@' IN dealer_email) > 0 AND LOWER(SPLIT_PART(dealer_email, '@', 2)) = %s)"
+            ") "
+            "ORDER BY created_at DESC LIMIT %s",
+            (domain, domain, EMBEDDING_CANDIDATE_LIMIT),
+        )
+        for row in rows or []:
+            candidates[row["id"]] = row
+
+    name_parts = _name_tokens(sender_name)
+    if len(name_parts) >= 2:
+        rows = execute_query(
+            "SELECT id, first_name, last_name, email, dealer_email, company_name, province, status "
+            "FROM leads "
+            "WHERE status NOT IN ('archived', 'dead') "
+            "AND LOWER(first_name) = %s AND LOWER(last_name) = %s "
+            "ORDER BY created_at DESC LIMIT %s",
+            (name_parts[0], name_parts[-1], EMBEDDING_CANDIDATE_LIMIT),
+        )
+        for row in rows or []:
+            candidates[row["id"]] = row
+    elif len(name_parts) == 1:
+        rows = execute_query(
+            "SELECT id, first_name, last_name, email, dealer_email, company_name, province, status "
+            "FROM leads "
+            "WHERE status NOT IN ('archived', 'dead') "
+            "AND (LOWER(first_name) = %s OR LOWER(last_name) = %s) "
+            "ORDER BY created_at DESC LIMIT %s",
+            (name_parts[0], name_parts[0], EMBEDDING_CANDIDATE_LIMIT),
+        )
+        for row in rows or []:
+            candidates[row["id"]] = row
+
+    return list(candidates.values())[:EMBEDDING_CANDIDATE_LIMIT]
+
+
+def _match_with_embeddings(email_record: dict, candidates: List[dict]) -> Tuple[Optional[int], float, Optional[str]]:
+    if len(candidates) < 2:
+        return (None, 0.0, None)
+
+    try:
+        recipients = json.loads(email_record.get("recipient_emails") or "[]")
+    except json.JSONDecodeError:
+        recipients = []
+
+    email_profile = (
+        f"Subject: {email_record.get('subject', '')}\n"
+        f"Sender: {email_record.get('sender_name', '')} <{email_record.get('sender_email', '')}>\n"
+        f"Recipients: {', '.join(recipients)}\n"
+        f"Preview: {email_record.get('body_preview', '')}\n"
+        f"Body: {_normalize_email_text(email_record.get('body_text', ''), MAX_EMAIL_BODY_CHARS)}"
+    )
+    email_embedding = _get_embedding(
+        email_profile,
+        cache_key=f"email:{hashlib.sha1(email_profile.encode('utf-8')).hexdigest()}",
+    )
+    if email_embedding is None:
+        return (None, 0.0, None)
+
+    scores: List[Tuple[float, int]] = []
+    for candidate in candidates:
+        lead_profile = (
+            f"Lead name: {(candidate.get('first_name') or '').strip()} {(candidate.get('last_name') or '').strip()}\n"
+            f"Primary email: {candidate.get('email') or ''}\n"
+            f"Dealer email: {candidate.get('dealer_email') or ''}\n"
+            f"Company: {candidate.get('company_name') or ''}\n"
+            f"Province: {candidate.get('province') or ''}\n"
+            f"Status: {candidate.get('status') or ''}"
+        )
+        lead_embedding = _get_embedding(
+            lead_profile,
+            cache_key=f"lead:{candidate['id']}",
+        )
+        if lead_embedding is None:
+            continue
+        scores.append((_cosine_similarity(email_embedding, lead_embedding), candidate["id"]))
+
+    if not scores:
+        return (None, 0.0, None)
+
+    scores.sort(reverse=True)
+    best_score, best_lead_id = scores[0]
+    second_score = scores[1][0] if len(scores) > 1 else 0.0
+
+    if best_score < EMBEDDING_SCORE_THRESHOLD:
+        return (None, 0.0, None)
+    if len(scores) > 1 and (best_score - second_score) < EMBEDDING_GAP_THRESHOLD:
+        return (None, 0.0, None)
+
+    confidence = min(0.9, max(0.55, round(best_score, 2)))
+    return (best_lead_id, confidence, "embedding")
+
+
 def match_email_to_lead(email_record: dict):
     """
+    Match the OTHER party in the email to a lead.
+    The connected mailbox owner (e.g. cmacleod@windowfilmcanada.ca) is excluded —
+    we want to find which customer/dealer lead this conversation is about.
+
+    For inbound emails: match the SENDER to a lead.
+    For outbound emails: match the RECIPIENT(S) to a lead.
+
     Match priority:
-    1. Exact email address match (sender/recipient email = lead.email or lead.dealer_email)
-    2. Name match (sender_name contains lead.first_name + lead.last_name)
-    3. Phone match (email body contains lead.phone)
-    4. AI match (use Claude to analyse email content against unmatched leads)
+    1. Exact email address match
+    2. Name match (sender name for inbound)
+    3. Phone match (phone number in email body)
 
     Returns: (lead_id, confidence, method) or (None, 0, None)
     """
+    # Get connected mailbox email to exclude from matching
+    config = _get_sync_config()
+    mailbox_email = (config.get("user_email") or "").lower().strip() if config else ""
+    # Also exclude common company domain emails
+    mailbox_domain = mailbox_email.split("@")[-1] if mailbox_email else ""
+
     sender = (email_record.get("sender_email") or "").lower().strip()
     sender_name = (email_record.get("sender_name") or "").lower().strip()
-    body = (email_record.get("body_text") or "") + " " + (email_record.get("body_preview") or "")
+    direction = email_record.get("direction", "inbound")
+    body = _normalize_email_text(
+        f"{email_record.get('body_text') or ''} {email_record.get('body_preview') or ''}"
+    )
     recipient_raw = email_record.get("recipient_emails") or "[]"
     try:
         recipients = json.loads(recipient_raw) if isinstance(recipient_raw, str) else recipient_raw
     except json.JSONDecodeError:
         recipients = []
-    all_emails = [sender] + [r.lower().strip() for r in recipients if r]
+
+    # Determine which emails belong to the "other party" (not the mailbox owner)
+    if direction == "outbound":
+        # Outbound: match recipients (excluding the mailbox owner)
+        match_emails = [r.lower().strip() for r in recipients if r and r.lower().strip() != mailbox_email]
+    else:
+        # Inbound: match sender (if it's not the mailbox owner)
+        if sender and sender != mailbox_email:
+            match_emails = [sender]
+        else:
+            # Sender is mailbox owner somehow — try recipients
+            match_emails = [r.lower().strip() for r in recipients if r and r.lower().strip() != mailbox_email]
+
+    # Filter out same-domain emails (internal company emails aren't leads)
+    if mailbox_domain:
+        external_emails = [e for e in match_emails if not e.endswith(f"@{mailbox_domain}")]
+        # Only use external filter if it leaves us with candidates
+        if external_emails:
+            match_emails = external_emails
 
     # --- 1. Exact email match ---
-    if all_emails:
-        placeholders = ", ".join(["%s"] * len(all_emails))
+    if match_emails:
+        placeholders = ", ".join(["%s"] * len(match_emails))
         rows = execute_query(
-            f"SELECT id FROM leads WHERE LOWER(email) IN ({placeholders}) LIMIT 1",
-            tuple(all_emails),
+            f"SELECT id, first_name, last_name, email FROM leads WHERE LOWER(email) IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
+            tuple(match_emails),
         )
         if rows:
             return (rows[0]["id"], 1.0, "email")
 
-    # --- 2. Name match ---
-    if sender_name:
+        # Also check dealer_email field
+        rows = execute_query(
+            f"SELECT id FROM leads WHERE LOWER(dealer_email) IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
+            tuple(match_emails),
+        )
+        if rows:
+            return (rows[0]["id"], 0.95, "dealer_email")
+
+    # --- 2. Name match (for inbound from external sender) ---
+    if direction == "inbound" and sender_name and sender != mailbox_email:
         parts = sender_name.split()
         if len(parts) >= 2:
             rows = execute_query(
-                "SELECT id FROM leads WHERE LOWER(first_name) = %s AND LOWER(last_name) = %s LIMIT 1",
+                "SELECT id FROM leads WHERE LOWER(first_name) = %s AND LOWER(last_name) = %s ORDER BY created_at DESC LIMIT 1",
                 (parts[0], parts[-1]),
             )
             if rows:
                 return (rows[0]["id"], 0.85, "name")
 
     # --- 3. Phone match ---
-    if body:
+    if body and match_emails:
         leads_with_phone = execute_query(
-            "SELECT id, phone FROM leads WHERE phone IS NOT NULL AND phone != ''"
+            "SELECT id, phone FROM leads WHERE phone IS NOT NULL AND phone != '' ORDER BY created_at DESC LIMIT 500"
         )
+        normalized_body = _normalize_phone(body)
         for lead in leads_with_phone or []:
-            phone = (lead.get("phone") or "").strip()
-            if phone and len(phone) >= 7 and phone in body:
+            phone = _normalize_phone((lead.get("phone") or "").strip())
+            if phone and len(phone) >= 7 and phone in normalized_body:
                 return (lead["id"], 0.75, "phone")
 
-    # --- 4. AI match (lightweight – compare subject against recent active leads) ---
-    client = _get_anthropic_client()
-    if client and (email_record.get("subject") or body):
-        active_leads = execute_query(
-            "SELECT id, first_name, last_name, email, phone, province "
-            "FROM leads WHERE status = 'active' ORDER BY created_at DESC LIMIT 20"
-        )
-        if active_leads:
-            leads_text = "\n".join(
-                f"ID={l['id']} Name={l.get('first_name','')} {l.get('last_name','')} "
-                f"Email={l.get('email','')} Phone={l.get('phone','')} Province={l.get('province','')}"
-                for l in active_leads
-            )
-            try:
-                resp = client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=256,
-                    system=(
-                        "You match emails to leads. Return JSON: "
-                        '{"lead_id": <int or null>, "confidence": <0-1>}. '
-                        "Return ONLY valid JSON."
-                    ),
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Email subject: {email_record.get('subject','')}\n"
-                                f"Sender: {sender} ({sender_name})\n"
-                                f"Preview: {(email_record.get('body_preview') or '')[:500]}\n\n"
-                                f"Leads:\n{leads_text}"
-                            ),
-                        }
-                    ],
-                )
-                result = json.loads(resp.content[0].text)
-                lid = result.get("lead_id")
-                conf = result.get("confidence", 0)
-                if lid and conf >= 0.6:
-                    return (int(lid), float(conf), "ai")
-            except Exception as e:
-                logger.warning(f"AI lead matching failed: {e}")
+    candidates = _build_embedding_candidates(match_emails, sender_name)
+    lead_id, confidence, method = _match_with_embeddings(email_record, candidates)
+    if lead_id:
+        return (lead_id, confidence, method)
 
     return (None, 0, None)
 
@@ -317,42 +690,31 @@ async def check_closure_candidates():
         if not any_ready and "positive" not in sentiments:
             continue
 
-        # Confirm with AI
-        client = _get_anthropic_client()
         reasoning = "Positive email sentiment with extended inactivity."
-        if client:
-            summaries = "\n".join(
-                f"- {e.get('ai_summary', 'No summary')}" for e in latest
-            )
-            try:
-                resp = client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=512,
-                    system=(
-                        "You are a sales-ops assistant. Based on recent email "
-                        "summaries for a lead, determine if the deal appears "
-                        "complete and the lead can be closed. Return JSON: "
-                        '{"should_flag": true/false, "reasoning": "..."}'
-                    ),
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Lead: {cand.get('first_name','')} {cand.get('last_name','')}\n"
-                                f"Status: {cand.get('status','')}\n"
-                                f"Days since last email: "
-                                f"{(datetime.utcnow() - cand['last_email_at']).days if cand.get('last_email_at') else '?'}\n"
-                                f"Recent email summaries:\n{summaries}"
-                            ),
-                        }
-                    ],
-                )
-                ai_result = json.loads(resp.content[0].text)
-                if not ai_result.get("should_flag", False):
-                    continue
-                reasoning = ai_result.get("reasoning", reasoning)
-            except Exception as e:
-                logger.warning(f"AI closure confirmation failed: {e}")
+        summaries = "\n".join(
+            f"- {e.get('ai_summary', 'No summary')}" for e in latest
+        )
+        ai_result, model_used = _reasoning_json_completion(
+            system_prompt=(
+                "You are a sales-ops assistant. Based on recent email summaries "
+                "for a lead, determine if the deal appears complete and the lead "
+                "can be closed. Return JSON: "
+                '{"should_flag": true/false, "reasoning": "..."}'
+            ),
+            user_prompt=(
+                f"Lead: {cand.get('first_name','')} {cand.get('last_name','')}\n"
+                f"Status: {cand.get('status','')}\n"
+                f"Days since last email: "
+                f"{(datetime.utcnow() - cand['last_email_at']).days if cand.get('last_email_at') else '?'}\n"
+                f"Recent email summaries:\n{summaries}"
+            ),
+            max_tokens=200,
+        )
+        if ai_result is not None:
+            if not ai_result.get("should_flag", False):
+                continue
+            reasoning = ai_result.get("reasoning", reasoning)
+            logger.info("Closure review reasoning completed with model %s", model_used)
 
         days_inactive = 0
         if cand.get("last_email_at"):
@@ -448,7 +810,11 @@ async def get_config(current_user: AdminUser = Depends(get_current_user)):
     config = _get_sync_config()
     if not config:
         return {"configured": False}
+
+    is_connected = bool(config.get("access_token")) and bool(config.get("refresh_token"))
+
     return {
+        "id": config.get("id"),
         "configured": True,
         "ms_tenant_id": config.get("ms_tenant_id"),
         "ms_client_id": config.get("ms_client_id"),
@@ -457,6 +823,7 @@ async def get_config(current_user: AdminUser = Depends(get_current_user)):
         "sync_interval_minutes": config.get("sync_interval_minutes", 15),
         "last_sync_at": config.get("last_sync_at"),
         "user_email": config.get("user_email"),
+        "is_connected": is_connected,
     }
 
 
@@ -466,12 +833,19 @@ async def save_config(
     current_user: AdminUser = Depends(get_current_user),
 ):
     """Save / update MS Graph OAuth config."""
-    _upsert_sync_config(
-        ms_tenant_id=body.ms_tenant_id,
-        ms_client_id=body.ms_client_id,
-        ms_client_secret=body.ms_client_secret,
-        ms_redirect_uri=body.ms_redirect_uri,
-    )
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        return {"success": True}
+
+    existing = _get_sync_config()
+    if not existing:
+        required_fields = ("ms_tenant_id", "ms_client_id", "ms_client_secret", "ms_redirect_uri")
+        missing = [field for field in required_fields if not updates.get(field)]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Missing required config fields: {', '.join(missing)}")
+
+    _upsert_sync_config(**updates)
+    audit_log("CONFIG_UPDATED", "OAuth config saved/updated", current_user.username)
     return {"success": True}
 
 
@@ -493,6 +867,7 @@ async def oauth_authorize(current_user: AdminUser = Depends(get_current_user)):
         f"{MS_LOGIN_BASE}/{config['ms_tenant_id']}/oauth2/v2.0/authorize?"
         + urlencode(params)
     )
+    audit_log("OAUTH_AUTHORIZE", "OAuth authorize URL generated", current_user.username)
     return {"auth_url": auth_url}
 
 
@@ -501,25 +876,82 @@ async def oauth_callback(
     body: OAuthCallbackIn,
     current_user: AdminUser = Depends(get_current_user),
 ):
-    """Exchange authorisation code for tokens."""
-    config = _get_sync_config()
+    """Exchange authorisation code for tokens (called from frontend)."""
+    result = _exchange_code_for_tokens(body.code)
+    audit_log("OAUTH_CONNECT", f"OAuth connected for {result['email']}", current_user.username)
+    return result
+
+
+@router.get("/oauth/callback-redirect")
+async def oauth_callback_redirect(code: str = None, error: str = None, error_description: str = None):
+    """
+    Microsoft redirects here after user grants consent.
+    This is a GET endpoint — no auth required since it's a browser redirect.
+    Exchanges the code for tokens, then redirects back to the frontend.
+    """
+    from fastapi.responses import RedirectResponse
+
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3001") + "/admin/email-intel"
+
+    if error:
+        logger.error(f"OAuth error: {error} - {error_description}")
+        return RedirectResponse(url=f"{frontend_url}?oauth_error={error}")
+
+    if not code:
+        return RedirectResponse(url=f"{frontend_url}?oauth_error=no_code")
+
+    try:
+        result = _exchange_code_for_tokens(code)
+        audit_log("OAUTH_CONNECT", f"OAuth connected for {result['email']}", "oauth-redirect")
+        return RedirectResponse(url=f"{frontend_url}?oauth_success=true&email={result['email']}")
+    except Exception as e:
+        logger.error(f"OAuth token exchange failed: {e}")
+        print(f"[EMAIL_INTEL] OAuth token exchange FAILED: {e}")
+        from urllib.parse import quote
+        return RedirectResponse(url=f"{frontend_url}?oauth_error={quote(str(e)[:200])}")
+
+
+def _exchange_code_for_tokens(code: str) -> dict:
+    """Exchange authorization code for access/refresh tokens."""
+    config = _get_sync_config_decrypted()
     if not config:
         raise HTTPException(status_code=400, detail="OAuth config not set.")
 
+    secret = config["ms_client_secret"]
+    # Debug: verify decrypted secret is intact (log length + first/last 4 chars only)
+    print(f"[EMAIL_INTEL] Exchanging code:")
+    print(f"  tenant   = {config['ms_tenant_id']}")
+    print(f"  client   = {config['ms_client_id']}")
+    print(f"  redirect = {config['ms_redirect_uri']}")
+    print(f"  secret   = {secret[:4]}...{secret[-4:]} (len={len(secret)})")
+    print(f"  scope    = {OAUTH_SCOPES}")
+    print(f"  code     = {code[:10]}... (len={len(code)})")
+
+    token_url = f"{MS_LOGIN_BASE}/{config['ms_tenant_id']}/oauth2/v2.0/token"
+    payload = {
+        "client_id": config["ms_client_id"],
+        "client_secret": secret,
+        "code": code,
+        "redirect_uri": config["ms_redirect_uri"],
+        "grant_type": "authorization_code",
+        "scope": OAUTH_SCOPES,
+    }
+
+    # Use explicit Content-Type header and encode body manually to avoid any encoding issues
+    from urllib.parse import urlencode
+    encoded_body = urlencode(payload)
+    print(f"[EMAIL_INTEL] POST {token_url}")
+    print(f"[EMAIL_INTEL] Body (first 200): {encoded_body[:200]}")
+
     resp = http_requests.post(
-        f"{MS_LOGIN_BASE}/{config['ms_tenant_id']}/oauth2/v2.0/token",
-        data={
-            "client_id": config["ms_client_id"],
-            "client_secret": config["ms_client_secret"],
-            "code": body.code,
-            "redirect_uri": config["ms_redirect_uri"],
-            "grant_type": "authorization_code",
-            "scope": OAUTH_SCOPES,
-        },
+        token_url,
+        data=encoded_body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
     )
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Token exchange failed: {resp.text}")
+        print(f"[EMAIL_INTEL] Token exchange failed ({resp.status_code}): {resp.text[:500]}")
+        raise Exception(f"Token exchange failed ({resp.status_code}): {resp.text[:300]}")
 
     data = resp.json()
     expires_at = datetime.utcnow() + timedelta(seconds=data.get("expires_in", 3600))
@@ -543,13 +975,31 @@ async def oauth_callback(
 
 
 # ---------------------------------------------------------------------------
+# Emergency Disconnect (Kill Switch)
+# ---------------------------------------------------------------------------
+
+@router.post("/emergency-disconnect")
+async def emergency_disconnect(current_user: AdminUser = Depends(get_current_user)):
+    """Instant kill switch -- wipes all tokens, disables sync, logs action."""
+    execute_query("UPDATE email_sync_config SET access_token = NULL, refresh_token = NULL, sync_enabled = FALSE, token_expires_at = NULL", fetch=False)
+    audit_log("EMERGENCY_DISCONNECT", "All email tokens wiped and sync disabled", current_user.username)
+    return {"success": True, "message": "All email access revoked immediately"}
+
+
+# ---------------------------------------------------------------------------
 # Email Sync
 # ---------------------------------------------------------------------------
 
 @router.post("/sync")
 async def sync_emails(current_user: AdminUser = Depends(get_current_user)):
     """Manually trigger an email sync from MS Graph."""
-    config = _get_sync_config()
+    global _last_sync_time
+    now = datetime.utcnow()
+    if _last_sync_time and (now - _last_sync_time).total_seconds() < 300:
+        raise HTTPException(status_code=429, detail="Sync rate limited. Wait 5 minutes between syncs.")
+    _last_sync_time = now
+
+    config = _get_sync_config_decrypted()
     if not config or not config.get("access_token"):
         raise HTTPException(status_code=400, detail="OAuth not configured or not authorised.")
 
@@ -583,6 +1033,8 @@ async def sync_emails(current_user: AdminUser = Depends(get_current_user)):
 
     # Check closure candidates
     flagged = await check_closure_candidates()
+
+    audit_log("EMAIL_SYNC", f"Synced {synced} emails, matched {matched}, flagged {flagged}", current_user.username)
 
     return {"synced": synced, "matched": matched, "flagged_for_review": flagged}
 
@@ -618,8 +1070,9 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
                 r.get("emailAddress", {}).get("address", "")
                 for r in msg.get("toRecipients", [])
             ]
-            body_text = (msg.get("body", {}).get("content") or "")[:10000]
-            body_preview = msg.get("bodyPreview", "")
+            # Full body used transiently for AI analysis, NOT stored permanently
+            body_text = _normalize_email_text(msg.get("body", {}).get("content") or "", 10000)
+            body_preview = _normalize_email_text(msg.get("bodyPreview", "") or "", 200)
             received_at = msg.get("receivedDateTime")
 
             email_record = {
@@ -629,7 +1082,7 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
                 "sender_name": sender_name,
                 "recipient_emails": json.dumps(recipients),
                 "body_preview": body_preview,
-                "body_text": body_text,
+                "body_text": body_text,  # kept transiently for matching/AI
                 "received_at": received_at,
                 "is_read": msg.get("isRead", False),
                 "direction": direction,
@@ -642,7 +1095,7 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
             email_record["match_confidence"] = confidence
             email_record["match_method"] = method
 
-            # AI analysis
+            # AI analysis (uses full body transiently)
             lead_data = None
             if lead_id:
                 lead_rows = execute_query("SELECT * FROM leads WHERE id = %s", (lead_id,))
@@ -664,6 +1117,9 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
                 f"Deal stage: {ai_result.get('deal_stage', 'unknown')}"
             )
             email_record["processed_at"] = datetime.utcnow()
+
+            # Discard full body before DB insert -- only store body_preview
+            del email_record["body_text"]
 
             # Insert
             cols = list(email_record.keys())
@@ -728,15 +1184,32 @@ async def get_lead_emails(
     current_user: AdminUser = Depends(get_current_user),
 ):
     """Get all matched emails for a specific lead."""
-    emails = execute_query(
-        "SELECT id, ms_message_id, subject, sender_email, sender_name, "
-        "recipient_emails, body_preview, received_at, is_read, direction, "
-        "match_confidence, match_method, ai_summary, ai_sentiment, "
-        "ai_action_items, ai_ready_to_close, ai_close_reasoning, processed_at "
-        "FROM email_messages WHERE matched_lead_id = %s "
-        "ORDER BY received_at DESC",
-        (lead_id,),
-    )
+    audit_log("EMAIL_READ", f"Viewed emails for lead {lead_id}", current_user.username)
+    if lead_id == 0:
+        # Return all recent emails (most recent 50) with lead name joined
+        emails = execute_query(
+            "SELECT em.id, em.ms_message_id, em.subject, em.sender_email, em.sender_name, "
+            "em.recipient_emails, em.body_preview, em.received_at, em.is_read, em.direction, "
+            "em.matched_lead_id, em.match_confidence, em.match_method, em.ai_summary, em.ai_sentiment, "
+            "em.ai_action_items, em.ai_ready_to_close, em.ai_close_reasoning, em.processed_at, "
+            "l.first_name AS lead_first_name, l.last_name AS lead_last_name, l.status AS lead_status "
+            "FROM email_messages em "
+            "LEFT JOIN leads l ON l.id = em.matched_lead_id "
+            "ORDER BY em.received_at DESC LIMIT 50"
+        )
+    else:
+        emails = execute_query(
+            "SELECT em.id, em.ms_message_id, em.subject, em.sender_email, em.sender_name, "
+            "em.recipient_emails, em.body_preview, em.received_at, em.is_read, em.direction, "
+            "em.matched_lead_id, em.match_confidence, em.match_method, em.ai_summary, em.ai_sentiment, "
+            "em.ai_action_items, em.ai_ready_to_close, em.ai_close_reasoning, em.processed_at, "
+            "l.first_name AS lead_first_name, l.last_name AS lead_last_name, l.status AS lead_status "
+            "FROM email_messages em "
+            "LEFT JOIN leads l ON l.id = em.matched_lead_id "
+            "WHERE em.matched_lead_id = %s "
+            "ORDER BY em.received_at DESC",
+            (lead_id,),
+        )
     return emails or []
 
 
@@ -746,6 +1219,7 @@ async def get_lead_context(
     current_user: AdminUser = Depends(get_current_user),
 ):
     """AI-generated context summary for a lead based on all matched emails."""
+    audit_log("EMAIL_READ", f"Viewed email context for lead {lead_id}", current_user.username)
     lead_rows = execute_query("SELECT * FROM leads WHERE id = %s", (lead_id,))
     if not lead_rows:
         raise HTTPException(status_code=404, detail="Lead not found")
@@ -777,8 +1251,7 @@ async def get_lead_context(
         for e in emails
     ]
 
-    client = _get_anthropic_client()
-    if not client:
+    if not OPENAI_API_KEY and not ANTHROPIC_API_KEY:
         return {
             "context": "AI service unavailable.",
             "timeline": timeline,
@@ -793,10 +1266,8 @@ async def get_lead_context(
     )
 
     try:
-        resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=(
+        result, model_used = _reasoning_json_completion(
+            system_prompt=(
                 "You are a sales intelligence assistant. Given email history for "
                 "a lead, produce a JSON object with:\n"
                 '- "context": a comprehensive narrative summary of all interactions\n'
@@ -804,20 +1275,18 @@ async def get_lead_context(
                 '- "recommended_action": what the sales team should do next\n'
                 "Return ONLY valid JSON."
             ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Lead: {lead.get('first_name','')} {lead.get('last_name','')}\n"
-                        f"Email: {lead.get('email','')}\n"
-                        f"Status: {lead.get('status','')}\n"
-                        f"Province: {lead.get('province','')}\n\n"
-                        f"Email history ({len(emails)} messages):\n{email_summaries}"
-                    ),
-                }
-            ],
+            user_prompt=(
+                f"Lead: {lead.get('first_name','')} {lead.get('last_name','')}\n"
+                f"Email: {lead.get('email','')}\n"
+                f"Status: {lead.get('status','')}\n"
+                f"Province: {lead.get('province','')}\n\n"
+                f"Email history ({len(emails)} messages):\n{email_summaries}"
+            ),
+            max_tokens=700,
         )
-        result = json.loads(resp.content[0].text)
+        if result is None:
+            raise RuntimeError("No AI model available for lead context generation")
+        logger.info("Lead context generated with model %s", model_used)
         result["timeline"] = timeline
         return result
     except Exception as e:
@@ -838,14 +1307,17 @@ async def get_lead_context(
 async def get_review_queue(current_user: AdminUser = Depends(get_current_user)):
     """Get all pending closure reviews with lead details."""
     rows = execute_query("""
-        SELECT crq.id AS review_id, crq.lead_id, crq.flagged_at,
+        SELECT crq.id AS id, crq.lead_id, crq.flagged_at,
                crq.ai_reasoning, crq.days_inactive, crq.last_email_at,
                crq.email_count, crq.status,
-               l.first_name, l.last_name, l.email AS lead_email,
+               TRIM(CONCAT(COALESCE(l.first_name, ''), ' ', COALESCE(l.last_name, ''))) AS lead_name,
+               l.email AS lead_email,
+               COALESCE(d.name, l.final_installer_selection, 'Unassigned') AS dealer_name,
                l.phone, l.province, l.status AS lead_status,
                l.email_match_count, l.last_email_activity, l.email_sentiment
         FROM closure_review_queue crq
         JOIN leads l ON l.id = crq.lead_id
+        LEFT JOIN dealers d ON d.id = l.assigned_dealer_id
         WHERE crq.status = 'pending'
         ORDER BY crq.flagged_at DESC
     """)
@@ -885,8 +1357,8 @@ async def approve_review(
 
     # Add lead log entry
     execute_query(
-        "INSERT INTO lead_logs (lead_id, action, details, performed_by) "
-        "VALUES (%s, %s, %s, %s)",
+        "INSERT INTO lead_logs (lead_id, log_type, message, created_by, created_at) "
+        "VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)",
         (
             review["lead_id"],
             "status_change",
@@ -901,6 +1373,7 @@ async def approve_review(
         fetch=False,
     )
 
+    audit_log("REVIEW_APPROVED", f"Review {review_id} approved, lead {review['lead_id']} converted", current_user.username)
     return {"success": True, "lead_id": review["lead_id"], "new_status": "converted"}
 
 
@@ -935,4 +1408,5 @@ async def dismiss_review(
         fetch=False,
     )
 
+    audit_log("REVIEW_DISMISSED", f"Review {review_id} dismissed for lead {review['lead_id']}", current_user.username)
     return {"success": True, "lead_id": review["lead_id"]}

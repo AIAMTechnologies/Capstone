@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS email_messages (
     sender_name VARCHAR(255),
     recipient_emails TEXT,  -- JSON array
     body_preview TEXT,
-    body_text TEXT,
+    body_text TEXT,  -- NOTE: body_text should be cleared after AI processing; only body_preview is retained long-term
     received_at TIMESTAMP,
     is_read BOOLEAN DEFAULT FALSE,
     direction VARCHAR(10) DEFAULT 'inbound',  -- inbound or outbound
@@ -69,3 +69,16 @@ ALTER TABLE leads ADD COLUMN IF NOT EXISTS email_match_count INTEGER DEFAULT 0;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_email_activity TIMESTAMP;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS email_sentiment VARCHAR(20);
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_closure_flagged BOOLEAN DEFAULT FALSE;
+
+-- Audit log for email intelligence actions
+CREATE TABLE IF NOT EXISTS email_audit_log (
+    id SERIAL PRIMARY KEY,
+    action VARCHAR(100) NOT NULL,
+    details TEXT,
+    performed_by VARCHAR(100),
+    performed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ip_address VARCHAR(45)
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_audit_action ON email_audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_email_audit_time ON email_audit_log(performed_at);
