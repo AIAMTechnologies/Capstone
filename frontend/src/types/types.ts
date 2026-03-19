@@ -310,6 +310,75 @@ export interface AIChurnRisk {
 }
 
 // ============================================
+// EMAIL INTELLIGENCE TYPES
+// ============================================
+
+export interface EmailSyncConfig {
+  id: number;
+  ms_tenant_id: string;
+  ms_client_id: string;
+  ms_redirect_uri: string;
+  sync_enabled: boolean;
+  sync_interval_minutes: number;
+  last_sync_at: string | null;
+  user_email: string | null;
+}
+
+export interface EmailMessage {
+  id: number;
+  ms_message_id: string;
+  subject: string;
+  sender_email: string;
+  sender_name: string;
+  body_preview: string;
+  body_text: string;
+  received_at: string;
+  direction: 'inbound' | 'outbound';
+  matched_lead_id: number | null;
+  match_confidence: number | null;
+  match_method: string | null;
+  ai_summary: string | null;
+  ai_sentiment: 'positive' | 'neutral' | 'negative' | null;
+  ai_action_items: string[] | null;
+  ai_ready_to_close: boolean;
+}
+
+export interface ClosureReview {
+  id: number;
+  lead_id: number;
+  lead_name: string;
+  lead_email: string;
+  dealer_name: string;
+  flagged_at: string;
+  ai_reasoning: string;
+  days_inactive: number;
+  last_email_at: string | null;
+  email_count: number;
+  status: 'pending' | 'approved' | 'dismissed';
+}
+
+export interface EmailLeadContext {
+  context: string;
+  timeline: Array<{ date: string; event: string; sentiment: string }>;
+  key_insights: string[];
+  recommended_action: string;
+}
+
+export interface EmailSyncStatus {
+  sync_enabled: boolean;
+  last_sync: string | null;
+  total_emails: number;
+  matched_emails: number;
+  pending_reviews: number;
+}
+
+export interface EmailSyncResult {
+  synced: number;
+  matched: number;
+  flagged_for_review: number;
+}
+
+// ============================================
 // REPORT TYPES
 // ============================================
 

@@ -26,7 +26,13 @@ import type {
   AIEmailDraft,
   AIEnrichment,
   AIConversionPrediction,
-  AIChurnRisk
+  AIChurnRisk,
+  EmailSyncConfig,
+  EmailMessage,
+  ClosureReview,
+  EmailLeadContext,
+  EmailSyncStatus,
+  EmailSyncResult,
 } from '../types';
 
 const API_BASE_URL = env.apiUrl || 'http://localhost:8000/api';
@@ -441,6 +447,65 @@ export const submitDealerInteraction = async (data: { lead_id: number; message: 
 
 export const submitDealerWinLost = async (data: { lead_id: number; status: string; value_of_order?: number; reason?: string }): Promise<{ message: string }> => {
   const response = await api.post('/dealer/submit-win', data);
+  return response.data;
+};
+
+// ============================================
+// EMAIL INTELLIGENCE
+// ============================================
+
+export const getEmailSyncConfig = async (): Promise<EmailSyncConfig | null> => {
+  const response = await api.get('/email-intel/config');
+  return response.data;
+};
+
+export const saveEmailSyncConfig = async (config: Partial<EmailSyncConfig> & { ms_client_secret?: string }): Promise<{ success: boolean }> => {
+  const response = await api.post('/email-intel/config', config);
+  return response.data;
+};
+
+export const getOAuthAuthorizeUrl = async (): Promise<{ auth_url: string }> => {
+  const response = await api.get('/email-intel/oauth/authorize');
+  return response.data;
+};
+
+export const completeOAuthCallback = async (code: string): Promise<{ success: boolean; email: string }> => {
+  const response = await api.post('/email-intel/oauth/callback', { code });
+  return response.data;
+};
+
+export const triggerEmailSync = async (): Promise<EmailSyncResult> => {
+  const response = await api.post('/email-intel/sync');
+  return response.data;
+};
+
+export const getEmailSyncStatus = async (): Promise<EmailSyncStatus> => {
+  const response = await api.get('/email-intel/status');
+  return response.data;
+};
+
+export const getLeadEmails = async (leadId: number): Promise<EmailMessage[]> => {
+  const response = await api.get(`/email-intel/lead/${leadId}/emails`);
+  return response.data;
+};
+
+export const getLeadEmailContext = async (leadId: number): Promise<EmailLeadContext> => {
+  const response = await api.get(`/email-intel/lead/${leadId}/context`);
+  return response.data;
+};
+
+export const getClosureReviewQueue = async (): Promise<ClosureReview[]> => {
+  const response = await api.get('/email-intel/review-queue');
+  return response.data;
+};
+
+export const approveClosureReview = async (reviewId: number): Promise<{ success: boolean }> => {
+  const response = await api.post(`/email-intel/review-queue/${reviewId}/approve`);
+  return response.data;
+};
+
+export const dismissClosureReview = async (reviewId: number): Promise<{ success: boolean }> => {
+  const response = await api.post(`/email-intel/review-queue/${reviewId}/dismiss`);
   return response.data;
 };
 

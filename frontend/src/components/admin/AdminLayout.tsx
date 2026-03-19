@@ -1,7 +1,7 @@
 import React from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
-import { LayoutDashboard, Clock, BookOpen, BarChart3, Wrench, LogOut } from 'lucide-react';
+import { LayoutDashboard, Clock, BookOpen, BarChart3, Wrench, Mail, LogOut } from 'lucide-react';
 
 const NAV_ITEMS = [
   { to: '/admin/dashboard', label: 'Dashboard', icon: LayoutDashboard },
@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { to: '/admin/resources', label: 'Resources', icon: BookOpen },
   { to: '/admin/reports', label: 'Reports', icon: BarChart3 },
   { to: '/admin/tools', label: 'Tools', icon: Wrench },
+  { to: '/admin/email-intel', label: 'Email Intel', icon: Mail },
 ];
 
 const AdminLayout: React.FC = () => {

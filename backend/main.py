@@ -99,6 +99,7 @@ from routes.admin_tools import router as admin_tools_router
 from routes.ai_leads import router as ai_leads_router
 from routes.ai_insights import router as ai_insights_router
 from routes.dealer import router as dealer_router
+from routes.email_intel import router as email_intel_router
 
 app.include_router(admin_leads_router)
 app.include_router(admin_dealers_router)
@@ -110,6 +111,7 @@ app.include_router(admin_tools_router)
 app.include_router(ai_leads_router)
 app.include_router(ai_insights_router)
 app.include_router(dealer_router)
+app.include_router(email_intel_router)
 
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
