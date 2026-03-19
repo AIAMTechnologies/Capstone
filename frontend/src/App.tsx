@@ -5,7 +5,12 @@ import Header from './components/Header';
 import ProtectedRoute from './components/ProtectedRoute';
 import Home from './pages/Home';
 import AdminLogin from './pages/AdminLogin';
-import AdminDashboard from './pages/AdminDashboard';
+import AdminLayout from './components/admin/AdminLayout';
+import Dashboard from './pages/admin/Dashboard';
+import History from './pages/admin/History';
+import Resources from './pages/admin/Resources';
+import Reports from './pages/admin/Reports';
+import Tools from './pages/admin/Tools';
 import './styles/App.css';
 
 const AppShell = () => (
@@ -17,6 +22,12 @@ const AppShell = () => (
   </div>
 );
 
+const AdminShell = () => (
+  <ProtectedRoute>
+    <AdminLayout />
+  </ProtectedRoute>
+);
+
 const router = createBrowserRouter(
   [
     {
@@ -24,15 +35,19 @@ const router = createBrowserRouter(
       children: [
         { path: '/', element: <Home /> },
         { path: '/admin/login', element: <AdminLogin /> },
-        {
-          path: '/admin/dashboard',
-          element: (
-            <ProtectedRoute>
-              <AdminDashboard />
-            </ProtectedRoute>
-          ),
-        },
         { path: '*', element: <Navigate to="/" replace /> },
+      ],
+    },
+    {
+      path: '/admin',
+      element: <AdminShell />,
+      children: [
+        { index: true, element: <Navigate to="/admin/dashboard" replace /> },
+        { path: 'dashboard', element: <Dashboard /> },
+        { path: 'history', element: <History /> },
+        { path: 'resources', element: <Resources /> },
+        { path: 'reports', element: <Reports /> },
+        { path: 'tools', element: <Tools /> },
       ],
     },
   ]

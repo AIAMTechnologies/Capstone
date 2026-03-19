@@ -86,6 +86,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================
+# REGISTER API ROUTE MODULES
+# ============================================
+from routes.admin_leads import router as admin_leads_router
+from routes.admin_dealers import router as admin_dealers_router
+from routes.admin_history import router as admin_history_router
+from routes.admin_logs import router as admin_logs_router
+from routes.admin_reports import router as admin_reports_router
+from routes.admin_resources import router as admin_resources_router
+from routes.admin_tools import router as admin_tools_router
+from routes.ai_leads import router as ai_leads_router
+from routes.ai_insights import router as ai_insights_router
+from routes.dealer import router as dealer_router
+
+app.include_router(admin_leads_router)
+app.include_router(admin_dealers_router)
+app.include_router(admin_history_router)
+app.include_router(admin_logs_router)
+app.include_router(admin_reports_router)
+app.include_router(admin_resources_router)
+app.include_router(admin_tools_router)
+app.include_router(ai_leads_router)
+app.include_router(ai_insights_router)
+app.include_router(dealer_router)
+
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login")
@@ -1318,6 +1343,33 @@ async def trigger_ml_training(
     status_payload = ml_allocator.status()
     message = "trained" if success else "training_failed"
     return MLStatusResponse(**status_payload, message=message)
+
+# ============================================
+# MIGRATION RUNNER
+# ============================================
+@app.on_event("startup")
+async def run_migrations():
+    """Run SQL migrations on startup."""
+    import glob
+    migrations_dir = Path(__file__).parent / "migrations"
+    if not migrations_dir.exists():
+        return
+    migration_files = sorted(glob.glob(str(migrations_dir / "*.sql")))
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            for mf in migration_files:
+                try:
+                    with open(mf, 'r') as f:
+                        sql = f.read()
+                    cursor.execute(sql)
+                    conn.commit()
+                    logger.info(f"Migration applied: {Path(mf).name}")
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning(f"Migration {Path(mf).name} skipped or failed: {e}")
+    finally:
+        conn.close()
 
 # ============================================
 # RUN SERVER

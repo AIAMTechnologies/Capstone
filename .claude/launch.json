@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Frontend (Vite + React)",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["start-vite.mjs"],
+      "port": 3000,
+      "autoPort": true
+    }
+  ]
+}

@@ -2,13 +2,31 @@ import axios, { AxiosError } from 'axios';
 import { env } from '../config/env';
 import type {
   LeadFormData,
-  LoginResponse, 
-  DashboardStats, 
-  LeadsResponse, 
+  LoginResponse,
+  DashboardStats,
+  LeadsResponse,
   Lead,
   LeadStatus,
   Installer,
-  HistoricalDataResponse
+  HistoricalDataResponse,
+  ExtendedLead,
+  Dealer,
+  LeadLog,
+  LeadReportSummary,
+  GraphDataPoint,
+  DealerPerformanceData,
+  DealerProjectData,
+  LeadStatusReport,
+  ResponseTimeData,
+  ResourcePage,
+  DealerNotificationStatus,
+  AILeadScore,
+  AIMatchExplanation,
+  AIInsight,
+  AIEmailDraft,
+  AIEnrichment,
+  AIConversionPrediction,
+  AIChurnRisk
 } from '../types';
 
 const API_BASE_URL = env.apiUrl || 'http://localhost:8000/api';
@@ -154,6 +172,275 @@ export const getHistoricalData = async (
   }
   
   const response = await api.get<HistoricalDataResponse>('/admin/historical-data', { params });
+  return response.data;
+};
+
+// ============================================
+// ADMIN LEAD MANAGEMENT (new routes)
+// ============================================
+
+export const getUnassignedLeads = async (): Promise<{ leads: ExtendedLead[]; count: number }> => {
+  const response = await api.get('/admin/unassigned-leads');
+  return response.data;
+};
+
+export const getActiveLeads = async (): Promise<{ leads: ExtendedLead[]; count: number }> => {
+  const response = await api.get('/admin/active-leads');
+  return response.data;
+};
+
+export const createNewLead = async (leadData: Record<string, any>): Promise<{ message: string; lead_id: number }> => {
+  const response = await api.post('/admin/leads/new', leadData);
+  return response.data;
+};
+
+export const assignDealerToLead = async (leadId: number, dealerIds: number[]): Promise<{ message: string }> => {
+  const response = await api.post(`/admin/leads/${leadId}/assign-dealer`, { dealer_ids: dealerIds });
+  return response.data;
+};
+
+export const updateLead = async (leadId: number, data: Record<string, any>): Promise<{ message: string }> => {
+  const response = await api.post(`/admin/leads/${leadId}/update`, data);
+  return response.data;
+};
+
+export const archiveLead = async (leadId: number): Promise<{ message: string }> => {
+  const response = await api.post(`/admin/leads/${leadId}/archive`);
+  return response.data;
+};
+
+export const deleteLead = async (leadId: number): Promise<{ message: string }> => {
+  const response = await api.post(`/admin/leads/${leadId}/delete`);
+  return response.data;
+};
+
+// ============================================
+// DEALER API
+// ============================================
+
+export const getDealers = async (province?: string): Promise<{ dealers: Dealer[]; count: number }> => {
+  const params: any = {};
+  if (province) params.province = province;
+  const response = await api.get('/admin/dealers', { params });
+  return response.data;
+};
+
+export const getDealerOptions = async (): Promise<{ dealers: Dealer[] }> => {
+  const response = await api.get('/admin/dealers/options');
+  return response.data;
+};
+
+// ============================================
+// LEAD LOGS
+// ============================================
+
+export const getLeadLogs = async (leadId: number): Promise<{ logs: LeadLog[]; count: number }> => {
+  const response = await api.get('/admin/lead-log', { params: { lead_id: leadId } });
+  return response.data;
+};
+
+export const createLeadLog = async (data: { lead_id: number; log_type: string; message: string; dealer_id?: number }): Promise<{ message: string }> => {
+  const response = await api.post('/admin/lead-log', data);
+  return response.data;
+};
+
+// ============================================
+// HISTORY
+// ============================================
+
+export const getHistoryLeads = async (params: {
+  start_date?: string;
+  end_date?: string;
+  province?: string;
+  dealer?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<{ leads: ExtendedLead[]; count: number; total: number }> => {
+  const response = await api.get('/admin/history-leads', { params });
+  return response.data;
+};
+
+export const updateValueOfOrder = async (leadId: number, value: number): Promise<{ message: string }> => {
+  const response = await api.post(`/admin/leads/${leadId}/update-value`, null, { params: { value } });
+  return response.data;
+};
+
+// ============================================
+// REPORTS
+// ============================================
+
+export const getLeadReport = async (): Promise<{ data: LeadReportSummary[] }> => {
+  const response = await api.get('/admin/reports/lead-report');
+  return response.data;
+};
+
+export const getLeadGraph = async (tf: number = 6, opt: number = 1): Promise<{ data: GraphDataPoint[] }> => {
+  const response = await api.get('/admin/reports/lead-graph', { params: { tf, opt } });
+  return response.data;
+};
+
+export const getDealerPerformance = async (source?: string): Promise<{ data: any[] }> => {
+  const params: any = {};
+  if (source) params.source = source;
+  const response = await api.get('/admin/reports/dealer-performance', { params });
+  return response.data;
+};
+
+export const getDealerProjects = async (source?: string): Promise<{ data: DealerProjectData[] }> => {
+  const params: any = {};
+  if (source) params.source = source;
+  const response = await api.get('/admin/reports/dealer-projects', { params });
+  return response.data;
+};
+
+export const getLeadStatusReport = async (source?: string): Promise<{ data: LeadStatusReport[] }> => {
+  const params: any = {};
+  if (source) params.source = source;
+  const response = await api.get('/admin/reports/lead-status', { params });
+  return response.data;
+};
+
+// Legacy compat
+export const getResponseTimes = getDealerPerformance;
+
+// ============================================
+// RESOURCES
+// ============================================
+
+export const getResources = async (): Promise<{ pages: ResourcePage[] }> => {
+  const response = await api.get('/admin/resources');
+  return response.data;
+};
+
+export const getResource = async (pageId: number): Promise<ResourcePage> => {
+  const response = await api.get(`/admin/resources/${pageId}`);
+  return response.data;
+};
+
+export const createResource = async (data: { title: string; slug?: string; content?: string; parent_id?: number; sort_order?: number }): Promise<{ message: string; id: number }> => {
+  const response = await api.post('/admin/resources', data);
+  return response.data;
+};
+
+export const updateResource = async (pageId: number, data: Record<string, any>): Promise<{ message: string }> => {
+  const response = await api.put(`/admin/resources/${pageId}`, data);
+  return response.data;
+};
+
+export const deleteResource = async (pageId: number): Promise<{ message: string }> => {
+  const response = await api.delete(`/admin/resources/${pageId}`);
+  return response.data;
+};
+
+// ============================================
+// TOOLS
+// ============================================
+
+export const uploadCSV = async (file: File): Promise<{ headers: string[]; preview: Record<string, string>[]; total_rows: number }> => {
+  const formData = new FormData();
+  formData.append('file', file);
+  const response = await api.post('/admin/tools/csv-upload', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 30000,
+  });
+  return response.data;
+};
+
+export const importCSV = async (data: { mappings: { csv_column: string; db_column: string }[]; data: Record<string, string>[] }): Promise<{ message: string; inserted: number; errors: string[] }> => {
+  const response = await api.post('/admin/tools/csv-import', data);
+  return response.data;
+};
+
+export const sendMassEmail = async (data: { dealer_ids: number[]; subject: string; body: string }): Promise<{ message: string }> => {
+  const response = await api.post('/admin/tools/mass-email', data);
+  return response.data;
+};
+
+export const getNotificationCheck = async (): Promise<{ dealers: DealerNotificationStatus[] }> => {
+  const response = await api.get('/admin/tools/notification-check');
+  return response.data;
+};
+
+export const resendNotification = async (dealerId: number): Promise<{ message: string }> => {
+  const response = await api.post(`/admin/tools/notification-resend/${dealerId}`);
+  return response.data;
+};
+
+export const exportLeads = async (params: { status?: string; province?: string; start_date?: string; end_date?: string }): Promise<{ leads: ExtendedLead[]; count: number }> => {
+  const response = await api.get('/admin/tools/lead-export', { params });
+  return response.data;
+};
+
+export const changePassword = async (data: { current_password: string; new_password: string }): Promise<{ message: string }> => {
+  const response = await api.post('/admin/tools/change-password', data);
+  return response.data;
+};
+
+// ============================================
+// AI ENDPOINTS
+// ============================================
+
+export const scoreLeadAI = async (leadId: number): Promise<AILeadScore> => {
+  const response = await api.post('/ai/lead-score', null, { params: { lead_id: leadId } });
+  return response.data;
+};
+
+export const getLeadScoreAI = async (leadId: number): Promise<{ ai_priority: string; ai_score: number; ai_reasoning: string; ai_scored_at: string }> => {
+  const response = await api.get(`/ai/lead-score/${leadId}`);
+  return response.data;
+};
+
+export const explainMatchAI = async (leadId: number): Promise<AIMatchExplanation> => {
+  const response = await api.post('/ai/explain-match', null, { params: { lead_id: leadId } });
+  return response.data;
+};
+
+export const draftEmailAI = async (data: { lead_id: number; purpose: string; dealer_id?: number }): Promise<AIEmailDraft> => {
+  const response = await api.post('/ai/draft-email', data);
+  return response.data;
+};
+
+export const enrichLeadAI = async (leadId: number): Promise<AIEnrichment> => {
+  const response = await api.post('/ai/enrich-lead', null, { params: { lead_id: leadId } });
+  return response.data;
+};
+
+export const predictConversionAI = async (leadId: number): Promise<AIConversionPrediction> => {
+  const response = await api.post('/ai/predict-conversion', null, { params: { lead_id: leadId } });
+  return response.data;
+};
+
+export const getAIInsights = async (): Promise<{ insights: AIInsight[] }> => {
+  const response = await api.get('/ai/insights');
+  return response.data;
+};
+
+export const getChurnRisks = async (): Promise<{ at_risk_leads: AIChurnRisk[] }> => {
+  const response = await api.get('/ai/churn-risks');
+  return response.data;
+};
+
+// ============================================
+// DEALER PORTAL
+// ============================================
+
+export const getDealerActiveLeads = async (): Promise<{ leads: ExtendedLead[]; count: number }> => {
+  const response = await api.get('/dealer/active-leads');
+  return response.data;
+};
+
+export const getDealerHistory = async (): Promise<{ leads: ExtendedLead[]; count: number }> => {
+  const response = await api.get('/dealer/history');
+  return response.data;
+};
+
+export const submitDealerInteraction = async (data: { lead_id: number; message: string }): Promise<{ message: string }> => {
+  const response = await api.post('/dealer/submit-interaction', data);
+  return response.data;
+};
+
+export const submitDealerWinLost = async (data: { lead_id: number; status: string; value_of_order?: number; reason?: string }): Promise<{ message: string }> => {
+  const response = await api.post('/dealer/submit-win', data);
   return response.data;
 };
 
