@@ -292,16 +292,21 @@ def _openai_json_completion(
 
     for model in model_candidates:
         try:
-            response = client.chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-                messages=[
+            request_kwargs = {
+                "model": model,
+                "response_format": {"type": "json_object"},
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-            )
+            }
+            if model.startswith("gpt-5"):
+                request_kwargs["max_completion_tokens"] = max_tokens
+            else:
+                request_kwargs["max_tokens"] = max_tokens
+                request_kwargs["temperature"] = 0.1
+
+            response = client.chat.completions.create(**request_kwargs)
             content = response.choices[0].message.content or "{}"
             return _extract_json(content), model
         except Exception as exc:
