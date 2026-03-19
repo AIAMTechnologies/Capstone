@@ -1191,7 +1191,7 @@ async def get_lead_emails(
     """Get all matched emails for a specific lead."""
     audit_log("EMAIL_READ", f"Viewed emails for lead {lead_id}", current_user.username)
     if lead_id == 0:
-        # Return all recent emails (most recent 50) with lead name joined
+        # Return recent matched emails for the dashboard feed.
         emails = execute_query(
             "SELECT em.id, em.ms_message_id, em.subject, em.sender_email, em.sender_name, "
             "em.recipient_emails, em.body_preview, em.received_at, em.is_read, em.direction, "
@@ -1200,6 +1200,7 @@ async def get_lead_emails(
             "l.first_name AS lead_first_name, l.last_name AS lead_last_name, l.status AS lead_status "
             "FROM email_messages em "
             "LEFT JOIN leads l ON l.id = em.matched_lead_id "
+            "WHERE em.matched_lead_id IS NOT NULL "
             "ORDER BY em.received_at DESC LIMIT 50"
         )
     else:

@@ -12,6 +12,7 @@ import {
   dismissClosureReview,
   getLeadEmails,
 } from '../../services/api';
+import { getApiErrorMessage } from '../../utils/apiErrors';
 
 const inputStyle: React.CSSProperties = { padding: '8px 12px', borderRadius: 6, border: '1px solid #ddd', fontSize: 14 };
 const cardStyle: React.CSSProperties = { background: 'white', borderRadius: 8, padding: 20, boxShadow: '0 2px 8px rgba(0,0,0,0.08)', marginBottom: 20 };
@@ -23,16 +24,6 @@ const tdStyle: React.CSSProperties = { padding: '10px 12px', borderBottom: '1px 
 const labelStyle: React.CSSProperties = { display: 'block', fontSize: 13, fontWeight: 600, color: '#555', marginBottom: 4 };
 
 const fmtDate = (d?: string | null) => d ? new Date(d).toLocaleString('en-CA') : '-';
-
-// Safely extract error message string from axios errors (FastAPI validation errors are objects/arrays)
-const getErrorMsg = (err: any, fallback: string): string => {
-  const detail = err?.response?.data?.detail;
-  if (!detail) return err?.message || fallback;
-  if (typeof detail === 'string') return detail;
-  if (Array.isArray(detail)) return detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ');
-  if (typeof detail === 'object') return detail.msg || JSON.stringify(detail);
-  return fallback;
-};
 
 const EmailIntel: React.FC = () => {
   const [oauthMsg, setOauthMsg] = useState('');
@@ -126,7 +117,7 @@ const SyncConfigSection: React.FC = () => {
       setSuccess('Configuration saved');
       setClientSecret('');
     } catch (err: any) {
-      setError(getErrorMsg(err, 'Failed to save configuration'));
+      setError(getApiErrorMessage(err, 'Failed to save configuration'));
     } finally {
       setSaving(false);
     }
@@ -139,7 +130,7 @@ const SyncConfigSection: React.FC = () => {
       // Redirect in same window — Microsoft OAuth works best this way
       window.location.href = res.auth_url;
     } catch (err: any) {
-      setError(getErrorMsg(err, 'Failed to get authorization URL'));
+      setError(getApiErrorMessage(err, 'Failed to get authorization URL'));
     }
   };
 
@@ -152,7 +143,7 @@ const SyncConfigSection: React.FC = () => {
       setSyncResult(res);
       await loadStatus();
     } catch (err: any) {
-      setError(getErrorMsg(err, 'Sync failed'));
+      setError(getApiErrorMessage(err, 'Sync failed'));
     } finally {
       setSyncing(false);
     }
@@ -165,7 +156,7 @@ const SyncConfigSection: React.FC = () => {
       await saveEmailSyncConfig({ sync_enabled: updated.sync_enabled });
     } catch (err: any) {
       setConfig(prev => ({ ...prev, sync_enabled: !updated.sync_enabled }));
-      setError(getErrorMsg(err, 'Failed to toggle sync'));
+      setError(getApiErrorMessage(err, 'Failed to toggle sync'));
     }
   };
 
@@ -285,7 +276,7 @@ const ReviewQueueSection: React.FC = () => {
       setReviews(res);
     } catch (err: any) {
       console.error('Review queue error:', err);
-      setError(getErrorMsg(err, 'Failed to load review queue'));
+      setError(getApiErrorMessage(err, 'Failed to load review queue'));
     } finally {
       setLoading(false);
     }
@@ -299,7 +290,7 @@ const ReviewQueueSection: React.FC = () => {
       await approveClosureReview(id);
       setReviews(prev => prev.filter(r => r.id !== id));
     } catch (err: any) {
-      setError(getErrorMsg(err, 'Failed to approve'));
+      setError(getApiErrorMessage(err, 'Failed to approve'));
     } finally {
       setActionLoading(null);
     }
@@ -311,7 +302,7 @@ const ReviewQueueSection: React.FC = () => {
       await dismissClosureReview(id);
       setReviews(prev => prev.filter(r => r.id !== id));
     } catch (err: any) {
-      setError(getErrorMsg(err, 'Failed to dismiss'));
+      setError(getApiErrorMessage(err, 'Failed to dismiss'));
     } finally {
       setActionLoading(null);
     }
@@ -390,11 +381,11 @@ const RecentEmailsSection: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      // Load recent emails (leadId 0 = recent/all)
+      // Load recent matched emails (leadId 0 = dashboard feed)
       const res = await getLeadEmails(0);
       setEmails(res);
     } catch (err: any) {
-      setError(getErrorMsg(err, 'Failed to load recent emails'));
+      setError(getApiErrorMessage(err, 'Failed to load recent emails'));
       setEmails([]);
     } finally {
       setLoading(false);
@@ -420,30 +411,9 @@ const RecentEmailsSection: React.FC = () => {
     );
   };
 
-  const matchBadge = (email: EmailMessage) => {
-    if (email.matched_lead_id) {
-      return (
-        <span style={{
-          padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600,
-          background: '#dcfce7', color: '#166534',
-        }}>
-          Matched
-        </span>
-      );
-    }
-    return (
-      <span style={{
-        padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600,
-        background: '#f3f4f6', color: '#6b7280',
-      }}>
-        Unmatched
-      </span>
-    );
-  };
-
   return (
     <div style={cardStyle}>
-      <h2 style={{ fontSize: 18, fontWeight: 700, color: '#1a1a2e', marginBottom: 16 }}>Recent Email Activity</h2>
+      <h2 style={{ fontSize: 18, fontWeight: 700, color: '#1a1a2e', marginBottom: 16 }}>Recent Matched Email Activity</h2>
 
       {error && <div style={{ color: '#c91414', marginBottom: 12, fontSize: 13 }}>{error}</div>}
       {loading && <p style={{ color: '#999', fontSize: 13 }}>Loading...</p>}
@@ -455,7 +425,6 @@ const RecentEmailsSection: React.FC = () => {
               <th style={thStyle}>Sender</th>
               <th style={thStyle}>Subject</th>
               <th style={thStyle}>Received</th>
-              <th style={thStyle}>Match Status</th>
               <th style={thStyle}>Matched Lead</th>
               <th style={thStyle}>Sentiment</th>
             </tr>
@@ -470,7 +439,6 @@ const RecentEmailsSection: React.FC = () => {
                   </span>
                 </td>
                 <td style={tdStyle}>{fmtDate(e.received_at)}</td>
-                <td style={tdStyle}>{matchBadge(e)}</td>
                 <td style={tdStyle}>
                   {e.matched_lead_id ? (
                     <Link
@@ -480,7 +448,8 @@ const RecentEmailsSection: React.FC = () => {
                     >
                       {e.lead_first_name || e.lead_last_name
                         ? `${e.lead_first_name || ''} ${e.lead_last_name || ''}`.trim()
-                        : `Lead #${e.matched_lead_id}`}
+                        : 'Lead'}
+                      {` (#${e.matched_lead_id})`}
                     </Link>
                   ) : '-'}
                 </td>
@@ -488,7 +457,7 @@ const RecentEmailsSection: React.FC = () => {
               </tr>
             ))}
             {emails.length === 0 && !loading && (
-              <tr><td colSpan={6} style={{ ...tdStyle, textAlign: 'center', color: '#999' }}>No recent emails</td></tr>
+              <tr><td colSpan={5} style={{ ...tdStyle, textAlign: 'center', color: '#999' }}>No matched emails yet</td></tr>
             )}
           </tbody>
         </table>

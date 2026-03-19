@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { getUnassignedLeads, deleteLead } from '../../services/api';
 import type { ExtendedLead } from '../../types';
 import AssignDealerModal from './AssignDealerModal';
+import { getApiErrorMessage } from '../../utils/apiErrors';
 
 interface UnassignedLeadsListProps {
   onLeadAssigned?: () => void;
@@ -26,7 +27,7 @@ const UnassignedLeadsList: React.FC<UnassignedLeadsListProps> = ({ onLeadAssigne
       const result = await getUnassignedLeads();
       setLeads(result.leads ?? result as any);
     } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Failed to load unassigned leads.');
+      setError(getApiErrorMessage(err, 'Failed to load unassigned leads.'));
       setLeads([]);
     } finally {
       setLoading(false);
@@ -45,7 +46,7 @@ const UnassignedLeadsList: React.FC<UnassignedLeadsListProps> = ({ onLeadAssigne
       await deleteLead(leadId);
       setLeads((prev) => prev.filter((l) => l.id !== leadId));
     } catch (err: any) {
-      alert(err?.response?.data?.detail || 'Failed to delete lead.');
+      alert(getApiErrorMessage(err, 'Failed to delete lead.'));
     }
   };
 

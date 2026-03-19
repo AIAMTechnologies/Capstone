@@ -5,6 +5,7 @@ import LeadDetailModal from './LeadDetailModal';
 import LeadEditModal from './LeadEditModal';
 import LeadLogModal from './LeadLogModal';
 import AssignDealerModal from './AssignDealerModal';
+import { getApiErrorMessage } from '../../utils/apiErrors';
 
 const priorityColors: Record<string, string> = {
   Hot: '#e74c3c',
@@ -32,7 +33,7 @@ const ActiveLeadsList: React.FC<ActiveLeadsListProps> = ({ onRefresh }) => {
       const result = await getActiveLeads();
       setLeads(result.leads ?? result as any);
     } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Failed to load active leads.');
+      setError(getApiErrorMessage(err, 'Failed to load active leads.'));
       setLeads([]);
     } finally {
       setLoading(false);
@@ -49,7 +50,7 @@ const ActiveLeadsList: React.FC<ActiveLeadsListProps> = ({ onRefresh }) => {
       await archiveLead(leadId);
       setLeads((prev) => prev.filter((l) => l.id !== leadId));
     } catch (err: any) {
-      alert(err?.response?.data?.detail || 'Failed to archive lead.');
+      alert(getApiErrorMessage(err, 'Failed to archive lead.'));
     }
   };
 
