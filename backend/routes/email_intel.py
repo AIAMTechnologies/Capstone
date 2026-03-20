@@ -1,12 +1,10 @@
 import json
 import os
 import logging
-import hashlib
 import html
 import threading
 import asyncio
 from datetime import datetime, timedelta
-from math import sqrt
 from copy import deepcopy
 from typing import Optional, List, Tuple
 from urllib.parse import urlencode
@@ -32,15 +30,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ENCRYPTION_KEY = os.getenv("EMAIL_ENCRYPTION_KEY")
 OPENAI_EMAIL_MODEL_CANDIDATES = [
     model.strip()
-    for model in os.getenv("OPENAI_EMAIL_MODELS", "gpt-5-nano,gpt-4o-mini").split(",")
+    for model in os.getenv("OPENAI_EMAIL_MODELS", "gpt-4.1-nano,gpt-4o-mini").split(",")
     if model.strip()
 ]
 OPENAI_REASONING_MODEL_CANDIDATES = [
     model.strip()
-    for model in os.getenv("OPENAI_REASONING_MODELS", "gpt-5-mini,gpt-4o-mini").split(",")
+    for model in os.getenv("OPENAI_REASONING_MODELS", "gpt-4.1-mini,gpt-4o-mini").split(",")
     if model.strip()
 ]
-OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 ANTHROPIC_REASONING_MODEL = os.getenv("ANTHROPIC_REASONING_MODEL", "claude-sonnet-4-20250514")
 
 # Env-based MS config (auto-seeds DB on first access)
@@ -50,24 +47,8 @@ MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
 MS_REDIRECT_URI = os.getenv("MS_REDIRECT_URI", "http://localhost:8000/api/email-intel/oauth/callback-redirect")
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-MAX_EMAIL_BODY_CHARS = _env_int("EMAIL_INTEL_MAX_BODY_CHARS", 1200)
-EMBEDDING_CANDIDATE_LIMIT = _env_int("EMAIL_INTEL_EMBEDDING_CANDIDATE_LIMIT", 8)
-EMBEDDING_SCORE_THRESHOLD = _env_float("EMAIL_INTEL_EMBEDDING_SCORE_THRESHOLD", 0.45)
-EMBEDDING_GAP_THRESHOLD = _env_float("EMAIL_INTEL_EMBEDDING_GAP_THRESHOLD", 0.03)
+MAX_EMAIL_BODY_CHARS = 600  # Keep short for speed — subject + preview is usually enough
+AI_BATCH_SIZE = 8  # Process this many AI calls concurrently
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +222,6 @@ def _upsert_sync_config(**kwargs):
 
 import re as _re
 
-_embedding_cache: dict[str, List[float]] = {}
 
 def _extract_json(text: str) -> dict:
     """Extract JSON from AI response, handling markdown code fences."""
@@ -254,9 +234,8 @@ def _extract_json(text: str) -> dict:
     except json.JSONDecodeError:
         obj_match = _re.search(r'\{.*\}', text, _re.DOTALL)
         if obj_match:
-            candidate = obj_match.group(0)
             try:
-                return json.loads(candidate)
+                return json.loads(obj_match.group(0))
             except json.JSONDecodeError:
                 pass
         raise
@@ -294,6 +273,26 @@ _DEFAULT_AI_RESULT = {
     "deal_stage": "inquiry",
 }
 
+# --- Cost tracking ---
+# Pricing per 1M tokens (USD)
+_MODEL_PRICING = {
+    "gpt-4.1-nano":  {"input": 0.10, "output": 0.40},
+    "gpt-4o-mini":   {"input": 0.15, "output": 0.60},
+    "gpt-4.1-mini":  {"input": 0.40, "output": 1.60},
+    "gpt-4.1":       {"input": 2.00, "output": 8.00},
+    "gpt-4o":        {"input": 2.50, "output": 10.00},
+    "gpt-5-nano":    {"input": 0.10, "output": 0.40},
+    "gpt-5-mini":    {"input": 0.30, "output": 1.20},
+}
+_cost_tracker_lock = threading.Lock()
+_cost_tracker = {
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "total_cost_usd": 0.0,
+    "calls": 0,
+    "by_model": {},
+}
+
 
 def _normalize_email_text(value: str, max_chars: Optional[int] = None) -> str:
     if not value:
@@ -310,20 +309,13 @@ def _normalize_phone(value: str) -> str:
     return "".join(ch for ch in value if ch.isdigit())
 
 
-def _name_tokens(value: str) -> List[str]:
-    return [
-        token
-        for token in _re.findall(r"[a-zA-Z]+", (value or "").lower())
-        if len(token) >= 2 and token not in {"re", "fw", "fwd", "mr", "mrs", "ms"}
-    ]
-
-
 def _openai_json_completion(
     system_prompt: str,
     user_prompt: str,
     model_candidates: List[str],
-    max_tokens: int,
+    max_tokens: int = 200,
 ) -> Tuple[Optional[dict], Optional[str]]:
+    """Try each model candidate in order until one succeeds."""
     client = _get_openai_client()
     if client is None:
         return None, None
@@ -338,7 +330,7 @@ def _openai_json_completion(
                     {"role": "user", "content": user_prompt},
                 ],
             }
-            if model.startswith("gpt-5"):
+            if model.startswith(("gpt-5", "o3", "o4")):
                 request_kwargs["max_completion_tokens"] = max_tokens
             else:
                 request_kwargs["max_tokens"] = max_tokens
@@ -346,7 +338,27 @@ def _openai_json_completion(
 
             response = client.chat.completions.create(**request_kwargs)
             content = response.choices[0].message.content or "{}"
-            return _extract_json(content), model
+
+            # Track token usage & cost
+            usage = response.usage
+            if usage:
+                inp = usage.prompt_tokens or 0
+                out = usage.completion_tokens or 0
+                pricing = _MODEL_PRICING.get(model, {"input": 0.15, "output": 0.60})
+                cost = (inp * pricing["input"] / 1_000_000) + (out * pricing["output"] / 1_000_000)
+                with _cost_tracker_lock:
+                    _cost_tracker["total_input_tokens"] += inp
+                    _cost_tracker["total_output_tokens"] += out
+                    _cost_tracker["total_cost_usd"] += cost
+                    _cost_tracker["calls"] += 1
+                    if model not in _cost_tracker["by_model"]:
+                        _cost_tracker["by_model"][model] = {"input": 0, "output": 0, "cost": 0.0, "calls": 0}
+                    _cost_tracker["by_model"][model]["input"] += inp
+                    _cost_tracker["by_model"][model]["output"] += out
+                    _cost_tracker["by_model"][model]["cost"] += cost
+                    _cost_tracker["by_model"][model]["calls"] += 1
+
+            return json.loads(content), model
         except Exception as exc:
             logger.warning("OpenAI JSON call failed for %s: %s", model, exc)
 
@@ -356,12 +368,11 @@ def _openai_json_completion(
 def _anthropic_json_completion(
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int,
+    max_tokens: int = 200,
 ) -> Tuple[Optional[dict], Optional[str]]:
     client = _get_anthropic_client()
     if client is None:
         return None, None
-
     try:
         response = client.messages.create(
             model=ANTHROPIC_REASONING_MODEL,
@@ -371,7 +382,7 @@ def _anthropic_json_completion(
         )
         return _extract_json(response.content[0].text), ANTHROPIC_REASONING_MODEL
     except Exception as exc:
-        logger.warning("Anthropic JSON call failed for %s: %s", ANTHROPIC_REASONING_MODEL, exc)
+        logger.warning("Anthropic JSON call failed: %s", exc)
         return None, None
 
 
@@ -380,6 +391,7 @@ def _reasoning_json_completion(
     user_prompt: str,
     max_tokens: int = 300,
 ) -> Tuple[Optional[dict], Optional[str]]:
+    """Try OpenAI reasoning models first, fall back to Anthropic."""
     result, model = _openai_json_completion(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
@@ -388,7 +400,6 @@ def _reasoning_json_completion(
     )
     if result is not None:
         return result, model
-
     return _anthropic_json_completion(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
@@ -396,44 +407,10 @@ def _reasoning_json_completion(
     )
 
 
-def _get_embedding(text: str, cache_key: Optional[str] = None) -> Optional[List[float]]:
-    if not text.strip():
-        return None
-    if cache_key and cache_key in _embedding_cache:
-        return _embedding_cache[cache_key]
-
-    client = _get_openai_client()
-    if client is None:
-        return None
-
-    try:
-        response = client.embeddings.create(
-            model=OPENAI_EMBEDDING_MODEL,
-            input=text[:4000],
-        )
-        embedding = response.data[0].embedding
-        if cache_key:
-            _embedding_cache[cache_key] = embedding
-        return embedding
-    except Exception as exc:
-        logger.warning("OpenAI embedding call failed for %s: %s", OPENAI_EMBEDDING_MODEL, exc)
-        return None
-
-
-def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
-    denominator = sqrt(sum(a * a for a in vec_a)) * sqrt(sum(b * b for b in vec_b))
-    if not denominator:
-        return 0.0
-    return sum(a * b for a, b in zip(vec_a, vec_b)) / denominator
-
-
 async def analyze_email_with_ai(
     email_body: str, email_subject: str, lead_data: dict = None
 ) -> dict:
-    """
-    Use the cheapest configured OpenAI model for bulk parsing, with fallback
-    to a known working model if the preferred one is unavailable.
-    """
+    """Use cheapest available OpenAI model for email analysis."""
     lead_context = ""
     if lead_data:
         lead_context = (
@@ -454,151 +431,228 @@ async def analyze_email_with_ai(
             f"{lead_context}"
         ),
         model_candidates=OPENAI_EMAIL_MODEL_CANDIDATES,
-        max_tokens=200,
     )
     if result is None:
-        logger.error("AI email analysis failed for all configured OpenAI models")
         return dict(_DEFAULT_AI_RESULT)
-
     logger.info("Email analysis completed with model %s", model)
+    return {**dict(_DEFAULT_AI_RESULT), **result}
+
+
+# ---------------------------------------------------------------------------
+# Lead matching — match the OTHER party in the email (not the mailbox owner)
+# ---------------------------------------------------------------------------
+
+def _load_leads_cache(mailbox_email: str = "") -> dict:
+    """
+    Pre-load ALL leads into in-memory lookup dicts for fast matching.
+    Called once per sync, NOT per email.
+    Returns dict with lookup tables.
+    """
+    mailbox_email = mailbox_email.lower().strip()
+    exclude_clause = ""
+    exclude_params: tuple = ()
+    if mailbox_email:
+        exclude_clause = " WHERE LOWER(email) != %s"
+        exclude_params = (mailbox_email,)
+
+    rows = execute_query(
+        f"SELECT id, email, dealer_email, first_name, last_name, phone, created_at "
+        f"FROM leads{exclude_clause} ORDER BY created_at DESC",
+        exclude_params,
+    ) or []
+
+    # Build lookup dicts
+    by_email: dict[str, int] = {}          # lowercase email -> lead id
+    by_dealer_email: dict[str, int] = {}   # lowercase dealer_email -> lead id
+    by_name: dict[str, int] = {}           # "first last" -> lead id
+    phones: list[tuple[int, str]] = []     # [(lead_id, normalized_phone), ...]
+
+    for r in rows:
+        lid = r["id"]
+        email = (r.get("email") or "").lower().strip()
+        dealer_email = (r.get("dealer_email") or "").lower().strip()
+        first = (r.get("first_name") or "").lower().strip()
+        last = (r.get("last_name") or "").lower().strip()
+        phone = _normalize_phone((r.get("phone") or "").strip())
+
+        # First match wins (rows are ordered by created_at DESC = newest first)
+        if email and email not in by_email:
+            by_email[email] = lid
+        if dealer_email and dealer_email not in by_dealer_email:
+            by_dealer_email[dealer_email] = lid
+        if first and last:
+            name_key = f"{first} {last}"
+            if name_key not in by_name:
+                by_name[name_key] = lid
+        if (
+            phone
+            and len(phone) >= 10
+            and not phone.startswith("0000")
+            and len(set(phone)) > 2
+        ):
+            phones.append((lid, phone))
+
+    print(f"[EMAIL_INTEL] Leads cache loaded: {len(rows)} leads, {len(by_email)} emails, {len(by_dealer_email)} dealer emails, {len(by_name)} names, {len(phones)} phones", flush=True)
     return {
-        **dict(_DEFAULT_AI_RESULT),
-        **result,
+        "by_email": by_email,
+        "by_dealer_email": by_dealer_email,
+        "by_name": by_name,
+        "phones": phones,
     }
 
 
-# ---------------------------------------------------------------------------
-# Lead matching
-# ---------------------------------------------------------------------------
+def _try_auto_create_lead(email_record: dict, mailbox_email: str, leads_cache: dict) -> tuple:
+    """
+    If an email contains customer info from a form submission (Name, Email, Phone)
+    and no matching lead exists, auto-create the lead.
 
-def _build_embedding_candidates(match_emails: List[str], sender_name: str) -> List[dict]:
-    candidates: dict[int, dict] = {}
-    email_domains = {
-        email.split("@", 1)[1]
-        for email in match_emails
-        if "@" in email and "." in email.split("@", 1)[1]
-    }
+    This handles the case where Colin forwards form submissions to dealers
+    before the lead is created in Lasso/the CRM.
 
-    for domain in email_domains:
-        rows = execute_query(
-            "SELECT id, first_name, last_name, email, dealer_email, company_name, province, status "
-            "FROM leads "
-            "WHERE status NOT IN ('archived', 'dead') "
-            "AND ("
-            "  (email IS NOT NULL AND POSITION('@' IN email) > 0 AND LOWER(SPLIT_PART(email, '@', 2)) = %s) "
-            "  OR "
-            "  (dealer_email IS NOT NULL AND POSITION('@' IN dealer_email) > 0 AND LOWER(SPLIT_PART(dealer_email, '@', 2)) = %s)"
-            ") "
-            "ORDER BY created_at DESC LIMIT %s",
-            (domain, domain, EMBEDDING_CANDIDATE_LIMIT),
-        )
-        for row in rows or []:
-            candidates[row["id"]] = row
+    Returns: (lead_id, confidence, method) or (None, 0, None)
+    """
+    body = f"{email_record.get('body_text') or ''} {email_record.get('body_preview') or ''}"
+    subject = email_record.get("subject", "")
 
-    name_parts = _name_tokens(sender_name)
-    if len(name_parts) >= 2:
-        rows = execute_query(
-            "SELECT id, first_name, last_name, email, dealer_email, company_name, province, status "
-            "FROM leads "
-            "WHERE status NOT IN ('archived', 'dead') "
-            "AND LOWER(first_name) = %s AND LOWER(last_name) = %s "
-            "ORDER BY created_at DESC LIMIT %s",
-            (name_parts[0], name_parts[-1], EMBEDDING_CANDIDATE_LIMIT),
-        )
-        for row in rows or []:
-            candidates[row["id"]] = row
-    elif len(name_parts) == 1:
-        rows = execute_query(
-            "SELECT id, first_name, last_name, email, dealer_email, company_name, province, status "
-            "FROM leads "
-            "WHERE status NOT IN ('archived', 'dead') "
-            "AND (LOWER(first_name) = %s OR LOWER(last_name) = %s) "
-            "ORDER BY created_at DESC LIMIT %s",
-            (name_parts[0], name_parts[0], EMBEDDING_CANDIDATE_LIMIT),
-        )
-        for row in rows or []:
-            candidates[row["id"]] = row
+    # Only auto-create from form submissions or lead assignment emails
+    is_form = (
+        "form submission" in body.lower()
+        or "form submission" in subject.lower()
+        or "squarespace" in email_record.get("sender_email", "").lower()
+        or _re.search(r'\b(lead|Lead)\b.*-.*\d{2}/\d{2}/\d{4}', subject)
+        or "contact form submission" in subject.lower()
+        or email_record.get("sender_email", "").startswith("lead@")
+    )
+    if not is_form:
+        return (None, 0, None)
 
-    return list(candidates.values())[:EMBEDDING_CANDIDATE_LIMIT]
+    # Extract customer info — try multiple formats
+    customer_email = None
+    customer_first = None
+    customer_last = None
+    customer_phone = None
+    customer_city = None
+    customer_province = None
+    customer_company = None
+    customer_project_type = None
 
+    # Format 1: "Name: First Last" + "Email: xxx@yyy.com"
+    name_m = _re.search(r'Name:\s*([A-Z][a-z]+)\s+([A-Z][a-zA-Z\'\-]+)', body)
+    if name_m:
+        customer_first = name_m.group(1)
+        customer_last = name_m.group(2)
 
-def _match_with_embeddings(email_record: dict, candidates: List[dict]) -> Tuple[Optional[int], float, Optional[str]]:
-    if len(candidates) < 2:
-        return (None, 0.0, None)
+    # Format 2: "First Name: X" + "Last Name: Y"
+    if not customer_first:
+        fn_m = _re.search(r'First\s*Name:\s*(\S+)', body)
+        ln_m = _re.search(r'Last\s*Name:\s*(\S+)', body)
+        if fn_m and ln_m:
+            customer_first = fn_m.group(1)
+            customer_last = ln_m.group(1)
 
+    # Extract email
+    em_m = _re.search(r'Email:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', body)
+    if em_m:
+        customer_email = em_m.group(1).lower()
+
+    # Extract phone
+    ph_m = _re.search(r'Phone:\s*([(\d][\d\s().-]{8,})', body)
+    if ph_m:
+        customer_phone = ph_m.group(1).strip()
+
+    # Extract city/province
+    city_m = _re.search(r'(?:City|Location)[^:]*:\s*([^,\n]+)', body)
+    if city_m:
+        customer_city = city_m.group(1).strip()
+    prov_m = _re.search(r'Province:\s*([A-Za-z\s]+?)(?:\s*(?:Project|Phone|Email|$))', body)
+    if prov_m:
+        customer_province = prov_m.group(1).strip()
+
+    # Extract project type
+    proj_m = _re.search(r'Type of Project:\s*(\w+)', body)
+    if proj_m:
+        customer_project_type = proj_m.group(1).strip()
+
+    # Extract company
+    comp_m = _re.search(r'Company\s*Name[^:]*:\s*([^\n]+?)(?:\s*Type|\s*$)', body)
+    if comp_m:
+        val = comp_m.group(1).strip()
+        if val and val.lower() not in ("n/a", "na", "none", ""):
+            customer_company = val
+
+    # Must have at least a name AND email to create a lead
+    if not customer_email or not customer_first:
+        return (None, 0, None)
+
+    # Don't create if this email already exists in leads cache
+    if customer_email and customer_email in leads_cache["by_email"]:
+        # Already exists — return the match
+        return (leads_cache["by_email"][customer_email], 0.90, "body_email")
+
+    # Don't create if this name already exists
+    if customer_first and customer_last:
+        name_key = f"{customer_first.lower()} {customer_last.lower()}"
+        if name_key in leads_cache["by_name"]:
+            return (leads_cache["by_name"][name_key], 0.85, "body_name")
+
+    # Extract dealer info from recipients (who Colin is forwarding to)
+    recipients_raw = email_record.get("recipient_emails", "[]")
     try:
-        recipients = json.loads(email_record.get("recipient_emails") or "[]")
+        recipients = json.loads(recipients_raw) if isinstance(recipients_raw, str) else recipients_raw
     except json.JSONDecodeError:
         recipients = []
+    dealer_email = None
+    for r in recipients:
+        if r and r.lower().strip() != mailbox_email and "windowfilmcanada" not in r.lower():
+            dealer_email = r.lower().strip()
+            break
 
-    email_profile = (
-        f"Subject: {email_record.get('subject', '')}\n"
-        f"Sender: {email_record.get('sender_name', '')} <{email_record.get('sender_email', '')}>\n"
-        f"Recipients: {', '.join(recipients)}\n"
-        f"Preview: {email_record.get('body_preview', '')}\n"
-        f"Body: {_normalize_email_text(email_record.get('body_text', ''), MAX_EMAIL_BODY_CHARS)}"
+    # Create the lead
+    full_name = f"{customer_first or ''} {customer_last or ''}".strip()
+    result = execute_query(
+        """INSERT INTO leads (
+            name, first_name, last_name, email, phone,
+            city, province, company_name, project_type,
+            dealer_email, source, status, email_match_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id""",
+        (
+            full_name, customer_first, customer_last, customer_email or "",
+            customer_phone or "", customer_city or "", customer_province or "",
+            customer_company or "", customer_project_type or "",
+            dealer_email or "", "Email Auto-Created", "active", 1,
+        ),
     )
-    email_embedding = _get_embedding(
-        email_profile,
-        cache_key=f"email:{hashlib.sha1(email_profile.encode('utf-8')).hexdigest()}",
-    )
-    if email_embedding is None:
-        return (None, 0.0, None)
+    if result:
+        new_id = result[0]["id"]
+        # Update the in-memory cache so subsequent emails can match
+        if customer_email:
+            leads_cache["by_email"][customer_email] = new_id
+        if customer_first and customer_last:
+            name_key = f"{customer_first.lower()} {customer_last.lower()}"
+            leads_cache["by_name"][name_key] = new_id
+        print(f"[EMAIL_INTEL] AUTO-CREATED Lead #{new_id}: {full_name} ({customer_email}) from '{email_record.get('subject', '')[:50]}'", flush=True)
+        return (new_id, 0.95, "auto_created")
 
-    scores: List[Tuple[float, int]] = []
-    for candidate in candidates:
-        lead_profile = (
-            f"Lead name: {(candidate.get('first_name') or '').strip()} {(candidate.get('last_name') or '').strip()}\n"
-            f"Primary email: {candidate.get('email') or ''}\n"
-            f"Dealer email: {candidate.get('dealer_email') or ''}\n"
-            f"Company: {candidate.get('company_name') or ''}\n"
-            f"Province: {candidate.get('province') or ''}\n"
-            f"Status: {candidate.get('status') or ''}"
-        )
-        lead_embedding = _get_embedding(
-            lead_profile,
-            cache_key=f"lead:{candidate['id']}",
-        )
-        if lead_embedding is None:
-            continue
-        scores.append((_cosine_similarity(email_embedding, lead_embedding), candidate["id"]))
-
-    if not scores:
-        return (None, 0.0, None)
-
-    scores.sort(reverse=True)
-    best_score, best_lead_id = scores[0]
-    second_score = scores[1][0] if len(scores) > 1 else 0.0
-
-    if best_score < EMBEDDING_SCORE_THRESHOLD:
-        return (None, 0.0, None)
-    if len(scores) > 1 and (best_score - second_score) < EMBEDDING_GAP_THRESHOLD:
-        return (None, 0.0, None)
-
-    confidence = min(0.9, max(0.55, round(best_score, 2)))
-    return (best_lead_id, confidence, "embedding")
+    return (None, 0, None)
 
 
-def match_email_to_lead(email_record: dict):
+def match_email_to_lead(email_record: dict, mailbox_email: str = "", leads_cache: dict | None = None):
     """
     Match the OTHER party in the email to a lead.
-    The connected mailbox owner (e.g. cmacleod@windowfilmcanada.ca) is excluded —
-    we want to find which customer/dealer lead this conversation is about.
+    The connected mailbox owner and all their lead records are EXCLUDED.
 
     For inbound emails: match the SENDER to a lead.
     For outbound emails: match the RECIPIENT(S) to a lead.
 
-    Match priority:
-    1. Exact email address match
-    2. Name match (sender name for inbound)
-    3. Phone match (phone number in email body)
+    Uses pre-loaded leads_cache for O(1) lookups — NO database calls.
 
     Returns: (lead_id, confidence, method) or (None, 0, None)
     """
-    # Get connected mailbox email to exclude from matching
-    config = _get_sync_config()
-    mailbox_email = (config.get("user_email") or "").lower().strip() if config else ""
-    # Also exclude common company domain emails
+    if not leads_cache:
+        return (None, 0, None)
+
+    mailbox_email = mailbox_email.lower().strip()
     mailbox_domain = mailbox_email.split("@")[-1] if mailbox_email else ""
 
     sender = (email_record.get("sender_email") or "").lower().strip()
@@ -615,68 +669,71 @@ def match_email_to_lead(email_record: dict):
 
     # Determine which emails belong to the "other party" (not the mailbox owner)
     if direction == "outbound":
-        # Outbound: match recipients (excluding the mailbox owner)
         match_emails = [r.lower().strip() for r in recipients if r and r.lower().strip() != mailbox_email]
     else:
-        # Inbound: match sender (if it's not the mailbox owner)
         if sender and sender != mailbox_email:
             match_emails = [sender]
         else:
-            # Sender is mailbox owner somehow — try recipients
             match_emails = [r.lower().strip() for r in recipients if r and r.lower().strip() != mailbox_email]
 
-    # Filter out same-domain emails (internal company emails aren't leads)
+    # Filter out same-domain emails (internal company emails aren't customer leads)
     if mailbox_domain:
         external_emails = [e for e in match_emails if not e.endswith(f"@{mailbox_domain}")]
-        # Only use external filter if it leaves us with candidates
         if external_emails:
             match_emails = external_emails
 
-    # --- 1. Exact email match ---
-    if match_emails:
-        placeholders = ", ".join(["%s"] * len(match_emails))
-        rows = execute_query(
-            f"SELECT id, first_name, last_name, email FROM leads WHERE LOWER(email) IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
-            tuple(match_emails),
-        )
-        if rows:
-            return (rows[0]["id"], 1.0, "email")
+    by_email = leads_cache["by_email"]
+    by_dealer_email = leads_cache["by_dealer_email"]
+    by_name = leads_cache["by_name"]
+    phones = leads_cache["phones"]
 
-        # Also check dealer_email field
-        rows = execute_query(
-            f"SELECT id FROM leads WHERE LOWER(dealer_email) IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
-            tuple(match_emails),
-        )
-        if rows:
-            return (rows[0]["id"], 0.95, "dealer_email")
+    # --- 1. Exact email match ---
+    for em in match_emails:
+        if em in by_email:
+            return (by_email[em], 1.0, "email")
+    for em in match_emails:
+        if em in by_dealer_email:
+            return (by_dealer_email[em], 0.95, "dealer_email")
 
     # --- 2. Name match (for inbound from external sender) ---
     if direction == "inbound" and sender_name and sender != mailbox_email:
         parts = sender_name.split()
         if len(parts) >= 2:
-            rows = execute_query(
-                "SELECT id FROM leads WHERE LOWER(first_name) = %s AND LOWER(last_name) = %s ORDER BY created_at DESC LIMIT 1",
-                (parts[0], parts[-1]),
-            )
-            if rows:
-                return (rows[0]["id"], 0.85, "name")
+            name_key = f"{parts[0]} {parts[-1]}"
+            if name_key in by_name:
+                return (by_name[name_key], 0.85, "name")
 
-    # --- 3. Phone match ---
-    if body and match_emails:
-        leads_with_phone = execute_query(
-            "SELECT id, phone FROM leads WHERE phone IS NOT NULL AND phone != '' ORDER BY created_at DESC LIMIT 500"
-        )
+    # --- 3. Email-in-body match (lead assignment emails contain customer email in body) ---
+    body_emails = _re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', body)
+    body_emails = [
+        e.lower() for e in body_emails
+        if e.lower() != mailbox_email
+        and not e.lower().endswith(f"@{mailbox_domain}" if mailbox_domain else "@impossible")
+        and "noreply" not in e.lower()
+        and "no-reply" not in e.lower()
+        and "squarespace" not in e.lower()
+    ]
+    for em in body_emails:
+        if em in by_email:
+            return (by_email[em], 0.90, "body_email")
+
+    # --- 4. Name-in-body match (form submissions contain "Name: First Last") ---
+    name_match = _re.search(r'Name:\s*([A-Z][a-z]+)\s+([A-Z][a-zA-Z\'\-]+)', body)
+    if name_match:
+        body_first = name_match.group(1).lower()
+        body_last = name_match.group(2).lower()
+        name_key = f"{body_first} {body_last}"
+        if name_key in by_name:
+            return (by_name[name_key], 0.85, "body_name")
+
+    # --- 5. Phone match (strict: 10+ digit real phone numbers only) ---
+    if body:
         normalized_body = _normalize_phone(body)
-        for lead in leads_with_phone or []:
-            phone = _normalize_phone((lead.get("phone") or "").strip())
-            if phone and len(phone) >= 7 and phone in normalized_body:
-                return (lead["id"], 0.75, "phone")
+        for lead_id, phone in phones:
+            if phone in normalized_body:
+                return (lead_id, 0.75, "phone")
 
-    candidates = _build_embedding_candidates(match_emails, sender_name)
-    lead_id, confidence, method = _match_with_embeddings(email_record, candidates)
-    if lead_id:
-        return (lead_id, confidence, method)
-
+    # No match found
     return (None, 0, None)
 
 
@@ -751,7 +808,6 @@ async def check_closure_candidates():
                 f"{(datetime.utcnow() - cand['last_email_at']).days if cand.get('last_email_at') else '?'}\n"
                 f"Recent email summaries:\n{summaries}"
             ),
-            max_tokens=200,
         )
         if ai_result is not None:
             if not ai_result.get("should_flag", False):
@@ -1047,8 +1103,8 @@ async def sync_emails(current_user: AdminUser = Depends(get_current_user)):
         }
 
     now = datetime.utcnow()
-    if _last_sync_time and (now - _last_sync_time).total_seconds() < 300:
-        raise HTTPException(status_code=429, detail="Sync rate limited. Wait 5 minutes between syncs.")
+    if _last_sync_time and (now - _last_sync_time).total_seconds() < 30:
+        raise HTTPException(status_code=429, detail="Sync rate limited. Wait 30 seconds between syncs.")
 
     config = _get_sync_config_decrypted()
     if not config or not config.get("access_token"):
@@ -1085,14 +1141,61 @@ async def sync_emails(current_user: AdminUser = Depends(get_current_user)):
     }
 
 
+def _propagate_thread_matches() -> int:
+    """
+    For every conversation that has at least one matched email,
+    propagate the lead match to all unmatched emails in the same conversation.
+    This connects dealer replies, follow-ups, and forwarded chains to the lead.
+    """
+    propagated = 0
+
+    # Find conversations where at least one email is matched
+    matched_threads = execute_query("""
+        SELECT DISTINCT conversation_id, matched_lead_id
+        FROM email_messages
+        WHERE conversation_id IS NOT NULL AND conversation_id != ''
+          AND matched_lead_id IS NOT NULL
+    """)
+    if not matched_threads:
+        return 0
+
+    for thread in matched_threads:
+        conv_id = thread["conversation_id"]
+        lead_id = thread["matched_lead_id"]
+
+        # Update all unmatched emails in this conversation
+        result = execute_query(
+            """UPDATE email_messages
+               SET matched_lead_id = %s, match_confidence = 0.80, match_method = 'thread'
+               WHERE conversation_id = %s
+                 AND (matched_lead_id IS NULL)
+               RETURNING id""",
+            (lead_id, conv_id),
+        )
+        count = len(result) if result else 0
+        if count > 0:
+            propagated += count
+            # Update lead email counters
+            execute_query(
+                "UPDATE leads SET email_match_count = email_match_count + %s WHERE id = %s",
+                (count, lead_id),
+                fetch=False,
+            )
+
+    return propagated
+
+
 async def _perform_sync_job(started_by: str):
     try:
+        print("[EMAIL_INTEL] Sync job starting...", flush=True)
         config = _get_sync_config_decrypted()
         if not config or not config.get("access_token"):
             raise RuntimeError("OAuth not configured or not authorised.")
 
+        print("[EMAIL_INTEL] Config loaded, refreshing token...", flush=True)
         _update_sync_state(current_phase="Refreshing access token")
         token = _refresh_access_token(config)
+        print(f"[EMAIL_INTEL] Token ready, starting inbox sync...", flush=True)
 
         synced = 0
         matched = 0
@@ -1100,8 +1203,8 @@ async def _perform_sync_job(started_by: str):
         _update_sync_state(current_phase="Syncing inbox")
         url = (
             f"{GRAPH_BASE}/me/messages?"
-            "$top=50&$orderby=receivedDateTime desc"
-            "&$select=id,subject,from,toRecipients,bodyPreview,body,receivedDateTime,isRead"
+            "$top=1000&$orderby=receivedDateTime desc"
+            "&$select=id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,isRead,conversationId"
         )
         synced_inbound, matched_inbound = await _sync_messages(token, url, direction="inbound")
         synced += synced_inbound
@@ -1111,13 +1214,21 @@ async def _perform_sync_job(started_by: str):
         _update_sync_state(current_phase="Syncing sent mail")
         url_sent = (
             f"{GRAPH_BASE}/me/mailFolders/SentItems/messages?"
-            "$top=50&$orderby=receivedDateTime desc"
-            "&$select=id,subject,from,toRecipients,bodyPreview,body,receivedDateTime,isRead"
+            "$top=1000&$orderby=receivedDateTime desc"
+            "&$select=id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,isRead,conversationId"
         )
         synced_outbound, matched_outbound = await _sync_messages(token, url_sent, direction="outbound")
         synced += synced_outbound
         matched += matched_outbound
         _update_sync_state(synced=synced, matched=matched)
+
+        # --- Thread propagation: if any email in a conversation matched,
+        #     propagate that match to ALL emails in the same conversation ---
+        _update_sync_state(current_phase="Propagating thread matches")
+        thread_matched = _propagate_thread_matches()
+        matched += thread_matched
+        _update_sync_state(matched=matched)
+        print(f"[EMAIL_INTEL] Thread propagation: {thread_matched} additional matches", flush=True)
 
         _upsert_sync_config(last_sync_at=datetime.utcnow())
 
@@ -1142,6 +1253,9 @@ async def _perform_sync_job(started_by: str):
         )
         audit_log("EMAIL_SYNC", f"Synced {synced} emails, matched {matched}, flagged {flagged}", started_by)
     except Exception as exc:
+        import traceback
+        print(f"[EMAIL_INTEL] SYNC FAILED: {exc}")
+        traceback.print_exc()
         logger.exception("Email sync job failed")
         _update_sync_state(
             is_running=False,
@@ -1153,27 +1267,44 @@ async def _perform_sync_job(started_by: str):
 
 
 async def _sync_messages(token: str, url: str, direction: str = "inbound"):
-    """Paginate through Graph messages and sync them."""
+    """
+    Paginate through Graph messages and sync them.
+    Fast: parallel AI calls in batches, skips AI for unmatched emails.
+    """
     synced = 0
     matched = 0
 
+    # Cache mailbox email once
+    config = _get_sync_config()
+    mailbox_email = (config.get("user_email") or "").lower().strip() if config else ""
+
+    # Pre-load existing message IDs to skip duplicates instantly
+    existing_ids_rows = execute_query("SELECT ms_message_id FROM email_messages")
+    existing_ids = {r["ms_message_id"] for r in (existing_ids_rows or [])}
+
+    # Pre-load ALL leads into memory for fast matching (1 DB query instead of thousands)
+    leads_cache = _load_leads_cache(mailbox_email)
+
+    page_num = 0
     while url:
+        page_num += 1
+        print(f"[EMAIL_INTEL] Fetching page {page_num} from Graph API...", flush=True)
         data = _graph_get(token, url)
         messages = data.get("value", [])
+        print(f"[EMAIL_INTEL] Page {page_num}: got {len(messages)} messages", flush=True)
         if not messages:
             break
 
-        for msg in messages:
+        # --- Phase 1: Parse all messages in this page & match leads (fast, no AI) ---
+        print(f"[EMAIL_INTEL] Page {page_num}: Phase 1 — matching leads...", flush=True)
+        page_records = []
+        skipped = 0
+        for msg_idx, msg in enumerate(messages):
+            if msg_idx % 100 == 0 and msg_idx > 0:
+                print(f"[EMAIL_INTEL]   ... processed {msg_idx}/{len(messages)} messages", flush=True)
             ms_id = msg.get("id")
-            if not ms_id:
-                continue
-
-            # Skip already-synced
-            existing = execute_query(
-                "SELECT id FROM email_messages WHERE ms_message_id = %s",
-                (ms_id,),
-            )
-            if existing:
+            if not ms_id or ms_id in existing_ids:
+                skipped += 1
                 continue
 
             from_obj = msg.get("from", {}).get("emailAddress", {})
@@ -1183,81 +1314,128 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
                 r.get("emailAddress", {}).get("address", "")
                 for r in msg.get("toRecipients", [])
             ]
-            # Full body used transiently for AI analysis, NOT stored permanently
-            body_text = _normalize_email_text(msg.get("body", {}).get("content") or "", 10000)
-            body_preview = _normalize_email_text(msg.get("bodyPreview", "") or "", 200)
+            # Get full body content (HTML), strip tags for text matching
+            full_body_html = (msg.get("body", {}) or {}).get("content", "") or ""
+            # Strip HTML tags to get plain text for matching
+            full_body_text = _re.sub(r'<[^>]+>', ' ', full_body_html)
+            full_body_text = _re.sub(r'\s+', ' ', full_body_text).strip()
+            # Use full body for matching, but store truncated preview for display
+            body_preview = _normalize_email_text(msg.get("bodyPreview", "") or full_body_text[:500], 500)
+
+            # Detect REAL direction: if sender is the mailbox owner, it's outbound
+            actual_direction = "outbound" if sender_email.lower().strip() == mailbox_email else "inbound"
             received_at = msg.get("receivedDateTime")
 
             email_record = {
                 "ms_message_id": ms_id,
+                "conversation_id": msg.get("conversationId", ""),
                 "subject": msg.get("subject", ""),
                 "sender_email": sender_email,
                 "sender_name": sender_name,
                 "recipient_emails": json.dumps(recipients),
                 "body_preview": body_preview,
-                "body_text": body_text,  # kept transiently for matching/AI
+                "body_text": full_body_text[:2000],  # Full body for matching (up to 2000 chars)
                 "received_at": received_at,
                 "is_read": msg.get("isRead", False),
-                "direction": direction,
-                "folder": "SentItems" if direction == "outbound" else "Inbox",
+                "direction": actual_direction,
+                "folder": "SentItems" if actual_direction == "outbound" else "Inbox",
             }
 
-            # Match to lead
-            lead_id, confidence, method = match_email_to_lead(email_record)
+            # Match to lead (excludes mailbox owner's lead records) — uses in-memory cache
+            lead_id, confidence, method = match_email_to_lead(email_record, mailbox_email, leads_cache)
+
+            # --- Auto-create lead from form submission emails ---
+            # If no match found AND the email contains customer info from a form submission,
+            # create a new lead so we can track it
+            if not lead_id:
+                lead_id, confidence, method = _try_auto_create_lead(email_record, mailbox_email, leads_cache)
+
             email_record["matched_lead_id"] = lead_id
             email_record["match_confidence"] = confidence
             email_record["match_method"] = method
+            page_records.append(email_record)
 
-            # AI analysis (uses full body transiently)
-            lead_data = None
-            if lead_id:
-                lead_rows = execute_query("SELECT * FROM leads WHERE id = %s", (lead_id,))
+        # --- Phase 2: Run AI analysis in PARALLEL batches (only matched emails) ---
+        ai_tasks = []
+        ai_indices = []
+        for i, rec in enumerate(page_records):
+            if rec["matched_lead_id"]:
+                lead_rows = execute_query("SELECT first_name, last_name, email, status FROM leads WHERE id = %s", (rec["matched_lead_id"],))
                 lead_data = lead_rows[0] if lead_rows else None
+                ai_tasks.append(analyze_email_with_ai(
+                    email_body=rec["body_preview"],
+                    email_subject=rec["subject"],
+                    lead_data=lead_data,
+                ))
+                ai_indices.append(i)
 
-            ai_result = await analyze_email_with_ai(
-                email_body=body_text,
-                email_subject=msg.get("subject", ""),
-                lead_data=lead_data,
-            )
-            email_record["ai_summary"] = ai_result.get("summary", "")
-            email_record["ai_sentiment"] = ai_result.get("sentiment", "neutral")
-            email_record["ai_action_items"] = json.dumps(ai_result.get("action_items", []))
-            email_record["ai_ready_to_close"] = (
-                ai_result.get("deal_stage") == "closed"
-                or ai_result.get("deal_stage") == "closing"
-            )
-            email_record["ai_close_reasoning"] = (
-                f"Deal stage: {ai_result.get('deal_stage', 'unknown')}"
-            )
-            email_record["processed_at"] = datetime.utcnow()
+        # Run all AI calls for this page concurrently
+        print(f"[EMAIL_INTEL] Page {page_num}: {len(page_records)} new records, {len(ai_tasks)} need AI analysis", flush=True)
+        if ai_tasks:
+            ai_results = await asyncio.gather(*ai_tasks, return_exceptions=True)
+            print(f"[EMAIL_INTEL] Page {page_num}: AI analysis complete", flush=True)
+        else:
+            ai_results = []
 
-            # Discard full body before DB insert -- only store body_preview
-            del email_record["body_text"]
+        # Apply AI results
+        ai_map = {}
+        for idx, ai_idx in enumerate(ai_indices):
+            result = ai_results[idx]
+            if isinstance(result, Exception):
+                logger.error("AI batch call failed: %s", result)
+                result = dict(_DEFAULT_AI_RESULT)
+            ai_map[ai_idx] = result
 
-            # Insert
-            cols = list(email_record.keys())
-            placeholders = ", ".join(["%s"] * len(cols))
-            execute_query(
-                f"INSERT INTO email_messages ({', '.join(cols)}) VALUES ({placeholders})",
-                tuple(email_record[c] for c in cols),
-                fetch=False,
-            )
-            synced += 1
-            _update_sync_state(synced=synced, matched=matched, current_phase=f"Processing {direction} email #{synced}")
+        # --- Phase 3: Insert all records into DB ---
+        for i, rec in enumerate(page_records):
+            ai_result = ai_map.get(i, _DEFAULT_AI_RESULT)
+            rec["ai_summary"] = ai_result.get("summary", "")
+            rec["ai_sentiment"] = ai_result.get("sentiment", "neutral")
+            rec["ai_action_items"] = json.dumps(ai_result.get("action_items", []))
+            rec["ai_ready_to_close"] = ai_result.get("deal_stage") in ("closed", "closing")
+            rec["ai_close_reasoning"] = f"Deal stage: {ai_result.get('deal_stage', 'unknown')}" if rec["matched_lead_id"] else ""
+            rec["processed_at"] = datetime.utcnow()
 
-            # Update lead email intel columns
-            if lead_id:
-                matched += 1
+            # Verify FK: if matched_lead_id set, confirm lead exists
+            if rec["matched_lead_id"]:
+                exists = execute_query("SELECT id FROM leads WHERE id = %s", (rec["matched_lead_id"],))
+                if not exists:
+                    print(f"[EMAIL_INTEL] WARNING: Lead #{rec['matched_lead_id']} missing, clearing match for '{rec.get('subject','')[:50]}'", flush=True)
+                    rec["matched_lead_id"] = None
+                    rec["match_confidence"] = 0
+                    rec["match_method"] = None
+
+            try:
+                # Exclude body_text from DB insert (used for matching only, not stored beyond body_preview)
+                insert_rec = {k: v for k, v in rec.items() if k != "body_text"}
+                cols = list(insert_rec.keys())
+                placeholders = ", ".join(["%s"] * len(cols))
                 execute_query(
-                    "UPDATE leads SET email_match_count = email_match_count + 1, "
-                    "last_email_activity = %s, email_sentiment = %s WHERE id = %s",
-                    (received_at, ai_result.get("sentiment", "neutral"), lead_id),
+                    f"INSERT INTO email_messages ({', '.join(cols)}) VALUES ({placeholders})",
+                    tuple(insert_rec[c] for c in cols),
                     fetch=False,
                 )
+                existing_ids.add(rec["ms_message_id"])
+                synced += 1
 
-        # Pagination
+                if rec["matched_lead_id"]:
+                    matched += 1
+                    execute_query(
+                        "UPDATE leads SET email_match_count = email_match_count + 1, "
+                        "last_email_activity = %s, email_sentiment = %s WHERE id = %s",
+                        (rec["received_at"], rec["ai_sentiment"], rec["matched_lead_id"]),
+                        fetch=False,
+                    )
+            except Exception as insert_err:
+                print(f"[EMAIL_INTEL] WARNING: Failed to insert email '{rec.get('subject','')[:50]}': {insert_err}", flush=True)
+                continue
+
+        print(f"[EMAIL_INTEL] Page {page_num} complete: total synced={synced}, matched={matched}", flush=True)
+        _update_sync_state(synced=synced, matched=matched, current_phase=f"Processing {direction} ({synced} done)")
         url = data.get("@odata.nextLink")
 
+    print(f"[EMAIL_INTEL] {direction} sync finished: synced={synced}, matched={matched}", flush=True)
+    _update_sync_state(synced=synced, matched=matched)
     return synced, matched
 
 
@@ -1280,6 +1458,9 @@ async def get_sync_status(current_user: AdminUser = Depends(get_current_user)):
     )
     pending = pending_rows[0]["cnt"] if pending_rows else 0
 
+    with _cost_tracker_lock:
+        cost_snapshot = deepcopy(_cost_tracker)
+
     return {
         "sync_enabled": config.get("sync_enabled", False) if config else False,
         "last_sync": config.get("last_sync_at") if config else None,
@@ -1297,7 +1478,15 @@ async def get_sync_status(current_user: AdminUser = Depends(get_current_user)):
             "matched": sync_state.get("matched", 0),
             "flagged_for_review": sync_state.get("flagged_for_review", 0),
         },
+        "ai_costs": cost_snapshot,
     }
+
+
+@router.get("/ai-costs")
+async def get_ai_costs(current_user: AdminUser = Depends(get_current_user)):
+    """Return AI API token usage and cost breakdown (resets on server restart)."""
+    with _cost_tracker_lock:
+        return deepcopy(_cost_tracker)
 
 
 # ---------------------------------------------------------------------------

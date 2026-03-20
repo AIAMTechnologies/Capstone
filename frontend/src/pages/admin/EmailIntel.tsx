@@ -299,6 +299,21 @@ const SyncConfigSection: React.FC = () => {
           </div>
         )}
 
+        {status?.ai_costs && status.ai_costs.calls > 0 && (
+          <div style={{ marginTop: 12, padding: 12, borderRadius: 6, background: '#f5f3ff', fontSize: 13, border: '1px solid #e5e0ff' }}>
+            <strong>AI Usage (this session):</strong>{' '}
+            {status.ai_costs.calls} calls | {status.ai_costs.total_input_tokens.toLocaleString()} input + {status.ai_costs.total_output_tokens.toLocaleString()} output tokens |{' '}
+            <span style={{ fontWeight: 700, color: (status.ai_costs.total_cost_usd * 1.44) > 0.50 ? '#c91414' : '#166534' }}>
+              ${(status.ai_costs.total_cost_usd * 1.44).toFixed(4)} CAD
+            </span>
+            {status.ai_costs.by_model && Object.keys(status.ai_costs.by_model).length > 0 && (
+              <span style={{ marginLeft: 8, color: '#888' }}>
+                ({Object.entries(status.ai_costs.by_model).map(([m, d]: [string, any]) => `${m}: ${d.calls} calls $${(d.cost * 1.44).toFixed(4)} CAD`).join(' | ')})
+              </span>
+            )}
+          </div>
+        )}
+
         {status?.sync_in_progress && status.current_sync_counts && (
           <div style={{ marginTop: 12, padding: 12, borderRadius: 6, background: '#eff6ff', fontSize: 13 }}>
             <strong>In Progress:</strong> {status.current_sync_counts.synced} emails synced, {status.current_sync_counts.matched} matched so far
