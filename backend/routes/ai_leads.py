@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from auth import AdminUser, get_current_user
 from db import execute_query
 from ai_service import ai_client
+from access_control import build_ai_pause_message
 from audit_logger import log_event
 from cost_control import build_spend_limit_message
 
@@ -112,9 +113,12 @@ Consider: commercial leads and larger square footage are typically higher priori
         )
         return result
 
+    if ai_client.last_error_meta.get("type") == "agent_paused":
+        return {"priority": "Warm", "score": 50, "reasoning": build_ai_pause_message(ai_client.last_error_meta), "suggested_actions": ["Resume AI operations in Tools"]} 
+
     spend_message = build_spend_limit_message(ai_client.last_error_meta)
     if ai_client.last_error_meta.get("type") == "spend_limit":
-        return {"priority": "Warm", "score": 50, "reasoning": spend_message, "suggested_actions": ["Review monthly and daily AI spend limits"]} 
+        return {"priority": "Warm", "score": 50, "reasoning": spend_message, "suggested_actions": ["Review monthly and daily AI spend limits"]}
 
     return {"priority": "Warm", "score": 50, "reasoning": "Unable to analyze - using default", "suggested_actions": ["Review manually"]}
 
@@ -172,6 +176,13 @@ Respond in JSON: {{"explanation": "...", "confidence": "high|medium|low", "consi
         )
         return result
 
+    if ai_client.last_error_meta.get("type") == "agent_paused":
+        return {
+            "explanation": build_ai_pause_message(ai_client.last_error_meta),
+            "confidence": "low",
+            "considerations": ["AI operations paused"],
+        }
+
     if ai_client.last_error_meta.get("type") == "spend_limit":
         return {
             "explanation": build_spend_limit_message(ai_client.last_error_meta),
@@ -224,6 +235,13 @@ Respond in JSON: {{"subject": "...", "body": "...", "tone": "professional"}}"""
     if result:
         return result
 
+    if ai_client.last_error_meta.get("type") == "agent_paused":
+        return {
+            "subject": f"Re: Window Film Project - {lead.get('city', '')}",
+            "body": build_ai_pause_message(ai_client.last_error_meta),
+            "tone": "professional",
+        }
+
     if ai_client.last_error_meta.get("type") == "spend_limit":
         return {
             "subject": f"Re: Window Film Project - {lead.get('city', '')}",
@@ -265,6 +283,14 @@ Respond in JSON:
 
     if result:
         return result
+
+    if ai_client.last_error_meta.get("type") == "agent_paused":
+        return {
+            "inferred_business_category": None,
+            "estimated_project_size": "medium",
+            "suggested_products": [build_ai_pause_message(ai_client.last_error_meta)],
+            "confidence": 0.0,
+        }
 
     if ai_client.last_error_meta.get("type") == "spend_limit":
         return {
@@ -325,6 +351,14 @@ Respond in JSON:
             (result.get('likelihood', 0.5), result.get('explanation', ''), lead_id), fetch=False
         )
         return result
+
+    if ai_client.last_error_meta.get("type") == "agent_paused":
+        return {
+            "likelihood": 0.5,
+            "label": "Possible",
+            "explanation": build_ai_pause_message(ai_client.last_error_meta),
+            "risk_factors": ["AI operations paused"],
+        }
 
     if ai_client.last_error_meta.get("type") == "spend_limit":
         return {

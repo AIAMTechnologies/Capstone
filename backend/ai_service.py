@@ -2,6 +2,7 @@ import json
 import time
 import logging
 from typing import Optional, Dict, Any
+from access_control import AIOperationsPausedError, assert_ai_operations_enabled
 from cost_control import (
     SpendLimitExceededError,
     assert_within_spend_limits,
@@ -93,6 +94,7 @@ class AIClient:
         self.last_error_meta = {}
         for attempt in range(retries):
             try:
+                assert_ai_operations_enabled()
                 assert_within_spend_limits(model)
                 started_at = timed_call_start()
                 response = client.chat.completions.create(
@@ -143,6 +145,19 @@ class AIClient:
                 if cache_key:
                     self._set_cache(cache_key, result)
                 return result
+            except AIOperationsPausedError as exc:
+                self.last_call_meta = {}
+                self.last_error_meta = exc.to_payload()
+                log_event(
+                    event_type="AI_KILL_SWITCH_BLOCK",
+                    entity_type=entity_type or "ai_operation",
+                    entity_id=entity_id,
+                    actor=actor,
+                    model_used=model,
+                    payload={**self.last_error_meta, **(payload or {})},
+                )
+                logger.info(exc.message_text)
+                return None
             except SpendLimitExceededError as exc:
                 self.last_call_meta = {}
                 self.last_error_meta = exc.to_payload()

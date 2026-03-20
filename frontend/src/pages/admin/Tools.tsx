@@ -3,6 +3,7 @@ import {
   uploadCSV, importCSV, sendMassEmail, getDealerOptions,
   getNotificationCheck, resendNotification, exportLeads, changePassword,
 } from '../../services/api';
+import AIControlPanel from '../../components/admin/AIControlPanel';
 import type { Dealer, DealerNotificationStatus, ExtendedLead } from '../../types/types';
 
 const PROVINCES = [
@@ -29,6 +30,7 @@ const thStyle: React.CSSProperties = { background: '#f8f9fa', textAlign: 'left' 
 const tdStyle: React.CSSProperties = { padding: '10px 12px', borderBottom: '1px solid #eee', fontSize: 13 };
 
 const SECTIONS = [
+  'AI Controls',
   'CSV Upload & Import',
   'Mass Email',
   'Notification Check',
@@ -62,6 +64,7 @@ const Tools: React.FC = () => {
           </div>
           {openSection === section && (
             <div style={{ ...cardStyle, borderRadius: '0 0 8px 8px', borderTop: 'none' }}>
+              {section === 'AI Controls' && <AIControlPanel />}
               {section === 'CSV Upload & Import' && <CSVSection />}
               {section === 'Mass Email' && <MassEmailSection />}
               {section === 'Notification Check' && <NotificationSection />}

@@ -1,6 +1,7 @@
 import hashlib
 
 from fastapi import APIRouter, Depends
+from access_control import build_ai_pause_message
 from auth import AdminUser, get_current_user
 from db import execute_query
 from ai_service import ai_client
@@ -190,6 +191,19 @@ async def get_insights(current_user: AdminUser = Depends(get_current_user)):
             return {"insights": ai_insights}
         combined = ai_insights + fallback
         return {"insights": combined[:4]}
+
+    if ai_client.last_error_meta.get("type") == "agent_paused":
+        return {
+            "insights": [
+                {
+                    "type": "warning",
+                    "title": "AI operations paused",
+                    "body": build_ai_pause_message(ai_client.last_error_meta),
+                    "action": "Resume AI operations in Tools when ready.",
+                },
+                *(fallback[:3] if fallback else []),
+            ][:4]
+        }
 
     if ai_client.last_error_meta.get("type") == "spend_limit":
         return {

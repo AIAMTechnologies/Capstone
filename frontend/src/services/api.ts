@@ -5,6 +5,8 @@ import type {
   LoginResponse,
   DashboardStats,
   CostTrackingSnapshot,
+  AIControlsSnapshot,
+  AISpendLimitUpdateRequest,
   LeadsResponse,
   Lead,
   LeadStatus,
@@ -120,6 +122,23 @@ export const getDashboardStats = async (): Promise<DashboardStats> => {
 
 export const getCostTracking = async (): Promise<CostTrackingSnapshot> => {
   const response = await api.get<CostTrackingSnapshot>('/admin/cost-tracking');
+  return response.data;
+};
+
+export const getAIControls = async (): Promise<AIControlsSnapshot> => {
+  const response = await api.get<AIControlsSnapshot>('/admin/ai-controls');
+  return response.data;
+};
+
+export const updateAgentEnabled = async (enabled: boolean): Promise<{ message: string; agent_enabled: boolean }> => {
+  const response = await api.post('/admin/ai-controls/agent-enabled', { enabled });
+  return response.data;
+};
+
+export const updateAISpendLimits = async (
+  payload: AISpendLimitUpdateRequest
+): Promise<{ message: string; daily_spend_limit_cad: number; monthly_spend_limit_cad: number }> => {
+  const response = await api.post('/admin/ai-controls/spend-limits', payload);
   return response.data;
 };
 

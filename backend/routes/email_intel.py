@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from auth import AdminUser, get_current_user
+from access_control import AIOperationsPausedError, assert_ai_operations_enabled
 from audit_logger import calculate_cost_cad, log_event, timed_call_latency_ms, timed_call_start
 from cost_control import SpendLimitExceededError, assert_within_spend_limits, log_spend_limit_block, record_cost_usage
 from db import execute_query, get_db_connection
@@ -677,6 +678,7 @@ def _openai_json_completion(
 
     for model in model_candidates:
         try:
+            assert_ai_operations_enabled()
             assert_within_spend_limits(model)
             started_at = timed_call_start()
             request_kwargs = {
@@ -729,6 +731,17 @@ def _openai_json_completion(
             record_cost_usage(model, inp, out, cost_cad)
 
             return json.loads(content), model
+        except AIOperationsPausedError as exc:
+            meta = exc.to_payload()
+            log_event(
+                event_type="AI_KILL_SWITCH_BLOCK",
+                entity_type="email_sync",
+                actor="system",
+                model_used=model,
+                payload={**meta, "operation": "email_intel_json_completion"},
+            )
+            logger.info(exc.message_text)
+            return None, None
         except SpendLimitExceededError as exc:
             meta = exc.to_payload()
             log_spend_limit_block(

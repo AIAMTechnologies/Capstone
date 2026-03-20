@@ -2,6 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
 
+from access_control import ensure_roles
 from auth import AdminUser, get_current_user
 from db import execute_query
 
@@ -18,6 +19,7 @@ async def get_audit_log(
     offset: int = Query(0, ge=0),
     current_user: AdminUser = Depends(get_current_user),
 ):
+    ensure_roles(current_user, {"viewer", "admin", "superadmin"})
     conditions = ["1=1"]
     params = []
 

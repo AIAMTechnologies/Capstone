@@ -104,6 +104,19 @@ export interface CostTrackingSnapshot {
   };
 }
 
+export interface AIControlsSnapshot {
+  agent_enabled: boolean;
+  daily_spend_limit_cad: number;
+  monthly_spend_limit_cad: number;
+  role: string;
+  can_manage: boolean;
+}
+
+export interface AISpendLimitUpdateRequest {
+  daily_spend_limit_cad: number;
+  monthly_spend_limit_cad: number;
+}
+
 export interface LeadsResponse {
   leads: Lead[];
   count: number;
