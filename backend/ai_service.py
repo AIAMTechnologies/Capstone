@@ -10,6 +10,7 @@ from cost_control import (
     record_cost_usage,
 )
 from db import settings
+from services.model_router import route_json_completion
 from audit_logger import calculate_cost_cad, log_event, timed_call_latency_ms, timed_call_start
 
 logger = logging.getLogger("lead_allocation")
@@ -30,13 +31,6 @@ class AIClient:
         self.last_error_meta: Dict[str, Any] = {}
 
     def _get_client(self):
-        if self._client is None:
-            try:
-                from openai import OpenAI
-                self._client = OpenAI(api_key=settings.OPENAI_API_KEY)
-            except Exception as e:
-                logger.error(f"Failed to initialize OpenAI client: {e}")
-                return None
         return self._client
 
     def _get_cache(self, key: str) -> Optional[dict]:
@@ -69,6 +63,7 @@ class AIClient:
         entity_id: Optional[str] = None,
         event_type: str = "OPENAI_API_CALL",
         payload: Optional[dict] = None,
+        task_type: str = "reasoning",
     ) -> Optional[dict]:
         """Call OpenAI and parse JSON response. Returns None on failure."""
         if not settings.OPENAI_API_KEY:
@@ -84,12 +79,6 @@ class AIClient:
                 self.last_error_meta = {}
                 return cached
 
-        client = self._get_client()
-        if not client:
-            self.last_call_meta = {}
-            self.last_error_meta = {}
-            return None
-
         self.last_call_meta = {}
         self.last_error_meta = {}
         for attempt in range(retries):
@@ -97,25 +86,26 @@ class AIClient:
                 assert_ai_operations_enabled()
                 assert_within_spend_limits(model)
                 started_at = timed_call_start()
-                response = client.chat.completions.create(
-                    model=model,
+                routed = route_json_completion(
+                    task_type=task_type,
                     messages=[
                         {"role": "system", "content": system},
-                        {"role": "user", "content": user}
+                        {"role": "user", "content": user},
                     ],
-                    response_format={"type": "json_object"},
-                    temperature=temperature,
                     max_tokens=max_tokens,
-                    timeout=request_timeout,
+                    temperature=temperature,
+                    override_model=model if model and model != "gpt-4o-mini" else None,
                 )
+                response = routed.response
                 latency_ms = timed_call_latency_ms(started_at)
                 usage = response.usage
                 prompt_tokens = (usage.prompt_tokens or 0) if usage else 0
                 completion_tokens = (usage.completion_tokens or 0) if usage else 0
                 total_tokens = prompt_tokens + completion_tokens
-                cost_cad = calculate_cost_cad(model, prompt_tokens, completion_tokens)
+                cost_cad = calculate_cost_cad(routed.model_used, prompt_tokens, completion_tokens)
                 self.last_call_meta = {
-                    "model_used": model,
+                    "model_used": routed.model_used,
+                    "provider": routed.provider,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "tokens_used": total_tokens,
@@ -127,7 +117,7 @@ class AIClient:
                     entity_type=entity_type or "ai_operation",
                     entity_id=entity_id,
                     actor=actor,
-                    model_used=model,
+                    model_used=routed.model_used,
                     tokens_used=total_tokens,
                     cost_cad=cost_cad,
                     latency_ms=latency_ms,
@@ -136,10 +126,12 @@ class AIClient:
                         "max_tokens": max_tokens,
                         "temperature": temperature,
                         "cache_key": cache_key,
+                        "task_type": task_type,
+                        "provider": routed.provider,
                         **(payload or {}),
                     },
                 )
-                record_cost_usage(model, prompt_tokens, completion_tokens, cost_cad)
+                record_cost_usage(routed.model_used, prompt_tokens, completion_tokens, cost_cad)
                 content = response.choices[0].message.content
                 result = json.loads(content)
                 if cache_key:

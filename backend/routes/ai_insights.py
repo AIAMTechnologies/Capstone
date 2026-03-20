@@ -174,6 +174,7 @@ async def get_insights(current_user: AdminUser = Depends(get_current_user)):
         temperature=0.2,
         request_timeout=6.0,
         retries=1,
+        task_type="reasoning",
     )
 
     fallback = _fallback_insights(

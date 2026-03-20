@@ -84,6 +84,7 @@ Consider: commercial leads and larger square footage are typically higher priori
         entity_type="lead",
         entity_id=str(lead_id),
         payload={"operation": "lead_score"},
+        task_type="reasoning",
     )
 
     if result:
@@ -166,7 +167,8 @@ Respond in JSON: {{"explanation": "...", "confidence": "high|medium|low", "consi
 
     result = ai_client.call_json(
         system="You are an AI that explains dealer-lead matching decisions for a window film company. Be specific and data-driven.",
-        user=prompt
+        user=prompt,
+        task_type="reasoning",
     )
 
     if result:
@@ -229,7 +231,8 @@ Respond in JSON: {{"subject": "...", "body": "...", "tone": "professional"}}"""
 
     result = ai_client.call_json(
         system="You are an email assistant for Window Film Canada. Draft professional, concise emails. Use proper business formatting.",
-        user=prompt
+        user=prompt,
+        task_type="realtime",
     )
 
     if result:
@@ -278,7 +281,8 @@ Respond in JSON:
 
     result = ai_client.call_json(
         system="You are a lead enrichment AI for a window film company. Infer realistic values based on available data. Be conservative with confidence scores.",
-        user=prompt
+        user=prompt,
+        task_type="reasoning",
     )
 
     if result:
@@ -342,7 +346,8 @@ Respond in JSON:
 
     result = ai_client.call_json(
         system="You are a conversion prediction AI for a window film company. Be realistic and data-driven in your predictions.",
-        user=prompt
+        user=prompt,
+        task_type="reasoning",
     )
 
     if result:

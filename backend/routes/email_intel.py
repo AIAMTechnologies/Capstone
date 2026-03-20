@@ -20,6 +20,7 @@ from access_control import AIOperationsPausedError, assert_ai_operations_enabled
 from audit_logger import calculate_cost_cad, log_event, timed_call_latency_ms, timed_call_start
 from cost_control import SpendLimitExceededError, assert_within_spend_limits, log_spend_limit_block, record_cost_usage
 from db import execute_query, get_db_connection
+from services.model_router import route_json_completion
 
 logger = logging.getLogger("lead_allocation")
 
@@ -670,32 +671,26 @@ def _openai_json_completion(
     user_prompt: str,
     model_candidates: List[str],
     max_tokens: int = 200,
+    task_type: str = "reasoning",
 ) -> Tuple[Optional[dict], Optional[str]]:
     """Try each model candidate in order until one succeeds."""
-    client = _get_openai_client()
-    if client is None:
-        return None, None
+    del model_candidates
 
-    for model in model_candidates:
+    for _ in [0]:
         try:
             assert_ai_operations_enabled()
-            assert_within_spend_limits(model)
+            assert_within_spend_limits(None)
             started_at = timed_call_start()
-            request_kwargs = {
-                "model": model,
-                "response_format": {"type": "json_object"},
-                "messages": [
+            routed = route_json_completion(
+                task_type=task_type,
+                messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-            }
-            if model.startswith(("gpt-5", "o3", "o4")):
-                request_kwargs["max_completion_tokens"] = max_tokens
-            else:
-                request_kwargs["max_tokens"] = max_tokens
-                request_kwargs["temperature"] = 0.1
-
-            response = client.chat.completions.create(**request_kwargs)
+                max_tokens=max_tokens,
+                temperature=0.1,
+            )
+            response = routed.response
             content = response.choices[0].message.content or "{}"
             latency_ms = timed_call_latency_ms(started_at)
 
@@ -703,41 +698,47 @@ def _openai_json_completion(
             usage = response.usage
             inp = (usage.prompt_tokens or 0) if usage else 0
             out = (usage.completion_tokens or 0) if usage else 0
-            cost_cad = calculate_cost_cad(model, inp, out)
+            cost_cad = calculate_cost_cad(routed.model_used, inp, out)
             if usage:
-                pricing = _MODEL_PRICING.get(model, {"input": 0.15, "output": 0.60})
+                pricing = _MODEL_PRICING.get(routed.model_used, {"input": 0.15, "output": 0.60})
                 cost = (inp * pricing["input"] / 1_000_000) + (out * pricing["output"] / 1_000_000)
                 with _cost_tracker_lock:
                     _cost_tracker["total_input_tokens"] += inp
                     _cost_tracker["total_output_tokens"] += out
                     _cost_tracker["total_cost_usd"] += cost
                     _cost_tracker["calls"] += 1
-                    if model not in _cost_tracker["by_model"]:
-                        _cost_tracker["by_model"][model] = {"input": 0, "output": 0, "cost": 0.0, "calls": 0}
-                    _cost_tracker["by_model"][model]["input"] += inp
-                    _cost_tracker["by_model"][model]["output"] += out
-                    _cost_tracker["by_model"][model]["cost"] += cost
-                    _cost_tracker["by_model"][model]["calls"] += 1
+                    if routed.model_used not in _cost_tracker["by_model"]:
+                        _cost_tracker["by_model"][routed.model_used] = {"input": 0, "output": 0, "cost": 0.0, "calls": 0}
+                    _cost_tracker["by_model"][routed.model_used]["input"] += inp
+                    _cost_tracker["by_model"][routed.model_used]["output"] += out
+                    _cost_tracker["by_model"][routed.model_used]["cost"] += cost
+                    _cost_tracker["by_model"][routed.model_used]["calls"] += 1
             log_event(
                 event_type="OPENAI_API_CALL",
                 entity_type="email_sync",
                 actor="system",
-                model_used=model,
+                model_used=routed.model_used,
                 tokens_used=inp + out,
                 cost_cad=cost_cad,
                 latency_ms=latency_ms,
-                payload={"operation": "email_intel_json_completion", "prompt_tokens": inp, "completion_tokens": out},
+                payload={
+                    "operation": "email_intel_json_completion",
+                    "prompt_tokens": inp,
+                    "completion_tokens": out,
+                    "task_type": task_type,
+                    "provider": routed.provider,
+                },
             )
-            record_cost_usage(model, inp, out, cost_cad)
+            record_cost_usage(routed.model_used, inp, out, cost_cad)
 
-            return json.loads(content), model
+            return json.loads(content), routed.model_used
         except AIOperationsPausedError as exc:
             meta = exc.to_payload()
             log_event(
                 event_type="AI_KILL_SWITCH_BLOCK",
                 entity_type="email_sync",
                 actor="system",
-                model_used=model,
+                model_used=None,
                 payload={**meta, "operation": "email_intel_json_completion"},
             )
             logger.info(exc.message_text)
@@ -748,14 +749,14 @@ def _openai_json_completion(
                 actor="system",
                 entity_type="email_sync",
                 entity_id=None,
-                model_used=model,
+                model_used=meta.get("model_used"),
                 meta=meta,
                 extra_payload={"operation": "email_intel_json_completion"},
             )
             logger.warning(exc.message())
             return None, None
         except Exception as exc:
-            logger.warning("OpenAI JSON call failed for %s: %s", model, exc)
+            logger.warning("OpenAI JSON call failed for task %s: %s", task_type, exc)
 
     return None, None
 
@@ -790,8 +791,9 @@ def _reasoning_json_completion(
     result, model = _openai_json_completion(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        model_candidates=OPENAI_REASONING_MODEL_CANDIDATES,
+        model_candidates=[],
         max_tokens=max_tokens,
+        task_type="reasoning",
     )
     if result is not None:
         return result, model
@@ -825,7 +827,8 @@ async def analyze_email_with_ai(
             f"Body:\n{_normalize_email_text(email_body, MAX_EMAIL_BODY_CHARS)}"
             f"{lead_context}"
         ),
-        model_candidates=OPENAI_EMAIL_MODEL_CANDIDATES,
+        model_candidates=[],
+        task_type="email_analysis",
     )
     if result is None:
         return dict(_DEFAULT_AI_RESULT)
