@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from auth import AdminUser, get_current_user
 from db import execute_query
 from ai_service import ai_client
+from audit_logger import log_event
 
 router = APIRouter(prefix="/api/ai", tags=["AI Features"])
 
@@ -76,7 +77,11 @@ Consider: commercial leads and larger square footage are typically higher priori
 
     result = ai_client.call_json(
         system="You are a lead scoring AI for a window film installation company. Classify leads as Hot (high priority, likely to convert), Warm (moderate interest), or Cold (low priority). Return valid JSON only.",
-        user=prompt
+        user=prompt,
+        actor=current_user.username,
+        entity_type="lead",
+        entity_id=str(lead_id),
+        payload={"operation": "lead_score"},
     )
 
     if result:
@@ -86,6 +91,23 @@ Consider: commercial leads and larger square footage are typically higher priori
             WHERE id = %s""",
             (result.get('priority', 'Warm'), result.get('score', 50), result.get('reasoning', ''), lead_id),
             fetch=False
+        )
+        call_meta = ai_client.last_call_meta or {}
+        log_event(
+            event_type="AI_LEAD_SCORING_BATCH",
+            entity_type="lead",
+            entity_id=str(lead_id),
+            actor=current_user.username,
+            model_used=call_meta.get("model_used"),
+            tokens_used=call_meta.get("tokens_used"),
+            cost_cad=call_meta.get("cost_cad"),
+            latency_ms=call_meta.get("latency_ms"),
+            payload={
+                "lead_ids": [lead_id],
+                "leads_scored": 1,
+                "priority": result.get("priority"),
+                "score": result.get("score"),
+            },
         )
         return result
 

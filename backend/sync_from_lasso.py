@@ -14,6 +14,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
 
+from audit_logger import log_event, timed_call_latency_ms, timed_call_start
+
 # Config
 LASSO_BASE = "https://lap.conveniencegroup.com"
 LASSO_USER = "info@windowfilmcanada.ca"
@@ -148,6 +150,7 @@ def sync_dealers(conn, dealers_data):
     conn.commit()
 
     print(f"  Inserted {len(dealers_data)} dealers")
+    return len(dealers_data)
 
 
 def sync_leads(conn, unassigned, active, history):
@@ -303,7 +306,7 @@ def sync_leads(conn, unassigned, active, history):
     conn.commit()
 
     print(f"  Done: {inserted} inserted, {errors} errors")
-    return inserted
+    return {"inserted": inserted, "errors": errors, "source_total": len(all_leads)}
 
 
 def print_summary(conn):
@@ -340,44 +343,77 @@ def print_summary(conn):
 
 
 if __name__ == "__main__":
+    started_at = timed_call_start()
     # Step 1: Login to Lasso
-    session = lasso_login()
-
-    # Step 2: Fetch all data from Lasso
-    print("\nFetching data from Lasso 9...")
-    dealers_data = fetch_json(session, "list-dealers")
-    unassigned = fetch_paginated(session, "unassigned-leads")
-    active = fetch_paginated(session, "active-leads")
-    history = fetch_paginated(session, "admin-history-leads")
-
-    # Step 3: Fetch report data
-    lead_report = fetch_json(session, "lead-report")
-    status_report = fetch_json(session, "lead-status-report")
-    response_report = fetch_json(session, "lead-response-report")
-    project_report = fetch_json(session, "dealer-project-report")
-
-    print(f"\nLasso data summary:")
-    print(f"  Dealers: {len(dealers_data)}")
-    print(f"  Unassigned leads: {len(unassigned)}")
-    print(f"  Active leads: {len(active)}")
-    print(f"  History leads: {len(history)}")
-
-    # Step 4: Sync to database
-    conn = psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
-
     try:
-        # Must clear leads before dealers due to FK constraint
-        cur = conn.cursor()
-        cur.execute("DELETE FROM lead_logs")
-        cur.execute("DELETE FROM lead_assignments")
-        cur.execute("DELETE FROM leads")
-        conn.commit()
-        print("Pre-cleared leads/logs/assignments (FK ordering)")
+        session = lasso_login()
 
-        sync_dealers(conn, dealers_data)
-        sync_leads(conn, unassigned, active, history)
-        print_summary(conn)
-    finally:
-        conn.close()
+        # Step 2: Fetch all data from Lasso
+        print("\nFetching data from Lasso 9...")
+        dealers_data = fetch_json(session, "list-dealers")
+        unassigned = fetch_paginated(session, "unassigned-leads")
+        active = fetch_paginated(session, "active-leads")
+        history = fetch_paginated(session, "admin-history-leads")
 
-    print("\nSync complete!")
+        # Step 3: Fetch report data
+        lead_report = fetch_json(session, "lead-report")
+        status_report = fetch_json(session, "lead-status-report")
+        response_report = fetch_json(session, "lead-response-report")
+        project_report = fetch_json(session, "dealer-project-report")
+
+        print(f"\nLasso data summary:")
+        print(f"  Dealers: {len(dealers_data)}")
+        print(f"  Unassigned leads: {len(unassigned)}")
+        print(f"  Active leads: {len(active)}")
+        print(f"  History leads: {len(history)}")
+
+        # Step 4: Sync to database
+        conn = psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+
+        try:
+            # Must clear leads before dealers due to FK constraint
+            cur = conn.cursor()
+            cur.execute("DELETE FROM lead_logs")
+            cur.execute("DELETE FROM lead_assignments")
+            cur.execute("DELETE FROM leads")
+            conn.commit()
+            print("Pre-cleared leads/logs/assignments (FK ordering)")
+
+            dealers_inserted = sync_dealers(conn, dealers_data)
+            lead_stats = sync_leads(conn, unassigned, active, history)
+            print_summary(conn)
+        finally:
+            conn.close()
+
+        log_event(
+            event_type="LASSO_SYNC",
+            entity_type="lasso_sync",
+            actor="sync_from_lasso.py",
+            latency_ms=timed_call_latency_ms(started_at),
+            payload={
+                "dealers_fetched": len(dealers_data),
+                "dealers_inserted": dealers_inserted,
+                "unassigned_fetched": len(unassigned),
+                "active_fetched": len(active),
+                "history_fetched": len(history),
+                "leads_fetched": len(unassigned) + len(active) + len(history),
+                "leads_inserted": lead_stats["inserted"],
+                "lead_errors": lead_stats["errors"],
+                "report_row_counts": {
+                    "lead_report": len(lead_report or []),
+                    "status_report": len(status_report or []),
+                    "response_report": len(response_report or []),
+                    "project_report": len(project_report or []),
+                },
+            },
+        )
+        print("\nSync complete!")
+    except Exception as exc:
+        log_event(
+            event_type="LASSO_SYNC_FAILED",
+            entity_type="lasso_sync",
+            actor="sync_from_lasso.py",
+            latency_ms=timed_call_latency_ms(started_at),
+            payload={"error": str(exc)},
+        )
+        raise

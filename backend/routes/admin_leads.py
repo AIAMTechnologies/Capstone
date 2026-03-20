@@ -4,6 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field, validator
 from auth import AdminUser, get_current_user
+from audit_logger import log_event
 from db import execute_query, get_db_connection
 
 router = APIRouter(prefix="/api/admin", tags=["Admin Leads"])
@@ -216,6 +217,17 @@ async def assign_dealer(lead_id: int, req: AssignDealerRequest, current_user: Ad
                 (lead_id, f"Assigned to dealer(s): {names}", current_user.username)
             )
             conn.commit()
+        log_event(
+            event_type="DEALER_ASSIGNMENT",
+            entity_type="lead",
+            entity_id=str(lead_id),
+            actor=current_user.username,
+            payload={
+                "dealer_ids": req.dealer_ids,
+                "dealer_names": [d["name"] for d in dealer_names] if dealer_names else [],
+                "primary_dealer_id": primary_dealer_id,
+            },
+        )
         return {"message": "Dealers assigned successfully", "lead_id": lead_id, "dealer_ids": req.dealer_ids}
     except Exception as e:
         conn.rollback()

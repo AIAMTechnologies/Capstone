@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from auth import AdminUser, get_current_user
+from audit_logger import calculate_cost_cad, log_event, timed_call_latency_ms, timed_call_start
 from db import execute_query, get_db_connection
 
 logger = logging.getLogger("lead_allocation")
@@ -675,6 +676,7 @@ def _openai_json_completion(
 
     for model in model_candidates:
         try:
+            started_at = timed_call_start()
             request_kwargs = {
                 "model": model,
                 "response_format": {"type": "json_object"},
@@ -691,12 +693,14 @@ def _openai_json_completion(
 
             response = client.chat.completions.create(**request_kwargs)
             content = response.choices[0].message.content or "{}"
+            latency_ms = timed_call_latency_ms(started_at)
 
             # Track token usage & cost
             usage = response.usage
+            inp = (usage.prompt_tokens or 0) if usage else 0
+            out = (usage.completion_tokens or 0) if usage else 0
+            cost_cad = calculate_cost_cad(model, inp, out)
             if usage:
-                inp = usage.prompt_tokens or 0
-                out = usage.completion_tokens or 0
                 pricing = _MODEL_PRICING.get(model, {"input": 0.15, "output": 0.60})
                 cost = (inp * pricing["input"] / 1_000_000) + (out * pricing["output"] / 1_000_000)
                 with _cost_tracker_lock:
@@ -710,6 +714,16 @@ def _openai_json_completion(
                     _cost_tracker["by_model"][model]["output"] += out
                     _cost_tracker["by_model"][model]["cost"] += cost
                     _cost_tracker["by_model"][model]["calls"] += 1
+            log_event(
+                event_type="OPENAI_API_CALL",
+                entity_type="email_sync",
+                actor="system",
+                model_used=model,
+                tokens_used=inp + out,
+                cost_cad=cost_cad,
+                latency_ms=latency_ms,
+                payload={"operation": "email_intel_json_completion", "prompt_tokens": inp, "completion_tokens": out},
+            )
 
             return json.loads(content), model
         except Exception as exc:
@@ -1927,6 +1941,19 @@ async def _perform_sync_job(started_by: str):
             "matched": matched,
             "flagged_for_review": flagged,
         }
+        log_event(
+            event_type="MS_GRAPH_EMAIL_SYNC",
+            entity_type="email_sync",
+            actor=started_by,
+            payload={
+                "synced": synced,
+                "matched": matched,
+                "unmatched_estimate": max(synced - matched, 0),
+                "flagged_for_review": flagged,
+                "mailbox_type": mailbox_type,
+                "mailbox_email": mailbox_email,
+            },
+        )
 
         _update_sync_state(
             is_running=False,
@@ -1945,6 +1972,12 @@ async def _perform_sync_job(started_by: str):
         print(f"[EMAIL_INTEL] SYNC FAILED: {exc}")
         traceback.print_exc()
         logger.exception("Email sync job failed")
+        log_event(
+            event_type="MS_GRAPH_EMAIL_SYNC_FAILED",
+            entity_type="email_sync",
+            actor=started_by,
+            payload={"error": error_message},
+        )
         _update_sync_state(
             is_running=False,
             finished_at=datetime.utcnow(),
