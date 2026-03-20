@@ -22,7 +22,7 @@ const Home: React.FC = () => {
               </div>
               <div style={styles.feature}>
                 <Award size={24} />
-                <span>Certified Installers</span>
+                <span>Certified Dealers</span>
               </div>
               <div style={styles.feature}>
                 <Clock size={24} />
@@ -65,7 +65,7 @@ const Home: React.FC = () => {
               </div>
               <h3>Expert Installation</h3>
               <p>
-                Our certified installers have years of experience and use only 
+                Our certified dealers have years of experience and use only 
                 premium materials for lasting results.
               </p>
             </div>
@@ -75,7 +75,7 @@ const Home: React.FC = () => {
               </div>
               <h3>Fast Service</h3>
               <p>
-                Get matched with a local installer quickly. Most installations 
+                Get matched with a local dealer quickly. Most installations 
                 are completed within 1-2 days.
               </p>
             </div>

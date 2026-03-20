@@ -174,10 +174,10 @@ async def lead_export(
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     query = f"""
-        SELECT l.*, d.name as dealer_name_assigned, i.name as installer_name
+        SELECT l.*, d.name as dealer_name_assigned, rd.name as recommended_dealer_name
         FROM leads l
         LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
-        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
         {where}
         ORDER BY l.created_at DESC
     """

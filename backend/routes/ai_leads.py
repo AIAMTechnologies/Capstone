@@ -106,13 +106,13 @@ async def get_lead_score(lead_id: int, current_user: AdminUser = Depends(get_cur
 
 @router.post("/explain-match")
 async def explain_match(lead_id: int, current_user: AdminUser = Depends(get_current_user)):
-    """AI explains why a dealer/installer was matched to this lead."""
+    """AI explains why a dealer recommendation or assignment was made for this lead."""
     lead = execute_query(
-        """SELECT l.*, i.name as installer_name, i.city as installer_city,
-           d.name as dealer_name_assigned, d.city as dealer_city
+        """SELECT l.*, d.name as dealer_name_assigned, d.city as dealer_city,
+           rd.name as recommended_dealer_name, rd.city as recommended_dealer_city
         FROM leads l
-        LEFT JOIN installers i ON l.assigned_installer_id = i.id
         LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
+        LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
         WHERE l.id = %s""",
         (lead_id,)
     )
@@ -120,15 +120,15 @@ async def explain_match(lead_id: int, current_user: AdminUser = Depends(get_curr
         raise HTTPException(status_code=404, detail="Lead not found")
     lead = dict(lead[0])
 
-    assigned_to = lead.get('dealer_name_assigned') or lead.get('installer_name') or 'No assignment'
+    assigned_to = lead.get('dealer_name_assigned') or lead.get('recommended_dealer_name') or 'No assignment'
 
-    prompt = f"""Explain why this dealer/installer was matched to this lead for a window film project.
+    prompt = f"""Explain why this dealer was recommended or assigned to this lead for a window film project.
 
 Lead: {lead.get('name')} in {lead.get('city')}, {lead.get('province')}
 Project: {lead.get('job_type', 'N/A')} - {lead.get('product_type', 'N/A')}
 Square Footage: {lead.get('square_footage', 'N/A')}
-Assigned To: {assigned_to} in {lead.get('installer_city') or lead.get('dealer_city', 'N/A')}
-Distance: {lead.get('distance_to_installer_km', 'N/A')} km
+Assigned To: {assigned_to} in {lead.get('dealer_city') or lead.get('recommended_dealer_city', 'N/A')}
+Distance: {lead.get('distance_to_dealer_km', 'N/A')} km
 Allocation Score: {lead.get('allocation_score', 'N/A')}
 
 Respond in JSON: {{"explanation": "...", "confidence": "high|medium|low", "considerations": ["point1", "point2"]}}"""

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { getUnassignedLeads, deleteLead } from '../../services/api';
 import type { ExtendedLead } from '../../types';
 import AssignDealerModal from './AssignDealerModal';
+import { getApiErrorMessage } from '../../utils/apiErrors';
 
 interface UnassignedLeadsListProps {
   onLeadAssigned?: () => void;
@@ -18,6 +19,7 @@ const UnassignedLeadsList: React.FC<UnassignedLeadsListProps> = ({ onLeadAssigne
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [assignLeadId, setAssignLeadId] = useState<number | null>(null);
+  const [visibleCount, setVisibleCount] = useState(100);
 
   const fetchLeads = useCallback(async () => {
     setLoading(true);
@@ -26,7 +28,7 @@ const UnassignedLeadsList: React.FC<UnassignedLeadsListProps> = ({ onLeadAssigne
       const result = await getUnassignedLeads();
       setLeads(result.leads ?? result as any);
     } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Failed to load unassigned leads.');
+      setError(getApiErrorMessage(err, 'Failed to load unassigned leads.'));
       setLeads([]);
     } finally {
       setLoading(false);
@@ -37,6 +39,10 @@ const UnassignedLeadsList: React.FC<UnassignedLeadsListProps> = ({ onLeadAssigne
     fetchLeads();
   }, [fetchLeads]);
 
+  useEffect(() => {
+    setVisibleCount(100);
+  }, [leads]);
+
   const handleDelete = async (leadId: number) => {
     if (!window.confirm('Are you sure you want to delete this lead? This action cannot be undone.')) {
       return;
@@ -45,7 +51,7 @@ const UnassignedLeadsList: React.FC<UnassignedLeadsListProps> = ({ onLeadAssigne
       await deleteLead(leadId);
       setLeads((prev) => prev.filter((l) => l.id !== leadId));
     } catch (err: any) {
-      alert(err?.response?.data?.detail || 'Failed to delete lead.');
+      alert(getApiErrorMessage(err, 'Failed to delete lead.'));
     }
   };
 
@@ -98,7 +104,7 @@ const UnassignedLeadsList: React.FC<UnassignedLeadsListProps> = ({ onLeadAssigne
         </div>
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 12 }}>
-          {leads.map((lead) => (
+          {leads.slice(0, visibleCount).map((lead) => (
             <div
               key={lead.id}
               style={{
@@ -174,6 +180,26 @@ const UnassignedLeadsList: React.FC<UnassignedLeadsListProps> = ({ onLeadAssigne
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {leads.length > visibleCount && (
+        <div style={{ display: 'flex', justifyContent: 'center', marginTop: 16 }}>
+          <button
+            onClick={() => setVisibleCount((count) => count + 100)}
+            style={{
+              padding: '8px 16px',
+              borderRadius: 6,
+              border: '1px solid #ddd',
+              cursor: 'pointer',
+              fontSize: 13,
+              fontWeight: 500,
+              background: 'white',
+              color: '#333',
+            }}
+          >
+            Show 100 More
+          </button>
         </div>
       )}
 

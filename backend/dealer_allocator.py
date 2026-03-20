@@ -1,4 +1,4 @@
-"""Fuzzy scoring helpers for installer allocation.
+"""Fuzzy scoring helpers for dealer allocation.
 
 This module keeps the fuzzy logic implementation isolated from the FastAPI
 application so it can be tested independently and re-used by background jobs.
@@ -30,8 +30,8 @@ def _normalize(value: Optional[str]) -> Optional[str]:
     return normalized or None
 
 
-def normalize_installer_name(value: Optional[str]) -> Optional[str]:
-    """Public helper used by other modules to normalize installer names."""
+def normalize_dealer_name(value: Optional[str]) -> Optional[str]:
+    """Public helper used by other modules to normalize dealer names."""
 
     return _normalize(value)
 
@@ -55,10 +55,10 @@ def _safe_float(value: Any) -> Optional[float]:
     return numeric
 
 
-def fetch_installer_historical_feature_stats(
+def fetch_dealer_historical_feature_stats(
     query_executor,
 ) -> Dict[str, Dict[str, Any]]:
-    """Return cached aggregates describing installer historical features."""
+    """Return cached aggregates describing dealer historical features."""
 
     global _HISTORICAL_CACHE
 
@@ -201,14 +201,14 @@ FUZZY_WEIGHTS = {
 }
 
 
-def score_installer_with_fuzzy_logic(
+def score_dealer_with_fuzzy_logic(
     distance_km: float,
-    installer_stats: Optional[Dict[str, Any]],
+    dealer_stats: Optional[Dict[str, Any]],
     lead_features: Dict[str, Any],
 ) -> Tuple[float, Dict[str, float]]:
-    """Return (score, breakdown) for an installer."""
+    """Return (score, breakdown) for a dealer."""
 
-    installer_stats = installer_stats or {}
+    dealer_stats = dealer_stats or {}
 
     distance_components = {
         "near": _membership_near(distance_km),
@@ -222,16 +222,16 @@ def score_installer_with_fuzzy_logic(
     )
 
     square_score = _square_footage_match(
-        lead_features.get("square_footage"), installer_stats.get("avg_square_footage")
+        lead_features.get("square_footage"), dealer_stats.get("avg_square_footage")
     )
     project_score = _categorical_match_score(
-        lead_features.get("project_type"), installer_stats.get("project_type")
+        lead_features.get("project_type"), dealer_stats.get("project_type")
     )
     product_score = _categorical_match_score(
-        lead_features.get("product_type"), installer_stats.get("product_type")
+        lead_features.get("product_type"), dealer_stats.get("product_type")
     )
     status_score = _categorical_match_score(
-        lead_features.get("current_status"), installer_stats.get("current_status")
+        lead_features.get("current_status"), dealer_stats.get("current_status")
     )
 
     composite = (

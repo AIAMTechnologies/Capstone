@@ -77,9 +77,23 @@ class UpdateLeadRequest(BaseModel):
 async def get_unassigned_leads(current_user: AdminUser = Depends(get_current_user)):
     """Get leads that haven't been assigned to a dealer yet."""
     query = """
-        SELECT l.*, i.name as installer_name
+        SELECT
+            l.id,
+            l.name,
+            l.first_name,
+            l.last_name,
+            l.email,
+            l.phone,
+            l.city,
+            l.province,
+            l.product_type,
+            l.lead_source,
+            l.ai_priority,
+            l.status,
+            l.created_at,
+            rd.name AS recommended_dealer_name
         FROM leads l
-        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
         WHERE l.assigned_dealer_id IS NULL
         AND l.status NOT IN ('converted', 'dead', 'archived')
         ORDER BY l.created_at DESC
@@ -92,10 +106,21 @@ async def get_unassigned_leads(current_user: AdminUser = Depends(get_current_use
 async def get_active_leads(current_user: AdminUser = Depends(get_current_user)):
     """Get leads that are assigned to dealers and actively being worked."""
     query = """
-        SELECT l.*, i.name as installer_name, d.name as dealer_name_assigned
+        SELECT
+            l.id,
+            l.name,
+            l.first_name,
+            l.last_name,
+            l.status,
+            l.product_type,
+            l.ai_priority,
+            l.assigned_dealer_id,
+            l.created_at,
+            d.name AS dealer_name_assigned,
+            rd.name AS recommended_dealer_name
         FROM leads l
-        LEFT JOIN installers i ON l.assigned_installer_id = i.id
         LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
+        LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
         WHERE l.assigned_dealer_id IS NOT NULL
         AND l.status NOT IN ('converted', 'dead', 'archived')
         ORDER BY l.created_at DESC

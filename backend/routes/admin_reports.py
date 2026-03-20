@@ -89,7 +89,7 @@ async def lead_graph(tf: int = 6, opt: int = 1, current_user: AdminUser = Depend
 async def dealer_performance(source: Optional[str] = None, current_user: AdminUser = Depends(get_current_user)):
     """
     Report 1: All dealers with Active/Converted/Dead counts + Avg Response Time.
-    Uses final_installer_selection (dealer name stored on leads) for matching since
+    Uses final_dealer_selection (dealer name stored on leads) for matching since
     not all leads have assigned_dealer_id set.
     """
     source_filter = ""
@@ -100,17 +100,17 @@ async def dealer_performance(source: Optional[str] = None, current_user: AdminUs
 
     query = f"""
         SELECT
-            d.id as dealer_id,
+            MIN(d.id) as dealer_id,
             d.name as dealer_name,
-            COUNT(CASE WHEN l.status IN ('active', 'follow_up') THEN 1 END) as active_leads,
-            COUNT(CASE WHEN l.status = 'converted' THEN 1 END) as converted,
-            COUNT(CASE WHEN l.status = 'dead' THEN 1 END) as dead,
-            COUNT(l.id) as total_leads
+            COUNT(DISTINCT CASE WHEN l.status IN ('active', 'follow_up') THEN l.id END) as active_leads,
+            COUNT(DISTINCT CASE WHEN l.status = 'converted' THEN l.id END) as converted,
+            COUNT(DISTINCT CASE WHEN l.status = 'dead' THEN l.id END) as dead,
+            COUNT(DISTINCT l.id) as total_leads
         FROM dealers d
         LEFT JOIN leads l ON (l.assigned_dealer_id = d.id
-            OR LOWER(TRIM(l.final_installer_selection)) = LOWER(TRIM(d.name)))
+            OR LOWER(TRIM(l.final_dealer_selection)) = LOWER(TRIM(d.name)))
             {source_filter}
-        GROUP BY d.id, d.name
+        GROUP BY d.name
         ORDER BY d.name
     """
     rows = execute_query(query, params)
@@ -119,20 +119,20 @@ async def dealer_performance(source: Optional[str] = None, current_user: AdminUs
     # otherwise from time between lead created_at and assigned_at
     resp_query = """
         SELECT
-            d.id as dealer_id,
+            d.name as dealer_name,
             AVG(EXTRACT(EPOCH FROM (COALESCE(l.assigned_at, l.created_at + INTERVAL '1 day') - l.created_at)) / 3600) as avg_response_hours
         FROM dealers d
         JOIN leads l ON (l.assigned_dealer_id = d.id
-            OR LOWER(TRIM(l.final_installer_selection)) = LOWER(TRIM(d.name)))
+            OR LOWER(TRIM(l.final_dealer_selection)) = LOWER(TRIM(d.name)))
         WHERE l.assigned_at IS NOT NULL
-        GROUP BY d.id
+        GROUP BY d.name
     """
     resp_rows = execute_query(resp_query)
-    resp_map = {r["dealer_id"]: r["avg_response_hours"] for r in resp_rows} if resp_rows else {}
+    resp_map = {r["dealer_name"]: r["avg_response_hours"] for r in resp_rows} if resp_rows else {}
 
     result = []
     for r in rows:
-        avg_hrs = resp_map.get(r["dealer_id"])
+        avg_hrs = resp_map.get(r["dealer_name"])
         if avg_hrs is not None:
             hours = int(avg_hrs)
             minutes = int((avg_hrs - hours) * 60)
@@ -184,7 +184,7 @@ async def dealer_projects(source: Optional[str] = None, current_user: AdminUser 
             COUNT(l.id) as total_leads
         FROM dealers d
         LEFT JOIN leads l ON (l.assigned_dealer_id = d.id
-            OR LOWER(TRIM(l.final_installer_selection)) = LOWER(TRIM(d.name)))
+            OR LOWER(TRIM(l.final_dealer_selection)) = LOWER(TRIM(d.name)))
             {source_filter}
         GROUP BY d.id, d.name
         HAVING COUNT(l.id) > 0
@@ -224,7 +224,7 @@ async def lead_status_report(source: Optional[str] = None, current_user: AdminUs
             END as lead_score_pct
         FROM dealers d
         LEFT JOIN leads l ON (l.assigned_dealer_id = d.id
-            OR LOWER(TRIM(l.final_installer_selection)) = LOWER(TRIM(d.name)))
+            OR LOWER(TRIM(l.final_dealer_selection)) = LOWER(TRIM(d.name)))
             {source_filter}
         GROUP BY d.id, d.name
         HAVING COUNT(l.id) > 0

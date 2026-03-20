@@ -208,7 +208,7 @@ def import_leads(conn, filepath):
                         custom_pick_3, comments, status,
                         form_submit_date, created_at,
                         assigned_dealer_id, value_of_order,
-                        final_installer_selection
+                        final_dealer_selection
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,

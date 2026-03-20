@@ -7,7 +7,6 @@ import type {
   LeadsResponse,
   Lead,
   LeadStatus,
-  Installer,
   HistoricalDataResponse,
   ExtendedLead,
   Dealer,
@@ -26,7 +25,16 @@ import type {
   AIEmailDraft,
   AIEnrichment,
   AIConversionPrediction,
-  AIChurnRisk
+  AIChurnRisk,
+  EmailSyncConfig,
+  EmailMessage,
+  ClosureReview,
+  ActiveMatchReviewItem,
+  NewLeadCandidate,
+  EmailCandidateActionResult,
+  EmailLeadContext,
+  EmailSyncStatus,
+  EmailSyncResult,
 } from '../types';
 
 const API_BASE_URL = env.apiUrl || 'http://localhost:8000/api';
@@ -37,7 +45,7 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
-  timeout: 10000, // 10 second timeout
+  timeout: 30000,
 });
 
 // Add token to requests if available
@@ -138,29 +146,6 @@ export const updateLeadStatus = async (
   return response.data;
 };
 
-export const updateInstallerOverride = async (
-  leadId: number,
-  installerId: number | null
-): Promise<{
-  message: string;
-  lead_id: number;
-  installer_id: number | null;
-  assigned_installer_id?: number | null;
-  final_installer_selection?: string;
-  installer_name?: string | null;
-  installer_city?: string | null;
-}> => {
-  const response = await api.patch(`/admin/leads/${leadId}/installer-override`, {
-    installer_id: installerId
-  });
-  return response.data;
-};
-
-export const getInstallers = async (): Promise<{ installers: Installer[]; count: number }> => {
-  const response = await api.get('/admin/installers');
-  return response.data;
-};
-
 export const getHistoricalData = async (
   limit = 100,
   offset = 0,
@@ -180,12 +165,12 @@ export const getHistoricalData = async (
 // ============================================
 
 export const getUnassignedLeads = async (): Promise<{ leads: ExtendedLead[]; count: number }> => {
-  const response = await api.get('/admin/unassigned-leads');
+  const response = await api.get('/admin/unassigned-leads', { timeout: 60000 });
   return response.data;
 };
 
 export const getActiveLeads = async (): Promise<{ leads: ExtendedLead[]; count: number }> => {
-  const response = await api.get('/admin/active-leads');
+  const response = await api.get('/admin/active-leads', { timeout: 60000 });
   return response.data;
 };
 
@@ -411,7 +396,7 @@ export const predictConversionAI = async (leadId: number): Promise<AIConversionP
 };
 
 export const getAIInsights = async (): Promise<{ insights: AIInsight[] }> => {
-  const response = await api.get('/ai/insights');
+  const response = await api.get('/ai/insights', { timeout: 60000 });
   return response.data;
 };
 
@@ -441,6 +426,80 @@ export const submitDealerInteraction = async (data: { lead_id: number; message: 
 
 export const submitDealerWinLost = async (data: { lead_id: number; status: string; value_of_order?: number; reason?: string }): Promise<{ message: string }> => {
   const response = await api.post('/dealer/submit-win', data);
+  return response.data;
+};
+
+// ============================================
+// EMAIL INTELLIGENCE
+// ============================================
+
+export const getEmailSyncConfig = async (): Promise<EmailSyncConfig | null> => {
+  const response = await api.get('/email-intel/config', { timeout: 30000 });
+  return response.data;
+};
+
+export const saveEmailSyncConfig = async (config: Partial<EmailSyncConfig> & { ms_client_secret?: string }): Promise<{ success: boolean }> => {
+  const response = await api.post('/email-intel/config', config);
+  return response.data;
+};
+
+export const getOAuthAuthorizeUrl = async (): Promise<{ auth_url: string }> => {
+  const response = await api.get('/email-intel/oauth/authorize');
+  return response.data;
+};
+
+export const completeOAuthCallback = async (code: string): Promise<{ success: boolean; email: string }> => {
+  const response = await api.post('/email-intel/oauth/callback', { code });
+  return response.data;
+};
+
+export const triggerEmailSync = async (): Promise<EmailSyncResult> => {
+  const response = await api.post('/email-intel/sync', {}, { timeout: 120000 });
+  return response.data;
+};
+
+export const getEmailSyncStatus = async (): Promise<EmailSyncStatus> => {
+  const response = await api.get('/email-intel/status', { timeout: 30000 });
+  return response.data;
+};
+
+export const getLeadEmails = async (leadId: number): Promise<EmailMessage[]> => {
+  const response = await api.get(`/email-intel/lead/${leadId}/emails`, { timeout: 30000 });
+  return response.data;
+};
+
+export const getLeadEmailContext = async (leadId: number): Promise<EmailLeadContext> => {
+  const response = await api.get(`/email-intel/lead/${leadId}/context`, { timeout: 30000 });
+  return response.data;
+};
+
+export const getClosureReviewQueue = async (): Promise<ClosureReview[]> => {
+  const response = await api.get('/email-intel/review-queue', { timeout: 30000 });
+  return response.data;
+};
+
+export const getActiveMatchReview = async (): Promise<ActiveMatchReviewItem[]> => {
+  const response = await api.get('/email-intel/active-match-review', { timeout: 30000 });
+  return response.data;
+};
+
+export const getNewLeadCandidates = async (): Promise<NewLeadCandidate[]> => {
+  const response = await api.get('/email-intel/new-lead-candidates', { timeout: 30000 });
+  return response.data;
+};
+
+export const createLeadFromEmailCandidate = async (emailId: number): Promise<EmailCandidateActionResult> => {
+  const response = await api.post(`/email-intel/new-lead-candidates/${emailId}/create`);
+  return response.data;
+};
+
+export const approveClosureReview = async (reviewId: number): Promise<{ success: boolean }> => {
+  const response = await api.post(`/email-intel/review-queue/${reviewId}/approve`);
+  return response.data;
+};
+
+export const dismissClosureReview = async (reviewId: number): Promise<{ success: boolean }> => {
+  const response = await api.post(`/email-intel/review-queue/${reviewId}/dismiss`);
   return response.data;
 };
 

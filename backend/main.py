@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, status, Query, Header
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, EmailStr, Field, validator
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -34,12 +35,12 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 
-from fuzzy_allocator import (
-    fetch_installer_historical_feature_stats,
-    normalize_installer_name,
-    score_installer_with_fuzzy_logic,
+from dealer_allocator import (
+    fetch_dealer_historical_feature_stats,
+    normalize_dealer_name,
+    score_dealer_with_fuzzy_logic,
 )
-from ml_model import InstallerMLModel
+from dealer_ml_model import DealerMLModel
 
 logger = logging.getLogger("lead_allocation")
 
@@ -73,7 +74,7 @@ settings = Settings()
 
 app = FastAPI(
     title="Lead Allocation System API",
-    description="Intelligent lead allocation for window film installers",
+    description="Intelligent lead allocation for window film dealers",
     version="1.0.0"
 )
 
@@ -85,6 +86,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ============================================
 # REGISTER API ROUTE MODULES
@@ -99,6 +101,7 @@ from routes.admin_tools import router as admin_tools_router
 from routes.ai_leads import router as ai_leads_router
 from routes.ai_insights import router as ai_insights_router
 from routes.dealer import router as dealer_router
+from routes.email_intel import router as email_intel_router
 
 app.include_router(admin_leads_router)
 app.include_router(admin_dealers_router)
@@ -110,6 +113,7 @@ app.include_router(admin_tools_router)
 app.include_router(ai_leads_router)
 app.include_router(ai_insights_router)
 app.include_router(dealer_router)
+app.include_router(email_intel_router)
 
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -146,14 +150,14 @@ def execute_query(query: str, params: tuple = None, fetch: bool = True):
         conn.close()
 
 
-def resolve_final_installer_selection(record: Dict[str, Any]) -> Optional[str]:
-    """Return the most accurate final installer name for a record."""
+def resolve_final_dealer_selection(record: Dict[str, Any]) -> Optional[str]:
+    """Return the most accurate final dealer name for a record."""
 
-    preferred = (record.get("final_installer_selection") or "").strip()
+    preferred = (record.get("final_dealer_selection") or "").strip()
     if preferred:
         return preferred
 
-    for field in ("assigned_installer_name", "installer_name", "dealer_name"):
+    for field in ("dealer_name_assigned", "recommended_dealer_name", "dealer_name"):
         candidate = (record.get(field) or "").strip()
         if candidate:
             return candidate
@@ -175,10 +179,9 @@ def sync_lead_to_historical(lead_id: int, executor=None) -> None:
 
     lead_rows = executor(
         """
-        SELECT l.*, ai.name AS assigned_installer_name, oi.name AS override_installer_name
+        SELECT l.*, d.name AS dealer_name_assigned
         FROM leads l
-        LEFT JOIN installers ai ON l.assigned_installer_id = ai.id
-        LEFT JOIN installers oi ON l.installer_override_id = oi.id
+        LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
         WHERE l.id = %s
         """,
         (lead_id,),
@@ -190,30 +193,15 @@ def sync_lead_to_historical(lead_id: int, executor=None) -> None:
     lead = dict(lead_rows[0])
     normalized_status = (lead.get("status") or "").strip().lower()
 
-    final_installer = None
-    if lead.get("installer_override_id"):
-        final_installer = (lead.get("override_installer_name") or "").strip()
-    if not final_installer:
-        final_installer = resolve_final_installer_selection(lead)
+    final_dealer = resolve_final_dealer_selection(lead)
+    dealer_name = lead.get("dealer_name") or lead.get("dealer_name_assigned") or final_dealer
 
-    # If the final installer name is still missing but we have an assigned
-    # installer id, fetch the authoritative installer record so historical_data
-    # always captures the resolved name.
-    if not final_installer and lead.get("assigned_installer_id"):
-        installer_row = executor(
-            "SELECT name FROM installers WHERE id = %s", (lead.get("assigned_installer_id"),)
-        )
-        if installer_row:
-            final_installer = (installer_row[0].get("name") or "").strip()
-
-    dealer_name = lead.get("dealer_name") or final_installer or lead.get("assigned_installer_name")
-
-    # Persist the resolved final installer on the operational lead so dashboard
+    # Persist the resolved final dealer on the operational lead so dashboard
     # queries don't recompute it.
-    if final_installer and final_installer != (lead.get("final_installer_selection") or "").strip():
+    if final_dealer and final_dealer != (lead.get("final_dealer_selection") or "").strip():
         executor(
-            "UPDATE leads SET final_installer_selection = %s WHERE id = %s",
-            (final_installer, lead_id),
+            "UPDATE leads SET final_dealer_selection = %s WHERE id = %s",
+            (final_dealer, lead_id),
             fetch=False,
         )
 
@@ -237,7 +225,7 @@ def sync_lead_to_historical(lead_id: int, executor=None) -> None:
             dealer_name,
             project_type,
             current_status,
-            final_installer_selection,
+            final_dealer_selection,
             created_at
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
         ON CONFLICT (id) DO UPDATE
@@ -250,7 +238,7 @@ def sync_lead_to_historical(lead_id: int, executor=None) -> None:
             dealer_name = EXCLUDED.dealer_name,
             project_type = EXCLUDED.project_type,
             current_status = EXCLUDED.current_status,
-            final_installer_selection = EXCLUDED.final_installer_selection
+            final_dealer_selection = EXCLUDED.final_dealer_selection
     """
 
     params = (
@@ -264,25 +252,25 @@ def sync_lead_to_historical(lead_id: int, executor=None) -> None:
         dealer_name,
         lead.get("job_type"),
         lead.get("status"),
-        final_installer,
+        final_dealer,
     )
 
     executor(query, params, fetch=False)
 
 
 # Initialize the ML allocator once so it can be reused across requests
-ml_allocator = InstallerMLModel(execute_query)
+ml_allocator = DealerMLModel(execute_query)
 
-# Distance preferences used when evaluating installer suitability
+# Distance preferences used when evaluating dealer suitability
 PREFERRED_DISTANCE_KM = 120
 ALTERNATIVE_DISTANCE_LIMIT_KM = 50
 LOCAL_PRIORITY_DISTANCE_KM = 75
 FUZZY_MAX_DISTANCE_KM = 200
 ABSOLUTE_DISTANCE_LIMIT_KM = 400
 
-# Lightweight in-memory cache for installer pools per province
-INSTALLER_CACHE_TTL = timedelta(minutes=5)
-_INSTALLER_CACHE: Dict[str, Dict[str, Any]] = {}
+# Lightweight in-memory cache for dealer pools per province
+DEALER_CACHE_TTL = timedelta(minutes=5)
+_DEALER_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ============================================
 # PYDANTIC MODELS
@@ -306,7 +294,7 @@ class LeadCreate(BaseModel):
             raise ValueError(f'Province must be one of: {", ".join(valid_provinces)}')
         return v.upper()
 
-class AlternativeInstaller(BaseModel):
+class AlternativeDealer(BaseModel):
     id: int
     name: str
     city: str
@@ -318,9 +306,6 @@ class AlternativeInstaller(BaseModel):
     ml_probability: Optional[float] = None
     distance_review_required: Optional[bool] = None
 
-class InstallerOverrideRequest(BaseModel):
-    installer_id: Optional[int] = None
-
 class LeadResponse(BaseModel):
     id: int
     name: str
@@ -329,14 +314,16 @@ class LeadResponse(BaseModel):
     province: str
     job_type: str
     status: str
-    assigned_installer_id: Optional[int]
-    assigned_installer_name: Optional[str]
-    final_installer_selection: Optional[str]
+    assigned_dealer_id: Optional[int]
+    dealer_name_assigned: Optional[str]
+    recommended_dealer_id: Optional[int]
+    recommended_dealer_name: Optional[str]
+    final_dealer_selection: Optional[str]
     allocation_score: Optional[float]
-    distance_to_installer_km: Optional[float]
-    installer_ml_probability: Optional[float] = None
+    distance_to_dealer_km: Optional[float]
+    dealer_ml_probability: Optional[float] = None
     distance_review_required: Optional[bool] = None
-    alternative_installers: Optional[List[AlternativeInstaller]]
+    alternative_dealers: Optional[List[AlternativeDealer]]
     created_at: datetime
     message: str = "Lead submitted successfully"
 
@@ -371,7 +358,7 @@ class DashboardStats(BaseModel):
     completed_leads: int
     conversion_rate: float
     avg_allocation_score: float
-    active_installers: int
+    active_dealers: int
 
 # ============================================
 # HAVERSINE DISTANCE CALCULATION
@@ -476,107 +463,99 @@ def build_ml_feature_payload(source: Optional[Any]) -> dict:
 # LEAD ALLOCATION ALGORITHM - ENHANCED VERSION
 # ============================================
 
-def fetch_active_installers_by_province(province: str) -> List[Dict[str, Any]]:
-    """Return active installers for the provided province (with caching)."""
+def fetch_active_dealers_by_province(province: str) -> List[Dict[str, Any]]:
+    """Return active dealers for the provided province, with caching."""
 
     now = datetime.utcnow()
-    cached_entry = _INSTALLER_CACHE.get(province)
+    cached_entry = _DEALER_CACHE.get(province)
     if cached_entry and cached_entry["expires_at"] > now:
         return deepcopy(cached_entry["payload"])
 
     query = """
         SELECT
-            i.id,
-            i.name,
-            i.email,
-            i.city,
-            i.province,
-            i.latitude,
-            i.longitude,
-            i.is_active,
-            COUNT(CASE WHEN l.status = 'active' THEN 1 END) as active_leads,
-            COUNT(CASE WHEN l.status = 'converted' THEN 1 END) as converted_leads
-        FROM installers i
-        LEFT JOIN leads l ON i.id = l.assigned_installer_id
-        WHERE i.is_active = TRUE
-            AND i.province = %s
-            AND i.latitude IS NOT NULL
-            AND i.longitude IS NOT NULL
-        GROUP BY i.id
+            d.id,
+            d.name,
+            d.email,
+            d.city,
+            d.province,
+            d.latitude,
+            d.longitude,
+            d.is_active,
+            COUNT(CASE WHEN l.status = 'active' THEN 1 END) AS active_leads,
+            COUNT(CASE WHEN l.status = 'converted' THEN 1 END) AS converted_leads
+        FROM dealers d
+        LEFT JOIN leads l ON d.id = l.assigned_dealer_id
+        WHERE d.is_active = TRUE
+          AND d.province = %s
+          AND d.latitude IS NOT NULL
+          AND d.longitude IS NOT NULL
+        GROUP BY d.id
     """
 
-    installers = execute_query(query, (province,))
-    _INSTALLER_CACHE[province] = {
-        "payload": deepcopy(installers),
-        "expires_at": now + INSTALLER_CACHE_TTL,
+    dealers = execute_query(query, (province,))
+    _DEALER_CACHE[province] = {
+        "payload": deepcopy(dealers),
+        "expires_at": now + DEALER_CACHE_TTL,
     }
-    return installers
+    return dealers
 
 
-def allocate_lead_to_installer(
+def allocate_lead_to_dealer(
     lead_lat: float,
     lead_lon: float,
     province: str,
     lead_payload: Optional[Any] = None,
-    installer_pool: Optional[List[Dict[str, Any]]] = None,
+    dealer_pool: Optional[List[Dict[str, Any]]] = None,
     historical_stats: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     """
-    Enhanced allocation algorithm that returns:
-    - Best installer (highest composite score)
-    - 2-3 alternative installers within 50km
+    Enhanced allocation algorithm that returns the best dealer plus alternatives.
 
     Composite score blends:
     - ML probability learned from historical data
-    - Geographic distance to the dealer
+    - Geographic distance
     - Closed deals and currently active allocations
     """
-    
-    # Get all active installers from the same province
-    if installer_pool is not None:
-        installers = installer_pool
-    else:
-        installers = fetch_active_installers_by_province(province)
 
-    if not installers:
+    dealers = dealer_pool if dealer_pool is not None else fetch_active_dealers_by_province(province)
+    if not dealers:
         return None
 
     if historical_stats is None:
-        historical_stats = fetch_installer_historical_feature_stats(execute_query)
+        historical_stats = fetch_dealer_historical_feature_stats(execute_query)
 
-    # Prepare ML probabilities for this lead (still exposed for debugging)
     lead_features = build_ml_feature_payload(lead_payload)
     ml_probabilities = ml_allocator.predict_probabilities(lead_features)
 
-    scored_installers = []
-    max_closed = max((installer.get('converted_leads') or 0) for installer in installers) if installers else 0
-    max_active = max((installer.get('active_leads') or 0) for installer in installers) if installers else 0
+    scored_dealers = []
+    max_closed = max((dealer.get("converted_leads") or 0) for dealer in dealers) if dealers else 0
+    max_active = max((dealer.get("active_leads") or 0) for dealer in dealers) if dealers else 0
 
-    for installer in installers:
+    for dealer in dealers:
         distance_km = haversine_distance(
-            lead_lat, lead_lon,
-            installer['latitude'], installer['longitude']
+            lead_lat,
+            lead_lon,
+            dealer["latitude"],
+            dealer["longitude"],
         )
-
         if distance_km > ABSOLUTE_DISTANCE_LIMIT_KM:
             continue
 
-        normalized_name = normalize_installer_name(installer.get('name'))
-        installer_stats = historical_stats.get(normalized_name, {}) if normalized_name else {}
-
-        fuzzy_score, breakdown = score_installer_with_fuzzy_logic(
+        normalized_name = normalize_dealer_name(dealer.get("name"))
+        dealer_stats = historical_stats.get(normalized_name, {}) if normalized_name else {}
+        fuzzy_score, breakdown = score_dealer_with_fuzzy_logic(
             distance_km=distance_km,
-            installer_stats=installer_stats,
+            dealer_stats=dealer_stats,
             lead_features=lead_features,
         )
 
         probability = (
-            ml_probabilities.get(installer['name'])
-            or ml_probabilities.get((installer.get('name') or '').lower())
+            ml_probabilities.get(dealer["name"])
+            or ml_probabilities.get((dealer.get("name") or "").lower())
             or 0.0
         )
-        closed_leads = installer.get('converted_leads') or 0
-        active_leads = installer.get('active_leads') or 0
+        closed_leads = dealer.get("converted_leads") or 0
+        active_leads = dealer.get("active_leads") or 0
 
         conversion_component = (closed_leads / max_closed) if max_closed else 0
         workload_component = (active_leads / max_active) if max_active else 0
@@ -595,61 +574,52 @@ def allocate_lead_to_installer(
         else:
             distance_bucket = 3
 
-        scored_installers.append({
-            'installer_id': installer['id'],
-            'installer_name': installer['name'],
-            'city': installer['city'],
-            'province': installer['province'],
-            'distance_km': round(distance_km, 2),
-            'allocation_score': round(allocation_score, 4),
-            'active_leads': active_leads,
-            'converted_leads': closed_leads,
-            'ml_probability': round(probability, 4),
-            'distance_review_required': distance_km > FUZZY_MAX_DISTANCE_KM,
-            'distance_bucket': distance_bucket,
-            'score_breakdown': breakdown,
-        })
+        scored_dealers.append(
+            {
+                "dealer_id": dealer["id"],
+                "dealer_name": dealer["name"],
+                "city": dealer["city"],
+                "province": dealer["province"],
+                "distance_km": round(distance_km, 2),
+                "allocation_score": round(allocation_score, 4),
+                "active_leads": active_leads,
+                "converted_leads": closed_leads,
+                "ml_probability": round(probability, 4),
+                "distance_review_required": distance_km > FUZZY_MAX_DISTANCE_KM,
+                "distance_bucket": distance_bucket,
+                "score_breakdown": breakdown,
+            }
+        )
 
-    if not scored_installers:
+    if not scored_dealers:
         return None
 
-    scored_installers.sort(key=lambda x: (x['distance_bucket'], -x['allocation_score']))
-
+    scored_dealers.sort(key=lambda row: (row["distance_bucket"], -row["allocation_score"]))
     prioritized = [
-        installer for installer in scored_installers
-        if installer['distance_km'] <= FUZZY_MAX_DISTANCE_KM
-    ] or scored_installers
+        dealer for dealer in scored_dealers if dealer["distance_km"] <= FUZZY_MAX_DISTANCE_KM
+    ] or scored_dealers
 
-    def sanitize(installer: dict) -> dict:
-        cleaned = dict(installer)
-        cleaned.pop('distance_bucket', None)
-        cleaned.pop('score_breakdown', None)
-
-        installer_id = cleaned.get('installer_id')
-        installer_name = cleaned.get('installer_name')
-
-        # Provide both legacy keys (installer_id/installer_name) and the new
-        # consumer-friendly aliases (id/name) so the frontend dropdown can rely
-        # on a stable schema without breaking existing references.
-        if installer_id is not None:
-            cleaned.setdefault('id', installer_id)
-        if installer_name:
-            cleaned.setdefault('name', installer_name)
-
+    def sanitize(dealer: dict) -> dict:
+        cleaned = dict(dealer)
+        cleaned.pop("distance_bucket", None)
+        cleaned.pop("score_breakdown", None)
+        if cleaned.get("dealer_id") is not None:
+            cleaned.setdefault("id", cleaned["dealer_id"])
+        if cleaned.get("dealer_name"):
+            cleaned.setdefault("name", cleaned["dealer_name"])
         return cleaned
 
-    best_installer = sanitize(prioritized[0])
-
+    best_dealer = sanitize(prioritized[0])
     alternatives = [
-        sanitize(installer)
-        for installer in scored_installers
-        if installer['installer_id'] != best_installer['installer_id']
-        and installer['distance_km'] <= ALTERNATIVE_DISTANCE_LIMIT_KM
+        sanitize(dealer)
+        for dealer in scored_dealers
+        if dealer["dealer_id"] != best_dealer["dealer_id"]
+        and dealer["distance_km"] <= ALTERNATIVE_DISTANCE_LIMIT_KM
     ][:3]
 
     return {
-        'best_installer': best_installer,
-        'alternative_installers': alternatives
+        "best_dealer": best_dealer,
+        "alternative_dealers": alternatives,
     }
 
 # ============================================
@@ -729,8 +699,8 @@ async def root():
 async def create_lead(lead: LeadCreate):
     """
     Public endpoint - Submit a new lead
-    Automatically assigns to best installer using enhanced ML algorithm
-    Returns alternative installer options
+    Automatically recommends and assigns the best dealer using the allocation model
+    Returns alternative dealer options
     """
     
     try:
@@ -738,28 +708,30 @@ async def create_lead(lead: LeadCreate):
         try:
             lead_lat, lead_lon = geocode_address(lead.address, lead.city, lead.province)
         except HTTPException as he:
-            # If geocoding fails, still create the lead but don't assign installer
+            # If geocoding fails, still create the lead but don't assign a dealer
             lead_lat, lead_lon = None, None
         
         # Step 2: Get allocation (best + alternatives) if geocoding succeeded
         allocation = None
         if lead_lat and lead_lon:
-            allocation = allocate_lead_to_installer(lead_lat, lead_lon, lead.province, lead)
+            allocation = allocate_lead_to_dealer(lead_lat, lead_lon, lead.province, lead)
         
         # Step 3: Insert lead into database
         conn = get_db_connection()
         try:
             with conn.cursor() as cursor:
-                assigned_installer_id = allocation['best_installer']['installer_id'] if allocation else None
-                final_installer_selection = allocation['best_installer']['installer_name'] if allocation else None
+                best_dealer = allocation["best_dealer"] if allocation else None
+                assigned_dealer_id = best_dealer["dealer_id"] if best_dealer else None
+                recommended_dealer_id = best_dealer["dealer_id"] if best_dealer else None
+                final_dealer_selection = best_dealer["dealer_name"] if best_dealer else None
                 query = """
                     INSERT INTO leads (
                         name, email, phone, address, city, province, postal_code,
-                        job_type, comments, status, assigned_installer_id,
-                        allocation_score, distance_to_installer_km,
-                        final_installer_selection,
+                        job_type, comments, status, assigned_dealer_id, recommended_dealer_id,
+                        allocation_score, distance_to_dealer_km, dealer_ml_probability,
+                        final_dealer_selection,
                         latitude, longitude, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     RETURNING id, created_at
                 """
 
@@ -774,10 +746,12 @@ async def create_lead(lead: LeadCreate):
                     lead.job_type,
                     lead.comments,
                     'active',
-                    assigned_installer_id,
-                    allocation['best_installer']['allocation_score'] if allocation else None,
-                    allocation['best_installer']['distance_km'] if allocation else None,
-                    final_installer_selection,
+                    assigned_dealer_id,
+                    recommended_dealer_id,
+                    best_dealer['allocation_score'] if best_dealer else None,
+                    best_dealer['distance_km'] if best_dealer else None,
+                    best_dealer.get('ml_probability') if best_dealer else None,
+                    final_dealer_selection,
                     lead_lat,
                     lead_lon
                 ))
@@ -793,13 +767,13 @@ async def create_lead(lead: LeadCreate):
         finally:
             conn.close()
         
-        # Step 4: Format alternative installers response
-        alternative_installers = None
-        if allocation and allocation['alternative_installers']:
-            alternative_installers = [
-                AlternativeInstaller(
-                    id=alt['installer_id'],
-                    name=alt['installer_name'],
+        # Step 4: Format alternative dealers response
+        alternative_dealers = None
+        if allocation and allocation['alternative_dealers']:
+            alternative_dealers = [
+                AlternativeDealer(
+                    id=alt['dealer_id'],
+                    name=alt['dealer_name'],
                     city=alt['city'],
                     province=alt['province'],
                     distance_km=alt['distance_km'],
@@ -808,7 +782,7 @@ async def create_lead(lead: LeadCreate):
                     converted_leads=alt.get('converted_leads'),
                     ml_probability=alt.get('ml_probability'),
                     distance_review_required=alt.get('distance_review_required'),
-                ) for alt in allocation['alternative_installers']
+                ) for alt in allocation['alternative_dealers']
             ]
         
         # Step 5: Return response
@@ -820,16 +794,18 @@ async def create_lead(lead: LeadCreate):
             province=lead.province,
             job_type=lead.job_type,
             status='active',
-            assigned_installer_id=allocation['best_installer']['installer_id'] if allocation else None,
-            assigned_installer_name=allocation['best_installer']['installer_name'] if allocation else None,
-            final_installer_selection=allocation['best_installer']['installer_name'] if allocation else None,
-            allocation_score=allocation['best_installer']['allocation_score'] if allocation else None,
-            distance_to_installer_km=allocation['best_installer']['distance_km'] if allocation else None,
-            installer_ml_probability=allocation['best_installer'].get('ml_probability') if allocation else None,
-            distance_review_required=allocation['best_installer'].get('distance_review_required') if allocation else None,
-            alternative_installers=alternative_installers,
+            assigned_dealer_id=best_dealer['dealer_id'] if allocation else None,
+            dealer_name_assigned=best_dealer['dealer_name'] if allocation else None,
+            recommended_dealer_id=best_dealer['dealer_id'] if allocation else None,
+            recommended_dealer_name=best_dealer['dealer_name'] if allocation else None,
+            final_dealer_selection=best_dealer['dealer_name'] if allocation else None,
+            allocation_score=best_dealer['allocation_score'] if allocation else None,
+            distance_to_dealer_km=best_dealer['distance_km'] if allocation else None,
+            dealer_ml_probability=best_dealer.get('ml_probability') if allocation else None,
+            distance_review_required=best_dealer.get('distance_review_required') if allocation else None,
+            alternative_dealers=alternative_dealers,
             created_at=created_at,
-            message="Lead submitted and assigned successfully" if allocation else "Lead submitted - no installer available in your area"
+            message="Lead submitted and dealer assigned successfully" if allocation else "Lead submitted - no dealer available in your area"
         )
         
     except HTTPException as he:
@@ -885,7 +861,7 @@ async def get_dashboard_stats(current_user: AdminUser = Depends(get_current_user
         SELECT 
             COUNT(*) as total_leads,
             COUNT(CASE WHEN status = 'active' THEN 1 END) as pending_leads,
-            COUNT(CASE WHEN assigned_installer_id IS NOT NULL THEN 1 END) as assigned_leads,
+            COUNT(CASE WHEN assigned_dealer_id IS NOT NULL THEN 1 END) as assigned_leads,
             COUNT(CASE WHEN status = 'converted' THEN 1 END) as completed_leads,
             AVG(allocation_score) as avg_allocation_score,
             (COUNT(CASE WHEN status = 'converted' THEN 1 END)::float / 
@@ -895,8 +871,7 @@ async def get_dashboard_stats(current_user: AdminUser = Depends(get_current_user
     
     stats = execute_query(query)[0]
     
-    # Get active installers count
-    active_installers = execute_query("SELECT COUNT(*) as count FROM installers WHERE is_active = TRUE")[0]['count']
+    active_dealers = execute_query("SELECT COUNT(*) as count FROM dealers WHERE is_active = TRUE")[0]['count']
     
     return DashboardStats(
         total_leads=stats['total_leads'] or 0,
@@ -905,7 +880,7 @@ async def get_dashboard_stats(current_user: AdminUser = Depends(get_current_user
         completed_leads=stats['completed_leads'] or 0,
         conversion_rate=round(stats['conversion_rate'] or 0, 2),
         avg_allocation_score=round(stats['avg_allocation_score'] or 0, 2),
-        active_installers=active_installers
+        active_dealers=active_dealers
     )
 
 @app.get("/api/admin/leads")
@@ -915,13 +890,14 @@ async def get_all_leads(
     offset: int = 0,
     current_user: AdminUser = Depends(get_current_user)
 ):
-    """Get all leads with optional status filter - includes alternative installers"""
+    """Get all leads with optional status filter - includes alternative dealers"""
     
     if status:
         query = """
-            SELECT l.*, i.name as installer_name, i.city as installer_city
+            SELECT l.*, d.name as dealer_name_assigned, rd.name as recommended_dealer_name
             FROM leads l
-            LEFT JOIN installers i ON l.assigned_installer_id = i.id
+            LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
+            LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
             WHERE l.status = %s
             ORDER BY l.created_at DESC
             LIMIT %s OFFSET %s
@@ -929,9 +905,10 @@ async def get_all_leads(
         params = (status, limit, offset)
     else:
         query = """
-            SELECT l.*, i.name as installer_name, i.city as installer_city
+            SELECT l.*, d.name as dealer_name_assigned, rd.name as recommended_dealer_name
             FROM leads l
-            LEFT JOIN installers i ON l.assigned_installer_id = i.id
+            LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
+            LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
             ORDER BY l.created_at DESC
             LIMIT %s OFFSET %s
         """
@@ -939,15 +916,15 @@ async def get_all_leads(
     
     leads = execute_query(query, params)
     
-    # Cache installers per province within this request to avoid repetitive queries
-    installer_cache: Dict[str, List[Dict[str, Any]]] = {}
+    # Cache dealer pools per province within this request to avoid repetitive queries
+    dealer_cache: Dict[str, List[Dict[str, Any]]] = {}
     try:
-        historical_stats = fetch_installer_historical_feature_stats(execute_query)
+        historical_stats = fetch_dealer_historical_feature_stats(execute_query)
     except Exception as exc:  # pragma: no cover - defensive guard
-        logger.warning("Unable to preload historical installer stats: %s", exc)
+        logger.warning("Unable to preload historical dealer stats: %s", exc)
         historical_stats = None
 
-    # For each lead, calculate alternative installers if coordinates exist
+    # For each lead, calculate alternative dealers if coordinates exist
     enhanced_leads = []
     for lead in leads:
         lead_dict = dict(lead)
@@ -962,26 +939,26 @@ async def get_all_leads(
         )
         if should_score_alternatives:
             province_key = lead.get('province')
-            installer_pool: Optional[List[Dict[str, Any]]] = None
+            dealer_pool: Optional[List[Dict[str, Any]]] = None
             if province_key:
-                if province_key not in installer_cache:
+                if province_key not in dealer_cache:
                     try:
-                        installer_cache[province_key] = fetch_active_installers_by_province(province_key)
+                        dealer_cache[province_key] = fetch_active_dealers_by_province(province_key)
                     except HTTPException as exc:
                         logger.warning(
-                            "Installer lookup failed for province %s: %s",
+                            "Dealer lookup failed for province %s: %s",
                             province_key,
                             getattr(exc, 'detail', str(exc)),
                         )
-                        installer_cache[province_key] = []
-                installer_pool = installer_cache.get(province_key)
+                        dealer_cache[province_key] = []
+                dealer_pool = dealer_cache.get(province_key)
             try:
-                allocation = allocate_lead_to_installer(
+                allocation = allocate_lead_to_dealer(
                     lead_lat,
                     lead_lon,
                     lead.get('province'),
                     lead,
-                    installer_pool=installer_pool,
+                    dealer_pool=dealer_pool,
                     historical_stats=historical_stats,
                 )
             except HTTPException as exc:
@@ -994,16 +971,19 @@ async def get_all_leads(
                 logger.exception("Unexpected allocation failure for lead %s", lead.get('id'))
 
         if allocation:
-            lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
-            lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
-            lead_dict['alternative_installers'] = allocation['alternative_installers']
+            lead_dict['recommended_dealer_id'] = allocation['best_dealer'].get('dealer_id')
+            lead_dict['recommended_dealer_name'] = allocation['best_dealer'].get('dealer_name')
+            lead_dict['dealer_ml_probability'] = allocation['best_dealer'].get('ml_probability')
+            lead_dict['distance_review_required'] = allocation['best_dealer'].get('distance_review_required')
+            lead_dict['distance_to_dealer_km'] = allocation['best_dealer'].get('distance_km')
+            lead_dict['alternative_dealers'] = allocation['alternative_dealers']
         else:
-            lead_dict['alternative_installers'] = []
+            lead_dict['alternative_dealers'] = []
             lead_dict['distance_review_required'] = None
 
-        resolved_final = resolve_final_installer_selection(lead_dict)
+        resolved_final = resolve_final_dealer_selection(lead_dict)
         if resolved_final:
-            lead_dict['final_installer_selection'] = resolved_final
+            lead_dict['final_dealer_selection'] = resolved_final
 
         enhanced_leads.append(lead_dict)
     
@@ -1019,16 +999,21 @@ async def get_all_leads(
 
 @app.get("/api/admin/leads/{lead_id}")
 async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_current_user)):
-    """Get detailed information about a specific lead - includes alternative installers"""
+    """Get detailed information about a specific lead - includes alternative dealers"""
     
     query = """
         SELECT l.*, 
-               i.name as installer_name, 
-               i.email as installer_email,
-               i.phone as installer_phone,
-               i.city as installer_city
+               d.name as dealer_name_assigned,
+               d.email as dealer_email_assigned,
+               d.phone as dealer_phone_assigned,
+               d.city as dealer_city_assigned,
+               rd.name as recommended_dealer_name,
+               rd.email as recommended_dealer_email,
+               rd.phone as recommended_dealer_phone,
+               rd.city as recommended_dealer_city
         FROM leads l
-        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
+        LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
         WHERE l.id = %s
     """
     
@@ -1042,7 +1027,7 @@ async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_cu
     allocation = None
     if lead_dict['latitude'] and lead_dict['longitude']:
         try:
-            allocation = allocate_lead_to_installer(
+            allocation = allocate_lead_to_dealer(
                 lead_dict['latitude'],
                 lead_dict['longitude'],
                 lead_dict['province'],
@@ -1058,16 +1043,19 @@ async def get_lead_detail(lead_id: int, current_user: AdminUser = Depends(get_cu
             logger.exception("Unexpected allocation failure for lead %s", lead_id)
 
     if allocation:
-        lead_dict['installer_ml_probability'] = allocation['best_installer'].get('ml_probability')
-        lead_dict['distance_review_required'] = allocation['best_installer'].get('distance_review_required')
-        lead_dict['alternative_installers'] = allocation['alternative_installers']
+        lead_dict['recommended_dealer_id'] = allocation['best_dealer'].get('dealer_id')
+        lead_dict['recommended_dealer_name'] = allocation['best_dealer'].get('dealer_name')
+        lead_dict['dealer_ml_probability'] = allocation['best_dealer'].get('ml_probability')
+        lead_dict['distance_review_required'] = allocation['best_dealer'].get('distance_review_required')
+        lead_dict['distance_to_dealer_km'] = allocation['best_dealer'].get('distance_km')
+        lead_dict['alternative_dealers'] = allocation['alternative_dealers']
     else:
-        lead_dict['alternative_installers'] = []
+        lead_dict['alternative_dealers'] = []
         lead_dict['distance_review_required'] = None
 
-    resolved_final = resolve_final_installer_selection(lead_dict)
+    resolved_final = resolve_final_dealer_selection(lead_dict)
     if resolved_final:
-        lead_dict['final_installer_selection'] = resolved_final
+        lead_dict['final_dealer_selection'] = resolved_final
 
     return lead_dict
 
@@ -1088,9 +1076,9 @@ async def update_lead_status(
     
     lead_rows = execute_query(
         """
-        SELECT l.*, i.name as assigned_installer_name
+        SELECT l.*, d.name as dealer_name_assigned
         FROM leads l
-        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
         WHERE l.id = %s
         """,
         (lead_id,),
@@ -1103,122 +1091,10 @@ async def update_lead_status(
     execute_query(query, (status, lead_id), fetch=False)
 
     # Re-read the lead so historical sync uses the persisted state and captures
-    # downstream changes to the final installer selection.
+    # downstream changes to the final dealer selection.
     sync_lead_to_historical(lead_id)
 
     return {"message": "Lead status updated successfully", "lead_id": lead_id, "new_status": status}
-
-
-@app.patch("/api/admin/leads/{lead_id}/installer-override")
-async def update_installer_override(
-    lead_id: int,
-    override: Optional[InstallerOverrideRequest] = None,
-    installer_id: Optional[int] = Query(default=None),
-    current_user: AdminUser = Depends(get_current_user)
-):
-    """Update installer override - allows manual assignment of alternative installers"""
-
-    resolved_installer_id = installer_id
-    if override and override.installer_id is not None:
-        resolved_installer_id = override.installer_id
-
-    lead_rows = execute_query(
-        """
-        SELECT l.id,
-               l.assigned_installer_id,
-               l.installer_override_id,
-               l.final_installer_selection,
-               i.name AS assigned_installer_name,
-               i.city AS assigned_installer_city
-        FROM leads l
-        LEFT JOIN installers i ON l.assigned_installer_id = i.id
-        WHERE l.id = %s
-        """,
-        (lead_id,),
-    )
-    if not lead_rows:
-        raise HTTPException(status_code=404, detail="Lead not found")
-
-    lead_record = lead_rows[0]
-    # Preserve the ML recommendation; overrides should not overwrite the
-    # assigned installer id so we can distinguish the model's pick from a
-    # manual alternative.
-    assigned_installer_id = lead_record.get('assigned_installer_id')
-    assigned_installer_name = lead_record.get('assigned_installer_name')
-    assigned_installer_city = lead_record.get('assigned_installer_city')
-    final_installer_name = resolve_final_installer_selection(lead_record)
-
-    if assigned_installer_id and (not assigned_installer_name or not assigned_installer_city):
-        installer_name_row = execute_query(
-            "SELECT name, city FROM installers WHERE id = %s",
-            (assigned_installer_id,),
-        )
-        if installer_name_row:
-            assigned_installer_name = installer_name_row[0]['name']
-            assigned_installer_city = installer_name_row[0].get('city')
-
-    # Validate installer exists if provided and capture its name
-    if resolved_installer_id:
-        installer_check = execute_query(
-            "SELECT id, name, city FROM installers WHERE id = %s AND is_active = TRUE",
-            (resolved_installer_id,),
-        )
-        if not installer_check:
-            raise HTTPException(status_code=404, detail="Installer not found or inactive")
-        override_name = installer_check[0]['name']
-        assigned_installer_name = assigned_installer_name or override_name
-        assigned_installer_city = assigned_installer_city or installer_check[0].get('city')
-        final_installer_name = override_name
-        # Only populate the assignment when no ML recommendation exists.
-        if not assigned_installer_id:
-            assigned_installer_id = installer_check[0]['id']
-    elif assigned_installer_id:
-        final_installer_name = assigned_installer_name
-    else:
-        final_installer_name = None
-
-    query = """
-        UPDATE leads
-        SET installer_override_id = %s,
-            assigned_installer_id = %s,
-            final_installer_selection = %s,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = %s
-    """
-    execute_query(query, (resolved_installer_id, assigned_installer_id, final_installer_name, lead_id), fetch=False)
-
-    # Keep historical_data in sync with the chosen installer so overrides
-    # immediately reflect in reporting and training data.
-    sync_lead_to_historical(lead_id)
-
-    logger.info(
-        "Lead %s installer override updated by %s (override_id=%s, final_installer=%s)",
-        lead_id,
-        current_user.username,
-        resolved_installer_id,
-        final_installer_name,
-    )
-
-    return {
-        "message": "Installer override updated successfully",
-        "lead_id": lead_id,
-        "installer_id": resolved_installer_id,
-        "assigned_installer_id": assigned_installer_id,
-        "final_installer_selection": final_installer_name,
-        "installer_name": assigned_installer_name,
-        "installer_city": assigned_installer_city,
-    }
-@app.get("/api/admin/installers")
-async def get_installers(current_user: AdminUser = Depends(get_current_user)):
-    """Get all installers with performance metrics"""
-
-    query = """
-        SELECT * FROM installer_performance
-        ORDER BY province, city
-    """
-
-    installers = execute_query(query)
-    return {"installers": installers, "count": len(installers)}
 
 
 @app.get("/api/admin/historical-data")

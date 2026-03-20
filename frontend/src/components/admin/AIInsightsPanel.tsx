@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { getAIInsights } from '../../services/api';
 import type { AIInsight } from '../../types';
+import { getApiErrorMessage } from '../../utils/apiErrors';
 
 const typeColors: Record<string, { bg: string; border: string; text: string }> = {
   warning: { bg: '#fff8e1', border: '#ffe082', text: '#f57f17' },
@@ -25,7 +26,7 @@ const AIInsightsPanel: React.FC = () => {
       if (status === 404 || status === 501) {
         setError('No AI key configured. AI insights are unavailable.');
       } else {
-        setError(err?.response?.data?.detail || 'Failed to load AI insights.');
+        setError(getApiErrorMessage(err, 'Failed to load AI insights.'));
       }
       setInsights([]);
     } finally {
