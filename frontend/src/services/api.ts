@@ -4,6 +4,7 @@ import type {
   LeadFormData,
   LoginResponse,
   DashboardStats,
+  CostTrackingSnapshot,
   LeadsResponse,
   Lead,
   LeadStatus,
@@ -114,6 +115,11 @@ export const login = async (username: string, password: string): Promise<LoginRe
 
 export const getDashboardStats = async (): Promise<DashboardStats> => {
   const response = await api.get<DashboardStats>('/admin/dashboard');
+  return response.data;
+};
+
+export const getCostTracking = async (): Promise<CostTrackingSnapshot> => {
+  const response = await api.get<CostTrackingSnapshot>('/admin/cost-tracking');
   return response.data;
 };
 

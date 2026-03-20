@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from auth import AdminUser, get_current_user
 from audit_logger import calculate_cost_cad, log_event, timed_call_latency_ms, timed_call_start
+from cost_control import SpendLimitExceededError, assert_within_spend_limits, log_spend_limit_block, record_cost_usage
 from db import execute_query, get_db_connection
 
 logger = logging.getLogger("lead_allocation")
@@ -676,6 +677,7 @@ def _openai_json_completion(
 
     for model in model_candidates:
         try:
+            assert_within_spend_limits(model)
             started_at = timed_call_start()
             request_kwargs = {
                 "model": model,
@@ -724,8 +726,21 @@ def _openai_json_completion(
                 latency_ms=latency_ms,
                 payload={"operation": "email_intel_json_completion", "prompt_tokens": inp, "completion_tokens": out},
             )
+            record_cost_usage(model, inp, out, cost_cad)
 
             return json.loads(content), model
+        except SpendLimitExceededError as exc:
+            meta = exc.to_payload()
+            log_spend_limit_block(
+                actor="system",
+                entity_type="email_sync",
+                entity_id=None,
+                model_used=model,
+                meta=meta,
+                extra_payload={"operation": "email_intel_json_completion"},
+            )
+            logger.warning(exc.message())
+            return None, None
         except Exception as exc:
             logger.warning("OpenAI JSON call failed for %s: %s", model, exc)
 

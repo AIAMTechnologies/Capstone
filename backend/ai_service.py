@@ -2,6 +2,12 @@ import json
 import time
 import logging
 from typing import Optional, Dict, Any
+from cost_control import (
+    SpendLimitExceededError,
+    assert_within_spend_limits,
+    log_spend_limit_block,
+    record_cost_usage,
+)
 from db import settings
 from audit_logger import calculate_cost_cad, log_event, timed_call_latency_ms, timed_call_start
 
@@ -20,6 +26,7 @@ class AIClient:
         self._cache_ttl = 1800  # 30 minutes
         self._client = None
         self.last_call_meta: Dict[str, Any] = {}
+        self.last_error_meta: Dict[str, Any] = {}
 
     def _get_client(self):
         if self._client is None:
@@ -65,6 +72,7 @@ class AIClient:
         """Call OpenAI and parse JSON response. Returns None on failure."""
         if not settings.OPENAI_API_KEY:
             logger.warning("OPENAI_API_KEY not set, skipping AI call")
+            self.last_error_meta = {}
             return None
 
         # Check cache
@@ -72,16 +80,20 @@ class AIClient:
             cached = self._get_cache(cache_key)
             if cached:
                 self.last_call_meta = {}
+                self.last_error_meta = {}
                 return cached
 
         client = self._get_client()
         if not client:
             self.last_call_meta = {}
+            self.last_error_meta = {}
             return None
 
         self.last_call_meta = {}
+        self.last_error_meta = {}
         for attempt in range(retries):
             try:
+                assert_within_spend_limits(model)
                 started_at = timed_call_start()
                 response = client.chat.completions.create(
                     model=model,
@@ -125,16 +137,31 @@ class AIClient:
                         **(payload or {}),
                     },
                 )
+                record_cost_usage(model, prompt_tokens, completion_tokens, cost_cad)
                 content = response.choices[0].message.content
                 result = json.loads(content)
                 if cache_key:
                     self._set_cache(cache_key, result)
                 return result
+            except SpendLimitExceededError as exc:
+                self.last_call_meta = {}
+                self.last_error_meta = exc.to_payload()
+                log_spend_limit_block(
+                    actor=actor,
+                    entity_type=entity_type or "ai_operation",
+                    entity_id=entity_id,
+                    model_used=model,
+                    meta=self.last_error_meta,
+                    extra_payload=payload,
+                )
+                logger.warning(exc.message())
+                return None
             except json.JSONDecodeError as e:
                 logger.error(f"AI JSON parse error (attempt {attempt+1}): {e}")
             except Exception as e:
                 logger.error(f"AI API error (attempt {attempt+1}): {e}")
                 self.last_call_meta = {}
+                self.last_error_meta = {}
                 if attempt < retries - 1:
                     time.sleep(1 * (attempt + 1))
         return None

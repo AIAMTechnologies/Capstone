@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 from auth import AdminUser, get_current_user
 from db import execute_query
 from ai_service import ai_client
+from cost_control import build_spend_limit_message
 
 router = APIRouter(prefix="/api/ai", tags=["AI Insights"])
 
@@ -189,6 +190,19 @@ async def get_insights(current_user: AdminUser = Depends(get_current_user)):
             return {"insights": ai_insights}
         combined = ai_insights + fallback
         return {"insights": combined[:4]}
+
+    if ai_client.last_error_meta.get("type") == "spend_limit":
+        return {
+            "insights": [
+                {
+                    "type": "warning",
+                    "title": "AI spend limit reached",
+                    "body": build_spend_limit_message(ai_client.last_error_meta),
+                    "action": "Review AI spend limits on the dashboard before retrying.",
+                },
+                *(fallback[:3] if fallback else []),
+            ][:4]
+        }
 
     return {"insights": fallback or [{"type": "trend", "title": "Pipeline looks healthy", "body": "No urgent issues were detected in the current dashboard snapshot.", "action": "Review dashboard"}]}
 

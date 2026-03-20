@@ -77,6 +77,33 @@ export interface DashboardStats {
   active_dealers: number;
 }
 
+export interface CostTrackingModelBreakdown {
+  model_used: string;
+  total_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  tokens_used: number;
+  spend_cad: number;
+}
+
+export interface CostTrackingPeriod {
+  spend_cad: number;
+  limit_cad: number;
+  remaining_cad: number;
+  total_calls: number;
+  tokens_used: number;
+  by_model: CostTrackingModelBreakdown[];
+}
+
+export interface CostTrackingSnapshot {
+  daily: CostTrackingPeriod;
+  monthly: CostTrackingPeriod;
+  limits: {
+    daily_spend_limit_cad: number;
+    monthly_spend_limit_cad: number;
+  };
+}
+
 export interface LeadsResponse {
   leads: Lead[];
   count: number;

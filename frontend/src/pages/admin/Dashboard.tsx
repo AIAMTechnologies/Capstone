@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import AIInsightsPanel from '../../components/admin/AIInsightsPanel';
+import AISpendWidget from '../../components/admin/AISpendWidget';
 import InsertLeadForm from '../../components/admin/InsertLeadForm';
 import UnassignedLeadsList from '../../components/admin/UnassignedLeadsList';
 import ActiveLeadsList from '../../components/admin/ActiveLeadsList';
@@ -94,6 +95,8 @@ const Dashboard: React.FC = () => {
       <h1 style={{ marginBottom: 24, fontSize: 28, fontWeight: 700, color: '#2c3e50' }}>
         Admin Dashboard
       </h1>
+
+      <AISpendWidget />
 
       {/* AI Insights Panel */}
       <AIInsightsPanel />

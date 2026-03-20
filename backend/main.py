@@ -96,6 +96,7 @@ from routes.admin_dealers import router as admin_dealers_router
 from routes.admin_history import router as admin_history_router
 from routes.admin_logs import router as admin_logs_router
 from routes.admin_audit_log import router as admin_audit_log_router
+from routes.admin_cost_tracking import router as admin_cost_tracking_router
 from routes.admin_reports import router as admin_reports_router
 from routes.admin_resources import router as admin_resources_router
 from routes.admin_tools import router as admin_tools_router
@@ -109,6 +110,7 @@ app.include_router(admin_dealers_router)
 app.include_router(admin_history_router)
 app.include_router(admin_logs_router)
 app.include_router(admin_audit_log_router)
+app.include_router(admin_cost_tracking_router)
 app.include_router(admin_reports_router)
 app.include_router(admin_resources_router)
 app.include_router(admin_tools_router)
