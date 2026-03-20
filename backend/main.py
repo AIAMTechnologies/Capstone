@@ -41,6 +41,7 @@ from dealer_allocator import (
     score_dealer_with_fuzzy_logic,
 )
 from dealer_ml_model import DealerMLModel
+from mcp_server import mcp_app
 
 logger = logging.getLogger("lead_allocation")
 
@@ -120,6 +121,7 @@ app.include_router(ai_leads_router)
 app.include_router(ai_insights_router)
 app.include_router(dealer_router)
 app.include_router(email_intel_router)
+app.mount("/mcp", mcp_app)
 
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

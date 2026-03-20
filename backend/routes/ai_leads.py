@@ -7,6 +7,7 @@ from ai_service import ai_client
 from access_control import build_ai_pause_message
 from audit_logger import log_event
 from cost_control import build_spend_limit_message
+from mcp_tools import get_dealer_tool, get_lead_score_tool, get_lead_tool
 
 router = APIRouter(prefix="/api/ai", tags=["AI Features"])
 
@@ -53,10 +54,10 @@ class ConversionPredictionResponse(BaseModel):
 @router.post("/lead-score")
 async def score_lead(lead_id: int, current_user: AdminUser = Depends(get_current_user)):
     """AI-powered lead scoring and priority classification."""
-    lead = execute_query("SELECT * FROM leads WHERE id = %s", (lead_id,))
-    if not lead:
+    try:
+        lead = get_lead_tool(lead_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    lead = dict(lead[0])
 
     prompt = f"""Analyze this window film installation lead and classify its priority.
 
@@ -127,30 +128,20 @@ Consider: commercial leads and larger square footage are typically higher priori
 @router.get("/lead-score/{lead_id}")
 async def get_lead_score(lead_id: int, current_user: AdminUser = Depends(get_current_user)):
     """Get cached AI score for a lead."""
-    lead = execute_query(
-        "SELECT ai_priority, ai_score, ai_reasoning, ai_scored_at FROM leads WHERE id = %s",
-        (lead_id,)
-    )
-    if not lead:
+    try:
+        lead_score = get_lead_score_tool(lead_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    return lead[0]
+    return lead_score
 
 
 @router.post("/explain-match")
 async def explain_match(lead_id: int, current_user: AdminUser = Depends(get_current_user)):
     """AI explains why a dealer recommendation or assignment was made for this lead."""
-    lead = execute_query(
-        """SELECT l.*, d.name as dealer_name_assigned, d.city as dealer_city,
-           rd.name as recommended_dealer_name, rd.city as recommended_dealer_city
-        FROM leads l
-        LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
-        LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
-        WHERE l.id = %s""",
-        (lead_id,)
-    )
-    if not lead:
+    try:
+        lead = get_lead_tool(lead_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    lead = dict(lead[0])
 
     assigned_to = lead.get('dealer_name_assigned') or lead.get('recommended_dealer_name') or 'No assignment'
 
@@ -198,16 +189,18 @@ Respond in JSON: {{"explanation": "...", "confidence": "high|medium|low", "consi
 @router.post("/draft-email")
 async def draft_email(req: EmailDraftRequest, current_user: AdminUser = Depends(get_current_user)):
     """AI generates contextual email draft."""
-    lead = execute_query("SELECT * FROM leads WHERE id = %s", (req.lead_id,))
-    if not lead:
+    try:
+        lead = get_lead_tool(req.lead_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    lead = dict(lead[0])
 
     dealer_info = ""
     if req.dealer_id:
-        dealer = execute_query("SELECT * FROM dealers WHERE id = %s", (req.dealer_id,))
-        if dealer:
-            dealer_info = f"Dealer: {dealer[0]['name']} ({dealer[0].get('email', 'N/A')})"
+        try:
+            dealer = get_dealer_tool(req.dealer_id)
+            dealer_info = f"Dealer: {dealer['name']} ({dealer.get('email', 'N/A')})"
+        except ValueError:
+            dealer_info = ""
 
     # Get interaction history
     logs = execute_query(
@@ -258,10 +251,10 @@ Respond in JSON: {{"subject": "...", "body": "...", "tone": "professional"}}"""
 @router.post("/enrich-lead")
 async def enrich_lead(lead_id: int, current_user: AdminUser = Depends(get_current_user)):
     """AI enriches lead data by inferring missing fields."""
-    lead = execute_query("SELECT * FROM leads WHERE id = %s", (lead_id,))
-    if not lead:
+    try:
+        lead = get_lead_tool(lead_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    lead = dict(lead[0])
 
     prompt = f"""Based on the available lead information, infer missing fields for a window film project.
 
@@ -310,15 +303,10 @@ Respond in JSON:
 @router.post("/predict-conversion")
 async def predict_conversion(lead_id: int, current_user: AdminUser = Depends(get_current_user)):
     """AI predicts conversion likelihood with explanation."""
-    lead = execute_query(
-        """SELECT l.*, d.name as dealer_name_assigned
-        FROM leads l LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
-        WHERE l.id = %s""",
-        (lead_id,)
-    )
-    if not lead:
+    try:
+        lead = get_lead_tool(lead_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Lead not found")
-    lead = dict(lead[0])
 
     # Get conversion stats for context
     stats = execute_query("""
