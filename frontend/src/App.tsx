@@ -12,6 +12,7 @@ import Resources from './pages/admin/Resources';
 import Reports from './pages/admin/Reports';
 import Tools from './pages/admin/Tools';
 import EmailIntel from './pages/admin/EmailIntel';
+import EmailOps from './pages/admin/EmailOps';
 import './styles/App.css';
 
 const AppShell = () => (
@@ -50,6 +51,7 @@ const router = createBrowserRouter(
         { path: 'reports', element: <Reports /> },
         { path: 'tools', element: <Tools /> },
         { path: 'email-intel', element: <EmailIntel /> },
+        { path: 'email-ops', element: <EmailOps /> },
       ],
     },
   ]

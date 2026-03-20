@@ -91,9 +91,9 @@ async def get_unassigned_leads(current_user: AdminUser = Depends(get_current_use
             l.ai_priority,
             l.status,
             l.created_at,
-            i.name AS installer_name
+            rd.name AS recommended_dealer_name
         FROM leads l
-        LEFT JOIN installers i ON l.assigned_installer_id = i.id
+        LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
         WHERE l.assigned_dealer_id IS NULL
         AND l.status NOT IN ('converted', 'dead', 'archived')
         ORDER BY l.created_at DESC
@@ -116,11 +116,11 @@ async def get_active_leads(current_user: AdminUser = Depends(get_current_user)):
             l.ai_priority,
             l.assigned_dealer_id,
             l.created_at,
-            i.name AS installer_name,
-            d.name AS dealer_name_assigned
+            d.name AS dealer_name_assigned,
+            rd.name AS recommended_dealer_name
         FROM leads l
-        LEFT JOIN installers i ON l.assigned_installer_id = i.id
         LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
+        LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
         WHERE l.assigned_dealer_id IS NOT NULL
         AND l.status NOT IN ('converted', 'dead', 'archived')
         ORDER BY l.created_at DESC

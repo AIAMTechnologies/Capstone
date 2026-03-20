@@ -1,6 +1,14 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Link } from 'react-router-dom';
-import type { EmailSyncConfig, EmailSyncStatus, EmailSyncResult, ClosureReview, EmailMessage } from '../../types/types';
+import type {
+  EmailSyncConfig,
+  EmailSyncStatus,
+  EmailSyncResult,
+  ClosureReview,
+  EmailMessage,
+  ActiveMatchReviewItem,
+  NewLeadCandidate,
+} from '../../types/types';
 import {
   getEmailSyncConfig,
   saveEmailSyncConfig,
@@ -8,25 +16,85 @@ import {
   triggerEmailSync,
   getEmailSyncStatus,
   getClosureReviewQueue,
+  getActiveMatchReview,
+  getNewLeadCandidates,
+  createLeadFromEmailCandidate,
   approveClosureReview,
   dismissClosureReview,
   getLeadEmails,
 } from '../../services/api';
 import { getApiErrorMessage } from '../../utils/apiErrors';
+import AssignDealerModal from '../../components/admin/AssignDealerModal';
+import EmailIntelDrawer from '../../components/admin/EmailIntelDrawer';
 
 const inputStyle: React.CSSProperties = { padding: '8px 12px', borderRadius: 6, border: '1px solid #ddd', fontSize: 14 };
 const cardStyle: React.CSSProperties = { background: 'white', borderRadius: 8, padding: 20, boxShadow: '0 2px 8px rgba(0,0,0,0.08)', marginBottom: 20 };
 const btnPrimary: React.CSSProperties = { padding: '8px 20px', background: '#c91414', color: 'white', border: 'none', borderRadius: 6, fontSize: 14, fontWeight: 600, cursor: 'pointer' };
 const btnGreen: React.CSSProperties = { ...btnPrimary, background: '#1a7a3a' };
 const btnGray: React.CSSProperties = { ...btnPrimary, background: '#888' };
+const btnSecondary: React.CSSProperties = { ...btnPrimary, background: '#f8fafc', color: '#1f2937', border: '1px solid #d1d5db' };
 const thStyle: React.CSSProperties = { background: '#f8f9fa', textAlign: 'left' as const, padding: '10px 12px', fontSize: 13, fontWeight: 600, color: '#555' };
 const tdStyle: React.CSSProperties = { padding: '10px 12px', borderBottom: '1px solid #eee', fontSize: 13 };
 const labelStyle: React.CSSProperties = { display: 'block', fontSize: 13, fontWeight: 600, color: '#555', marginBottom: 4 };
+const statCardStyle: React.CSSProperties = { padding: 14, borderRadius: 8, background: '#f8fafc', border: '1px solid #e5e7eb' };
 
 const fmtDate = (d?: string | null) => d ? new Date(d).toLocaleString('en-CA') : '-';
+const truncateText = (value?: string | null, max = 80) => {
+  if (!value) return '-';
+  return value.length > max ? `${value.slice(0, max)}...` : value;
+};
+
+const renderSentimentBadge = (sentiment?: 'positive' | 'neutral' | 'negative' | null) => {
+  const colors: Record<string, { bg: string; color: string }> = {
+    positive: { bg: '#dcfce7', color: '#166534' },
+    neutral: { bg: '#f3f4f6', color: '#374151' },
+    negative: { bg: '#fde8e8', color: '#991b1b' },
+  };
+  const key = sentiment || 'neutral';
+  const color = colors[key] || colors.neutral;
+  return (
+    <span
+      style={{
+        padding: '2px 8px',
+        borderRadius: 10,
+        fontSize: 11,
+        fontWeight: 600,
+        background: color.bg,
+        color: color.color,
+      }}
+    >
+      {sentiment || 'unknown'}
+    </span>
+  );
+};
+
+const renderPriorityBadge = (priority: ActiveMatchReviewItem['review_priority']) => {
+  const colors = {
+    high: { bg: '#fee2e2', color: '#b91c1c' },
+    medium: { bg: '#fef3c7', color: '#92400e' },
+    low: { bg: '#e0f2fe', color: '#0f4c81' },
+  };
+  const color = colors[priority];
+  return (
+    <span
+      style={{
+        padding: '2px 8px',
+        borderRadius: 10,
+        fontSize: 11,
+        fontWeight: 700,
+        textTransform: 'uppercase',
+        background: color.bg,
+        color: color.color,
+      }}
+    >
+      {priority}
+    </span>
+  );
+};
 
 const EmailIntel: React.FC = () => {
   const [oauthMsg, setOauthMsg] = useState('');
+  const [queueRefreshToken, setQueueRefreshToken] = useState(0);
 
   useEffect(() => {
     // Handle OAuth redirect query params
@@ -56,6 +124,14 @@ const EmailIntel: React.FC = () => {
         </div>
       )}
       <SyncConfigSection />
+      <ActiveMatchReviewSection
+        refreshToken={queueRefreshToken}
+        onQueueChanged={() => setQueueRefreshToken((prev) => prev + 1)}
+      />
+      <NewLeadCandidatesSection
+        refreshToken={queueRefreshToken}
+        onQueueChanged={() => setQueueRefreshToken((prev) => prev + 1)}
+      />
       <ReviewQueueSection />
       <RecentEmailsSection />
     </div>
@@ -68,6 +144,8 @@ const SyncConfigSection: React.FC = () => {
     ms_tenant_id: '',
     ms_client_id: '',
     ms_redirect_uri: '',
+    shared_mailbox_email: '',
+    target_mailbox_type: 'connected',
     sync_enabled: false,
     sync_interval_minutes: 15,
   });
@@ -184,6 +262,17 @@ const SyncConfigSection: React.FC = () => {
   };
 
   const syncInProgress = syncing || status?.sync_in_progress;
+  const syncStatusLabel = status?.sync_message
+    ? status.sync_message
+    : status?.sync_in_progress
+      ? 'Syncing...'
+      : null;
+  const targetMailboxType = config.target_mailbox_type || 'connected';
+  const targetMailboxLabel = targetMailboxType === 'group'
+    ? 'Microsoft 365 Group Email'
+    : targetMailboxType === 'shared'
+      ? 'Shared Mailbox'
+      : 'Connected Mailbox';
 
   const handleToggleSync = async () => {
     const updated = { ...config, sync_enabled: !config.sync_enabled };
@@ -241,6 +330,47 @@ const SyncConfigSection: React.FC = () => {
             placeholder="https://yourdomain.com/api/email-intel/oauth/callback"
           />
         </div>
+        <div>
+          <label style={labelStyle}>Target Mailbox Type</label>
+          <select
+            value={targetMailboxType}
+            onChange={e => setConfig(prev => ({ ...prev, target_mailbox_type: e.target.value as EmailSyncConfig['target_mailbox_type'] }))}
+            style={{ ...inputStyle, width: '100%', boxSizing: 'border-box' as const }}
+          >
+            <option value="connected">Connected mailbox</option>
+            <option value="shared">Shared mailbox</option>
+            <option value="group">Microsoft 365 Group</option>
+          </select>
+        </div>
+        {targetMailboxType !== 'connected' && (
+          <div>
+            <label style={labelStyle}>{targetMailboxLabel}</label>
+            <input
+              value={config.shared_mailbox_email || ''}
+              onChange={e => setConfig(prev => ({ ...prev, shared_mailbox_email: e.target.value }))}
+              style={{ ...inputStyle, width: '100%', boxSizing: 'border-box' as const }}
+              placeholder="info@windowfilmcanada.ca"
+            />
+          </div>
+        )}
+      </div>
+
+      <div style={{ marginBottom: 16, fontSize: 13, lineHeight: 1.5, color: '#555' }}>
+        {targetMailboxType === 'group' ? (
+          <span>
+            Microsoft 365 Group mode uses Graph group conversations instead of `/users/{'{'}mailbox{'}'}/messages`.
+            Add delegated `Group.Read.All` and `Group-Conversation.Read.All` to the same app registration,
+            grant admin consent, then click <strong>Connect Outlook</strong> again so the refreshed token includes the new scopes.
+          </span>
+        ) : targetMailboxType === 'shared' ? (
+          <span>
+            Shared mailbox mode uses delegated `Mail.Read.Shared` access on the same app registration.
+          </span>
+        ) : (
+          <span>
+            Connected mailbox mode syncs the signed-in Outlook mailbox directly.
+          </span>
+        )}
       </div>
 
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 20 }}>
@@ -268,10 +398,10 @@ const SyncConfigSection: React.FC = () => {
           <div style={{ fontSize: 13, color: '#555' }}>
             <strong>Pending Reviews:</strong> {status?.pending_reviews ?? 0}
           </div>
-          {(status?.sync_in_progress || status?.sync_message) && (
+          {syncStatusLabel && (
             <div style={{ fontSize: 13, color: '#555' }}>
               <strong>Sync Status:</strong>{' '}
-              {status?.sync_in_progress ? (status.sync_message || 'Syncing...') : 'Idle'}
+              {syncStatusLabel}
             </div>
           )}
         </div>
@@ -289,7 +419,12 @@ const SyncConfigSection: React.FC = () => {
             Auto-sync enabled
           </label>
           {config.user_email && (
-            <span style={{ fontSize: 12, color: '#888' }}>Connected: {config.user_email}</span>
+            <span style={{ fontSize: 12, color: '#888' }}>
+              Connected: {config.user_email}
+              {config.target_mailbox_email && config.target_mailbox_email !== config.user_email
+                ? ` | Syncing (${targetMailboxType}): ${config.target_mailbox_email}`
+                : ` | Syncing (${targetMailboxType})`}
+            </span>
           )}
         </div>
 
@@ -319,6 +454,362 @@ const SyncConfigSection: React.FC = () => {
             <strong>In Progress:</strong> {status.current_sync_counts.synced} emails synced, {status.current_sync_counts.matched} matched so far
           </div>
         )}
+      </div>
+    </div>
+  );
+};
+
+// ===================== Active Matched Lead Cleanup =====================
+const ActiveMatchReviewSection: React.FC<{
+  refreshToken: number;
+  onQueueChanged: () => void;
+}> = ({ refreshToken, onQueueChanged }) => {
+  const [items, setItems] = useState<ActiveMatchReviewItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [assignLead, setAssignLead] = useState<ActiveMatchReviewItem | null>(null);
+  const [drawerLead, setDrawerLead] = useState<{ leadId: number; leadName: string } | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await getActiveMatchReview();
+      setItems(res);
+    } catch (err: any) {
+      setError(getApiErrorMessage(err, 'Failed to load active matched leads'));
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load, refreshToken]);
+
+  const missingDealerCount = items.filter((item) => item.missing_dealer).length;
+  const reviewCount = items.filter((item) => item.needs_match_review).length;
+
+  return (
+    <div style={cardStyle}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap' }}>
+        <div>
+          <h2 style={{ fontSize: 18, fontWeight: 700, color: '#1a1a2e', margin: 0 }}>Active Match Cleanup</h2>
+          <p style={{ margin: '6px 0 0 0', fontSize: 13, color: '#6b7280', lineHeight: 1.5 }}>
+            Review the active leads where matched email activity can reduce manual assignment or cleanup work.
+          </p>
+        </div>
+        <button onClick={load} disabled={loading} style={{ ...btnSecondary, opacity: loading ? 0.6 : 1 }}>
+          {loading ? 'Refreshing...' : 'Refresh'}
+        </button>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 16 }}>
+        <div style={statCardStyle}>
+          <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>Matched Active Leads</div>
+          <div style={{ fontSize: 24, fontWeight: 700, color: '#111827' }}>{items.length}</div>
+        </div>
+        <div style={statCardStyle}>
+          <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>Missing Dealer</div>
+          <div style={{ fontSize: 24, fontWeight: 700, color: '#b91c1c' }}>{missingDealerCount}</div>
+        </div>
+        <div style={statCardStyle}>
+          <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>Needs Match Review</div>
+          <div style={{ fontSize: 24, fontWeight: 700, color: '#92400e' }}>{reviewCount}</div>
+        </div>
+      </div>
+
+      {error && <div style={{ color: '#c91414', marginBottom: 12, fontSize: 13 }}>{error}</div>}
+      {loading && <p style={{ color: '#999', fontSize: 13 }}>Loading cleanup queue...</p>}
+
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr>
+              <th style={thStyle}>Lead</th>
+              <th style={thStyle}>Assignment</th>
+              <th style={thStyle}>Latest Email</th>
+              <th style={thStyle}>Signals</th>
+              <th style={thStyle}>Review Reason</th>
+              <th style={thStyle}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item) => (
+              <tr key={item.lead_id}>
+                <td style={{ ...tdStyle, minWidth: 220 }}>
+                  <div style={{ fontWeight: 700, color: '#1f2937', marginBottom: 4 }}>{item.lead_name || `Lead #${item.lead_id}`}</div>
+                  <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>
+                    {item.lead_email || 'No email'} {item.lead_phone ? `| ${item.lead_phone}` : ''}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>
+                    Status: {item.lead_status} | Source: {item.lead_source || 'unknown'}
+                  </div>
+                  <Link
+                    to={`/admin/dashboard?lead=${item.lead_id}`}
+                    style={{ color: '#c91414', textDecoration: 'none', fontWeight: 600, fontSize: 12 }}
+                  >
+                    Open lead #{item.lead_id}
+                  </Link>
+                </td>
+                <td style={{ ...tdStyle, minWidth: 200 }}>
+                  <div style={{ fontWeight: 600, color: item.missing_dealer ? '#b91c1c' : '#1f2937', marginBottom: 4 }}>
+                    Dealer: {item.assigned_dealer_name || 'Missing dealer'}
+                  </div>
+                  {item.landing_page && (
+                    <div style={{ fontSize: 12, color: '#0f4c81', marginBottom: 4 }}>
+                      Dealer-site signal: {item.landing_page}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 12, color: '#6b7280' }}>
+                    Lead age: {item.lead_age_days}d | Last email: {item.days_since_last_email ?? '-'}d ago
+                  </div>
+                </td>
+                <td style={{ ...tdStyle, minWidth: 260 }}>
+                  <div style={{ fontWeight: 600, color: '#1f2937', marginBottom: 4 }}>
+                    {truncateText(item.latest_subject, 70)}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>
+                    {item.latest_sender_name || item.latest_sender_email} | {fmtDate(item.latest_email_at || item.last_email_activity)}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#374151', lineHeight: 1.5, marginBottom: 6 }}>
+                    {truncateText(item.latest_ai_summary, 120)}
+                  </div>
+                  {renderSentimentBadge(item.latest_ai_sentiment)}
+                </td>
+                <td style={{ ...tdStyle, minWidth: 200 }}>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
+                    {renderPriorityBadge(item.review_priority)}
+                    {item.weak_match_count > 0 && (
+                      <span style={{ padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600, background: '#fef3c7', color: '#92400e' }}>
+                        {item.weak_match_count} weak match
+                      </span>
+                    )}
+                    {item.active_duplicate_email_count > 1 && (
+                      <span style={{ padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600, background: '#fee2e2', color: '#991b1b' }}>
+                        duplicate email
+                      </span>
+                    )}
+                    {item.max_match_confidence !== null && (
+                      <span style={{ padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600, background: '#e0f2fe', color: '#0f4c81' }}>
+                        {(item.max_match_confidence * 100).toFixed(0)}% confidence
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>
+                    Match methods: {item.match_methods || '-'}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#6b7280' }}>
+                    Matched emails: {item.matched_email_count} | Strong: {item.strong_match_count}
+                  </div>
+                </td>
+                <td style={{ ...tdStyle, minWidth: 220, color: '#374151', lineHeight: 1.5 }}>
+                  {item.review_reason}
+                </td>
+                <td style={{ ...tdStyle, minWidth: 180 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <button
+                      onClick={() => setDrawerLead({ leadId: item.lead_id, leadName: item.lead_name || `Lead #${item.lead_id}` })}
+                      style={{ ...btnSecondary, width: '100%', fontSize: 12, padding: '6px 12px' }}
+                    >
+                      Review Emails
+                    </button>
+                    {item.missing_dealer && (
+                      <button
+                        onClick={() => setAssignLead(item)}
+                        style={{ ...btnPrimary, width: '100%', fontSize: 12, padding: '6px 12px' }}
+                      >
+                        Assign Dealer
+                      </button>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {items.length === 0 && !loading && (
+              <tr>
+                <td colSpan={6} style={{ ...tdStyle, textAlign: 'center', color: '#999' }}>
+                  No active matched leads need cleanup review yet
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {assignLead && (
+        <AssignDealerModal
+          leadId={assignLead.lead_id}
+          isOpen={true}
+          onClose={() => setAssignLead(null)}
+          onAssigned={() => {
+            setAssignLead(null);
+            load();
+            onQueueChanged();
+          }}
+        />
+      )}
+
+      {drawerLead && (
+        <EmailIntelDrawer
+          leadId={drawerLead.leadId}
+          leadName={drawerLead.leadName}
+          isOpen={true}
+          onClose={() => setDrawerLead(null)}
+        />
+      )}
+    </div>
+  );
+};
+
+// ===================== New Lead Candidates =====================
+const NewLeadCandidatesSection: React.FC<{
+  refreshToken: number;
+  onQueueChanged: () => void;
+}> = ({ refreshToken, onQueueChanged }) => {
+  const [items, setItems] = useState<NewLeadCandidate[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [actionMessage, setActionMessage] = useState('');
+  const [creatingId, setCreatingId] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await getNewLeadCandidates();
+      setItems(res);
+    } catch (err: any) {
+      setError(getApiErrorMessage(err, 'Failed to load new lead candidates'));
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load, refreshToken]);
+
+  const handleCreateLead = async (emailId: number) => {
+    setCreatingId(emailId);
+    setError('');
+    setActionMessage('');
+    try {
+      const res = await createLeadFromEmailCandidate(emailId);
+      const actionLabel = res.action === 'created' ? 'Created lead' : 'Matched existing lead';
+      setActionMessage(`${actionLabel} #${res.lead_id} from candidate email. ${res.matched_email_count} email(s) linked.`);
+      await load();
+      onQueueChanged();
+    } catch (err: any) {
+      setError(getApiErrorMessage(err, 'Failed to create lead from candidate email'));
+    } finally {
+      setCreatingId(null);
+    }
+  };
+
+  const highSignalCount = items.filter((item) => item.candidate_score >= 6).length;
+  const overlapCount = items.filter((item) => item.existing_sender_lead_count > 0).length;
+
+  return (
+    <div style={cardStyle}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap' }}>
+        <div>
+          <h2 style={{ fontSize: 18, fontWeight: 700, color: '#1a1a2e', margin: 0 }}>New Lead Candidates</h2>
+          <p style={{ margin: '6px 0 0 0', fontSize: 13, color: '#6b7280', lineHeight: 1.5 }}>
+            Unmatched inbound emails that look like real lead inquiries. This stays read-only until the create-from-email flow is ready.
+          </p>
+        </div>
+        <button onClick={load} disabled={loading} style={{ ...btnSecondary, opacity: loading ? 0.6 : 1 }}>
+          {loading ? 'Refreshing...' : 'Refresh'}
+        </button>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 16 }}>
+        <div style={statCardStyle}>
+          <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>Candidate Emails</div>
+          <div style={{ fontSize: 24, fontWeight: 700, color: '#111827' }}>{items.length}</div>
+        </div>
+        <div style={statCardStyle}>
+          <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>High-Signal Candidates</div>
+          <div style={{ fontSize: 24, fontWeight: 700, color: '#166534' }}>{highSignalCount}</div>
+        </div>
+        <div style={statCardStyle}>
+          <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 4 }}>Sender Already In Leads</div>
+          <div style={{ fontSize: 24, fontWeight: 700, color: '#92400e' }}>{overlapCount}</div>
+        </div>
+      </div>
+
+      {error && <div style={{ color: '#c91414', marginBottom: 12, fontSize: 13 }}>{error}</div>}
+      {actionMessage && <div style={{ color: '#166534', marginBottom: 12, fontSize: 13 }}>{actionMessage}</div>}
+      {loading && <p style={{ color: '#999', fontSize: 13 }}>Loading candidate emails...</p>}
+
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr>
+              <th style={thStyle}>Sender</th>
+              <th style={thStyle}>Subject / Preview</th>
+              <th style={thStyle}>Reason</th>
+              <th style={thStyle}>Score</th>
+              <th style={thStyle}>Existing Lead Overlap</th>
+              <th style={thStyle}>Received</th>
+              <th style={thStyle}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item) => (
+              <tr key={item.id}>
+                <td style={{ ...tdStyle, minWidth: 220 }}>
+                  <div style={{ fontWeight: 700, color: '#1f2937', marginBottom: 4 }}>{item.sender_name || item.sender_email}</div>
+                  <div style={{ fontSize: 12, color: '#6b7280' }}>{item.sender_email}</div>
+                </td>
+                <td style={{ ...tdStyle, minWidth: 280 }}>
+                  <div style={{ fontWeight: 600, color: '#1f2937', marginBottom: 4 }}>{truncateText(item.subject, 75)}</div>
+                  <div style={{ fontSize: 12, color: '#6b7280', lineHeight: 1.5 }}>{truncateText(item.body_preview, 120)}</div>
+                </td>
+                <td style={{ ...tdStyle, minWidth: 160, color: '#374151' }}>{item.candidate_reason}</td>
+                <td style={tdStyle}>
+                  <span
+                    style={{
+                      padding: '2px 8px',
+                      borderRadius: 10,
+                      fontSize: 11,
+                      fontWeight: 700,
+                      background: item.candidate_score >= 6 ? '#dcfce7' : '#fef3c7',
+                      color: item.candidate_score >= 6 ? '#166534' : '#92400e',
+                    }}
+                  >
+                    {item.candidate_score}
+                  </span>
+                </td>
+                <td style={tdStyle}>
+                  <span style={{ color: item.existing_sender_lead_count > 0 ? '#92400e' : '#6b7280', fontWeight: item.existing_sender_lead_count > 0 ? 600 : 500 }}>
+                    {item.existing_sender_lead_count > 0 ? `${item.existing_sender_lead_count} lead(s)` : 'None'}
+                  </span>
+                </td>
+                <td style={tdStyle}>{fmtDate(item.received_at)}</td>
+                <td style={{ ...tdStyle, minWidth: 160 }}>
+                  <button
+                    onClick={() => handleCreateLead(item.id)}
+                    disabled={creatingId === item.id}
+                    style={{ ...btnPrimary, width: '100%', fontSize: 12, padding: '6px 12px', opacity: creatingId === item.id ? 0.6 : 1 }}
+                  >
+                    {creatingId === item.id ? 'Working...' : item.existing_sender_lead_count > 0 ? 'Create / Match' : 'Create Lead'}
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {items.length === 0 && !loading && (
+              <tr>
+                <td colSpan={7} style={{ ...tdStyle, textAlign: 'center', color: '#999' }}>
+                  No unmatched inbound emails meet the current candidate threshold
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </div>
   );
@@ -457,23 +948,6 @@ const RecentEmailsSection: React.FC = () => {
 
   useEffect(() => { load(); }, [load]);
 
-  const sentimentBadge = (s: EmailMessage['ai_sentiment']) => {
-    const colors: Record<string, { bg: string; color: string }> = {
-      positive: { bg: '#dcfce7', color: '#166534' },
-      neutral: { bg: '#f3f4f6', color: '#374151' },
-      negative: { bg: '#fde8e8', color: '#991b1b' },
-    };
-    const c = s ? colors[s] : colors.neutral;
-    return (
-      <span style={{
-        padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600,
-        background: c.bg, color: c.color,
-      }}>
-        {s || 'unknown'}
-      </span>
-    );
-  };
-
   return (
     <div style={cardStyle}>
       <h2 style={{ fontSize: 18, fontWeight: 700, color: '#1a1a2e', marginBottom: 16 }}>Recent Matched Email Activity</h2>
@@ -516,7 +990,7 @@ const RecentEmailsSection: React.FC = () => {
                     </Link>
                   ) : '-'}
                 </td>
-                <td style={tdStyle}>{sentimentBadge(e.ai_sentiment)}</td>
+                <td style={tdStyle}>{renderSentimentBadge(e.ai_sentiment)}</td>
               </tr>
             ))}
             {emails.length === 0 && !loading && (

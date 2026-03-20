@@ -235,7 +235,7 @@ def sync_leads(conn, unassigned, active, history):
                     utm_source, utm_medium, utm_campaign, utm_content,
                     comments, status,
                     form_submit_date, created_at,
-                    assigned_dealer_id, final_installer_selection,
+                    assigned_dealer_id, final_dealer_selection,
                     value_of_order
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,

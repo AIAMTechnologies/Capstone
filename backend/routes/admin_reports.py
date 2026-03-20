@@ -89,7 +89,7 @@ async def lead_graph(tf: int = 6, opt: int = 1, current_user: AdminUser = Depend
 async def dealer_performance(source: Optional[str] = None, current_user: AdminUser = Depends(get_current_user)):
     """
     Report 1: All dealers with Active/Converted/Dead counts + Avg Response Time.
-    Uses final_installer_selection (dealer name stored on leads) for matching since
+    Uses final_dealer_selection (dealer name stored on leads) for matching since
     not all leads have assigned_dealer_id set.
     """
     source_filter = ""
@@ -108,7 +108,7 @@ async def dealer_performance(source: Optional[str] = None, current_user: AdminUs
             COUNT(DISTINCT l.id) as total_leads
         FROM dealers d
         LEFT JOIN leads l ON (l.assigned_dealer_id = d.id
-            OR LOWER(TRIM(l.final_installer_selection)) = LOWER(TRIM(d.name)))
+            OR LOWER(TRIM(l.final_dealer_selection)) = LOWER(TRIM(d.name)))
             {source_filter}
         GROUP BY d.name
         ORDER BY d.name
@@ -123,7 +123,7 @@ async def dealer_performance(source: Optional[str] = None, current_user: AdminUs
             AVG(EXTRACT(EPOCH FROM (COALESCE(l.assigned_at, l.created_at + INTERVAL '1 day') - l.created_at)) / 3600) as avg_response_hours
         FROM dealers d
         JOIN leads l ON (l.assigned_dealer_id = d.id
-            OR LOWER(TRIM(l.final_installer_selection)) = LOWER(TRIM(d.name)))
+            OR LOWER(TRIM(l.final_dealer_selection)) = LOWER(TRIM(d.name)))
         WHERE l.assigned_at IS NOT NULL
         GROUP BY d.name
     """
@@ -184,7 +184,7 @@ async def dealer_projects(source: Optional[str] = None, current_user: AdminUser 
             COUNT(l.id) as total_leads
         FROM dealers d
         LEFT JOIN leads l ON (l.assigned_dealer_id = d.id
-            OR LOWER(TRIM(l.final_installer_selection)) = LOWER(TRIM(d.name)))
+            OR LOWER(TRIM(l.final_dealer_selection)) = LOWER(TRIM(d.name)))
             {source_filter}
         GROUP BY d.id, d.name
         HAVING COUNT(l.id) > 0
@@ -224,7 +224,7 @@ async def lead_status_report(source: Optional[str] = None, current_user: AdminUs
             END as lead_score_pct
         FROM dealers d
         LEFT JOIN leads l ON (l.assigned_dealer_id = d.id
-            OR LOWER(TRIM(l.final_installer_selection)) = LOWER(TRIM(d.name)))
+            OR LOWER(TRIM(l.final_dealer_selection)) = LOWER(TRIM(d.name)))
             {source_filter}
         GROUP BY d.id, d.name
         HAVING COUNT(l.id) > 0

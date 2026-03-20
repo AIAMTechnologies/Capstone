@@ -1,6 +1,6 @@
-# Lead Allocation & Installer ML Local Setup
+# Lead Allocation & Dealer ML Local Setup
 
-This repo already contains everything needed to run the FastAPI backend and its machine-learning powered installer allocation locally. Use the steps below to expose the ML status/training endpoints from your local environment without depending on cloud configuration.
+This repo already contains everything needed to run the FastAPI backend and its machine-learning powered dealer allocation locally. Use the steps below to expose the ML status/training endpoints from your local environment without depending on cloud configuration.
 
 ## 1. Create a local `.env` file
 Copy the sample variables and adjust them to match your local database and secrets:

@@ -4,10 +4,11 @@ import logging
 import html
 import threading
 import asyncio
+import base64
 from datetime import datetime, timedelta
 from copy import deepcopy
 from typing import Optional, List, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, unquote
 
 import requests as http_requests
 from cryptography.fernet import Fernet
@@ -15,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from auth import AdminUser, get_current_user
-from db import execute_query
+from db import execute_query, get_db_connection
 
 logger = logging.getLogger("lead_allocation")
 
@@ -23,7 +24,7 @@ router = APIRouter(prefix="/api/email-intel", tags=["Email Intelligence"])
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 MS_LOGIN_BASE = "https://login.microsoftonline.com"
-OAUTH_SCOPES = "Mail.Read offline_access User.Read"
+OAUTH_SCOPES = "Mail.Read Mail.Read.Shared Group.Read.All Group-Conversation.Read.All offline_access User.Read"
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -49,6 +50,20 @@ MS_REDIRECT_URI = os.getenv("MS_REDIRECT_URI", "http://localhost:8000/api/email-
 
 MAX_EMAIL_BODY_CHARS = 600  # Keep short for speed — subject + preview is usually enough
 AI_BATCH_SIZE = 8  # Process this many AI calls concurrently
+GRAPH_SYNC_PAGE_SIZE = 1000
+try:
+    EMAIL_SYNC_HISTORY_LIMIT = max(1, int(os.getenv("EMAIL_SYNC_HISTORY_LIMIT", "10000")))
+except ValueError:
+    EMAIL_SYNC_HISTORY_LIMIT = 10000
+
+MAILBOX_TYPE_CONNECTED = "connected"
+MAILBOX_TYPE_SHARED = "shared"
+MAILBOX_TYPE_GROUP = "group"
+VALID_TARGET_MAILBOX_TYPES = {
+    MAILBOX_TYPE_CONNECTED,
+    MAILBOX_TYPE_SHARED,
+    MAILBOX_TYPE_GROUP,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +86,29 @@ def decrypt_value(encrypted: str) -> str:
     if not encrypted:
         return encrypted
     return get_fernet().decrypt(encrypted.encode()).decode()
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    if not token:
+        return {}
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+    except Exception:
+        return {}
+
+
+def _infer_user_email_from_token(token: str) -> str:
+    payload = _decode_jwt_payload(token)
+    return (
+        (payload.get("preferred_username") or "").strip()
+        or (payload.get("upn") or "").strip()
+        or (payload.get("email") or "").strip()
+        or (payload.get("unique_name") or "").strip()
+    ).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +177,8 @@ class OAuthConfigIn(BaseModel):
     ms_client_id: Optional[str] = None
     ms_client_secret: Optional[str] = None
     ms_redirect_uri: Optional[str] = None
+    shared_mailbox_email: Optional[str] = None
+    target_mailbox_type: Optional[str] = None
     sync_enabled: Optional[bool] = None
     sync_interval_minutes: Optional[int] = None
 
@@ -151,7 +191,23 @@ class OAuthCallbackIn(BaseModel):
 # Helpers -- DB convenience wrappers
 # ---------------------------------------------------------------------------
 
+def _ensure_sync_config_columns():
+    execute_query(
+        "ALTER TABLE email_sync_config ADD COLUMN IF NOT EXISTS shared_mailbox_email VARCHAR(255)",
+        fetch=False,
+    )
+    execute_query(
+        "ALTER TABLE email_sync_config ADD COLUMN IF NOT EXISTS target_mailbox_type VARCHAR(32)",
+        fetch=False,
+    )
+    execute_query(
+        "ALTER TABLE email_sync_config ADD COLUMN IF NOT EXISTS target_group_id VARCHAR(255)",
+        fetch=False,
+    )
+
+
 def _get_sync_config() -> Optional[dict]:
+    _ensure_sync_config_columns()
     rows = execute_query("SELECT * FROM email_sync_config ORDER BY id DESC LIMIT 1")
     if rows:
         return rows[0]
@@ -186,6 +242,7 @@ def _get_sync_config_decrypted() -> Optional[dict]:
 
 def _upsert_sync_config(**kwargs):
     """Insert or update the single sync-config row. Encrypts sensitive fields."""
+    _ensure_sync_config_columns()
     # Encrypt sensitive values before storing
     for field in ("access_token", "refresh_token", "ms_client_secret"):
         if field in kwargs and kwargs[field]:
@@ -213,6 +270,156 @@ def _upsert_sync_config(**kwargs):
             tuple(kwargs.values()),
             fetch=False,
         )
+
+
+def _get_target_mailbox_email(config: Optional[dict]) -> str:
+    if not config:
+        return ""
+    mailbox_type = _get_target_mailbox_type(config)
+    if mailbox_type == MAILBOX_TYPE_CONNECTED:
+        return ((config.get("user_email") or "").strip()).lower()
+    return (
+        (config.get("shared_mailbox_email") or "").strip()
+        or (config.get("user_email") or "").strip()
+    ).lower()
+
+
+def _get_target_mailbox_type(config: Optional[dict]) -> str:
+    raw = ((config or {}).get("target_mailbox_type") or "").strip().lower()
+    if raw in VALID_TARGET_MAILBOX_TYPES:
+        return raw
+    if (config or {}).get("shared_mailbox_email"):
+        return MAILBOX_TYPE_SHARED
+    return MAILBOX_TYPE_CONNECTED
+
+
+def _graph_mailbox_base(config: Optional[dict]) -> str:
+    if _get_target_mailbox_type(config) == MAILBOX_TYPE_GROUP:
+        return f"{GRAPH_BASE}/me"
+    mailbox_email = _get_target_mailbox_email(config)
+    if not mailbox_email:
+        return f"{GRAPH_BASE}/me"
+    user_email = ((config or {}).get("user_email") or "").strip().lower()
+    if mailbox_email == user_email or not (config or {}).get("shared_mailbox_email"):
+        return f"{GRAPH_BASE}/me"
+    return f"{GRAPH_BASE}/users/{mailbox_email}"
+
+
+def _get_matching_mailbox_email(config: Optional[dict]) -> str:
+    if not config:
+        return ""
+    if _get_target_mailbox_type(config) == MAILBOX_TYPE_GROUP:
+        return ((config.get("user_email") or "").strip() or _get_target_mailbox_email(config)).lower()
+    return _get_target_mailbox_email(config)
+
+
+def _extract_graph_recipient_email(recipient: Optional[dict]) -> str:
+    if not recipient:
+        return ""
+    email_address = recipient.get("emailAddress") or recipient
+    return ((email_address or {}).get("address") or "").strip().lower()
+
+
+def _extract_graph_recipient_name(recipient: Optional[dict]) -> str:
+    if not recipient:
+        return ""
+    email_address = recipient.get("emailAddress") or recipient
+    return ((email_address or {}).get("name") or "").strip()
+
+
+def _flatten_graph_recipients(*recipient_groups: Optional[list]) -> list[str]:
+    flattened: list[str] = []
+    seen: set[str] = set()
+    for group in recipient_groups:
+        for recipient in group or []:
+            email = _extract_graph_recipient_email(recipient)
+            if email and email not in seen:
+                flattened.append(email)
+                seen.add(email)
+    return flattened
+
+
+def _resolve_group_target(token: str, config: Optional[dict]) -> dict:
+    target_mailbox = _get_target_mailbox_email(config)
+    if not target_mailbox:
+        raise RuntimeError("Group mailbox mode requires a target group email.")
+
+    cached_group_id = ((config or {}).get("target_group_id") or "").strip()
+    if cached_group_id:
+        try:
+            group = _graph_get(
+                token,
+                f"{GRAPH_BASE}/groups/{cached_group_id}?$select=id,mail,displayName",
+            )
+            group_mail = (group.get("mail") or "").strip().lower()
+            if not group_mail or group_mail == target_mailbox:
+                return group
+        except RuntimeError as exc:
+            if "Authorization_RequestDenied" in str(exc):
+                raise RuntimeError(
+                    "Microsoft 365 Group sync requires delegated Group.Read.All and "
+                    "Group-Conversation.Read.All permissions, admin consent, and a fresh Outlook reconnect."
+                ) from exc
+
+    escaped_target_mailbox = target_mailbox.replace("'", "''")
+    query = urlencode(
+        {
+            "$filter": f"mail eq '{escaped_target_mailbox}'",
+            "$select": "id,mail,displayName",
+        }
+    )
+    try:
+        data = _graph_get(token, f"{GRAPH_BASE}/groups?{query}")
+    except RuntimeError as exc:
+        if "Authorization_RequestDenied" in str(exc):
+            raise RuntimeError(
+                "Microsoft 365 Group sync requires delegated Group.Read.All and "
+                "Group-Conversation.Read.All permissions, admin consent, and a fresh Outlook reconnect."
+            ) from exc
+        raise
+
+    groups = data.get("value") or []
+    if not groups:
+        raise RuntimeError(f"No Microsoft 365 Group with the email address {target_mailbox} was found in Graph.")
+
+    group = groups[0]
+    if group.get("id") and group.get("id") != cached_group_id:
+        _upsert_sync_config(target_group_id=group["id"])
+    return group
+
+
+def _is_group_internal_sender(sender_email: str, config: Optional[dict]) -> bool:
+    sender = (sender_email or "").lower().strip()
+    if not sender:
+        return False
+
+    aliases = {
+        ((config or {}).get("user_email") or "").strip().lower(),
+        _get_target_mailbox_email(config),
+        _get_matching_mailbox_email(config),
+    }
+    aliases.discard("")
+    if sender in aliases:
+        return True
+
+    internal_seed = _get_matching_mailbox_email(config) or _get_target_mailbox_email(config)
+    internal_domain = internal_seed.split("@")[-1] if internal_seed else ""
+    return bool(internal_domain and sender.endswith(f"@{internal_domain}"))
+
+
+def _group_post_message_id(group_id: str, post_id: str) -> str:
+    return f"group-post:{group_id}:{post_id}"
+
+
+def _fetch_group_thread_posts(token: str, group_id: str, thread_id: str) -> list[dict]:
+    query = urlencode(
+        {
+            "$top": GRAPH_SYNC_PAGE_SIZE,
+            "$select": "id,conversationId,conversationThreadId,receivedDateTime,createdDateTime,body,from,sender",
+        }
+    )
+    data = _graph_get(token, f"{GRAPH_BASE}/groups/{group_id}/threads/{thread_id}/posts?{query}")
+    return data.get("value") or []
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +514,152 @@ def _normalize_email_text(value: str, max_chars: Optional[int] = None) -> str:
 
 def _normalize_phone(value: str) -> str:
     return "".join(ch for ch in value if ch.isdigit())
+
+
+_FORM_FIELD_LABELS = {
+    "name": ["name"],
+    "first_name": ["first name", "first_name"],
+    "last_name": ["last name", "last_name"],
+    "email": ["email", "email address"],
+    "phone": ["phone", "phone number", "primary phone", "cell phone", "work phone"],
+    "address": ["address"],
+    "city": ["city"],
+    "province": ["province", "state"],
+    "company_name": ["company name", "company name (if applicable)", "company"],
+    "project_type": ["type of project", "project type"],
+    "project_location_city_province": ["project location (city, province)", "location (city, province)"],
+    "project_location_city": ["project location (city)", "location (city)"],
+    "project_location_province": ["project location (province)", "location (province)"],
+    "submission_host": ["submission host"],
+    "submission_date": ["submission date"],
+    "submission_ip": ["submission ip"],
+    "submission_source": ["submission source"],
+    "submission_data": ["submission data"],
+    "comments": ["comments / questions", "comments", "message"],
+}
+
+_ALL_FORM_FIELD_VARIANTS = [
+    variant
+    for variants in _FORM_FIELD_LABELS.values()
+    for variant in variants
+]
+
+
+def _form_label_pattern(label: str) -> str:
+    parts = [_re.escape(part) for part in _re.split(r"[\s_]+", label.strip()) if part]
+    return r"[\s_]*".join(parts)
+
+
+def _clean_extracted_field_value(value: str) -> str:
+    cleaned = _normalize_email_text(value or "")
+    cleaned = _re.sub(r"^[\s,;:-]+|[\s,;:-]+$", "", cleaned)
+    return cleaned
+
+
+def _extract_labeled_value(text: str, labels: List[str]) -> Optional[str]:
+    if not text:
+        return None
+    label_pattern = "|".join(_form_label_pattern(label) for label in labels)
+    next_pattern = "|".join(_form_label_pattern(label) for label in _ALL_FORM_FIELD_VARIANTS)
+    match = _re.search(
+        rf"(?is)\b(?:{label_pattern})\s*:\s*(.+?)(?=\s+\b(?:{next_pattern})\s*:|$)",
+        text,
+    )
+    if not match:
+        return None
+    value = _clean_extracted_field_value(match.group(1))
+    return value or None
+
+
+def _extract_form_fields(text: str) -> dict:
+    fields = {}
+    for key, labels in _FORM_FIELD_LABELS.items():
+        value = _extract_labeled_value(text, labels)
+        if value:
+            fields[key] = value
+    return fields
+
+
+def _extract_host_from_urlish(value: str) -> str:
+    if not value:
+        return ""
+    match = _re.search(r"(?i)(?:https?://)?(?:www\.)?([a-z0-9.-]+\.[a-z]{2,})(?:/|$)", value.strip())
+    return (match.group(1).lower() if match else value.strip().lower()).strip()
+
+
+def _extract_first_urlish(value: str) -> str:
+    if not value:
+        return ""
+    match = _re.search(r"(?i)((?:https?://)?(?:www\.)?[^\s]+)", value.strip())
+    return (match.group(1).strip() if match else value.strip())
+
+
+def _extract_email_text_from_graph_message(message: dict) -> tuple[str, str]:
+    body_content = ((message.get("body") or {}).get("content") or "").strip()
+    body_text = _normalize_email_text(body_content)
+    graph_preview = _normalize_email_text(message.get("bodyPreview", "") or "", 1200)
+    full_preview = _normalize_email_text(body_text, 1200)
+    body_preview = full_preview if len(full_preview) > len(graph_preview) else graph_preview
+    return body_preview, body_text[:4000]
+
+
+def _fetch_graph_message_content(token: str, ms_message_id: str, config: Optional[dict] = None) -> tuple[str, str]:
+    if not token or not ms_message_id:
+        return "", ""
+    if ms_message_id.startswith("group-post:"):
+        return "", ""
+    bases = []
+    primary_base = _graph_mailbox_base(config)
+    bases.append(primary_base)
+    if primary_base != f"{GRAPH_BASE}/me":
+        bases.append(f"{GRAPH_BASE}/me")
+
+    for base in bases:
+        resp = http_requests.get(
+            f"{base}/messages/{ms_message_id}?$select=body,bodyPreview",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Prefer": 'outlook.body-content-type="text"',
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return _extract_email_text_from_graph_message(resp.json())
+        logger.warning("Graph body fetch failed for %s via %s: %s", ms_message_id, base, resp.status_code)
+    return "", ""
+
+
+def _hydrate_email_record_for_parsing(email_record: dict, token: str = "", config: Optional[dict] = None) -> dict:
+    enriched = dict(email_record)
+    current_preview = _normalize_email_text(enriched.get("body_preview") or "", 1200)
+    current_body = _normalize_email_text(enriched.get("body_text") or "", 4000)
+    sender_email = (enriched.get("sender_email") or "").lower().strip()
+    subject = (enriched.get("subject") or "").lower()
+    needs_refresh = (
+        not current_body
+        and enriched.get("ms_message_id")
+        and (
+            sender_email.startswith("lead@")
+            or "form submission" in subject
+            or "request a quote" in subject
+            or current_preview.lower().find("first_name:") >= 0
+        )
+    )
+    if needs_refresh and token:
+        fetched_preview, fetched_body = _fetch_graph_message_content(token, enriched["ms_message_id"], config)
+        if len(fetched_body) > len(current_body) or len(fetched_preview) > len(current_preview):
+            enriched["body_preview"] = fetched_preview or current_preview
+            enriched["body_text"] = fetched_body or current_body
+            if enriched.get("id"):
+                execute_query(
+                    "UPDATE email_messages SET body_preview = %s, body_text = %s WHERE id = %s",
+                    (enriched["body_preview"], enriched["body_text"], enriched["id"]),
+                    fetch=False,
+                )
+            return enriched
+    enriched["body_preview"] = current_preview
+    enriched["body_text"] = current_body
+    return enriched
 
 
 def _openai_json_completion(
@@ -501,30 +854,29 @@ def _load_leads_cache(mailbox_email: str = "") -> dict:
     }
 
 
-def _try_auto_create_lead(email_record: dict, mailbox_email: str, leads_cache: dict) -> tuple:
-    """
-    If an email contains customer info from a form submission (Name, Email, Phone)
-    and no matching lead exists, auto-create the lead.
-
-    This handles the case where Colin forwards form submissions to dealers
-    before the lead is created in Lasso/the CRM.
-
-    Returns: (lead_id, confidence, method) or (None, 0, None)
-    """
-    body = f"{email_record.get('body_text') or ''} {email_record.get('body_preview') or ''}"
+def _extract_candidate_lead_fields(email_record: dict, mailbox_email: str) -> Optional[dict]:
+    """Extract customer lead fields from a likely form-submission email."""
+    body = _normalize_email_text(
+        f"{email_record.get('body_text') or ''} {email_record.get('body_preview') or ''}",
+        8000,
+    )
     subject = email_record.get("subject", "")
+    parsed_fields = _extract_form_fields(body)
+    sender_email = (email_record.get("sender_email") or "").lower()
 
     # Only auto-create from form submissions or lead assignment emails
     is_form = (
         "form submission" in body.lower()
         or "form submission" in subject.lower()
-        or "squarespace" in email_record.get("sender_email", "").lower()
+        or "squarespace" in sender_email
         or _re.search(r'\b(lead|Lead)\b.*-.*\d{2}/\d{2}/\d{4}', subject)
         or "contact form submission" in subject.lower()
-        or email_record.get("sender_email", "").startswith("lead@")
+        or sender_email.startswith("lead@")
+        or "submission_host" in parsed_fields
+        or "submission_source" in parsed_fields
     )
     if not is_form:
-        return (None, 0, None)
+        return None
 
     # Extract customer info — try multiple formats
     customer_email = None
@@ -535,65 +887,100 @@ def _try_auto_create_lead(email_record: dict, mailbox_email: str, leads_cache: d
     customer_province = None
     customer_company = None
     customer_project_type = None
+    submission_host = parsed_fields.get("submission_host", "")
+    submission_source = parsed_fields.get("submission_source", "")
+    comments = parsed_fields.get("comments", "")
 
-    # Format 1: "Name: First Last" + "Email: xxx@yyy.com"
-    name_m = _re.search(r'Name:\s*([A-Z][a-z]+)\s+([A-Z][a-zA-Z\'\-]+)', body)
-    if name_m:
-        customer_first = name_m.group(1)
-        customer_last = name_m.group(2)
+    if parsed_fields.get("first_name"):
+        customer_first = parsed_fields["first_name"].split()[0]
+    if parsed_fields.get("last_name"):
+        last_parts = parsed_fields["last_name"].split()
+        customer_last = last_parts[-1] if last_parts else None
 
-    # Format 2: "First Name: X" + "Last Name: Y"
+    # Formats that only provide a single full-name label.
+    if not customer_first and parsed_fields.get("name"):
+        name_parts = parsed_fields["name"].split()
+        if len(name_parts) >= 2:
+            customer_first = name_parts[0]
+            customer_last = " ".join(name_parts[1:])
     if not customer_first:
-        fn_m = _re.search(r'First\s*Name:\s*(\S+)', body)
-        ln_m = _re.search(r'Last\s*Name:\s*(\S+)', body)
-        if fn_m and ln_m:
-            customer_first = fn_m.group(1)
-            customer_last = ln_m.group(1)
+        name_m = _re.search(r'(?i)\bname\s*:\s*([A-Z][A-Za-zÀ-ÿ\'\-]+)\s+([A-Z][A-Za-zÀ-ÿ\'\-\s]+)', body)
+        if name_m:
+            customer_first = name_m.group(1).strip()
+            customer_last = name_m.group(2).strip()
 
     # Extract email
-    em_m = _re.search(r'Email:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', body)
-    if em_m:
-        customer_email = em_m.group(1).lower()
+    if parsed_fields.get("email"):
+        em_m = _re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', parsed_fields["email"])
+        if em_m:
+            customer_email = em_m.group(1).lower()
+    if not customer_email:
+        em_m = _re.search(r'Email:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', body, _re.I)
+        if em_m:
+            customer_email = em_m.group(1).lower()
 
     # Extract phone
-    ph_m = _re.search(r'Phone:\s*([(\d][\d\s().-]{8,})', body)
-    if ph_m:
-        customer_phone = ph_m.group(1).strip()
+    if parsed_fields.get("phone"):
+        ph_m = _re.search(r'([+\d(][\d\s().-]{8,})', parsed_fields["phone"])
+        if ph_m:
+            customer_phone = ph_m.group(1).strip()
+    if not customer_phone:
+        ph_m = _re.search(r'Phone:\s*([(\d][\d\s().-]{8,})', body, _re.I)
+        if ph_m:
+            customer_phone = ph_m.group(1).strip()
 
     # Extract city/province
-    city_m = _re.search(r'(?:City|Location)[^:]*:\s*([^,\n]+)', body)
-    if city_m:
-        customer_city = city_m.group(1).strip()
-    prov_m = _re.search(r'Province:\s*([A-Za-z\s]+?)(?:\s*(?:Project|Phone|Email|$))', body)
-    if prov_m:
-        customer_province = prov_m.group(1).strip()
+    if parsed_fields.get("project_location_city_province"):
+        parts = [part.strip() for part in parsed_fields["project_location_city_province"].split(",") if part.strip()]
+        if parts:
+            customer_city = parts[0]
+        if len(parts) > 1:
+            customer_province = parts[1]
+    if not customer_city and parsed_fields.get("project_location_city"):
+        customer_city = parsed_fields["project_location_city"].strip()
+    if not customer_city and parsed_fields.get("city"):
+        customer_city = parsed_fields["city"].strip()
+    if not customer_province and parsed_fields.get("project_location_province"):
+        customer_province = parsed_fields["project_location_province"].strip()
+    if not customer_province and parsed_fields.get("province"):
+        customer_province = parsed_fields["province"].strip()
 
     # Extract project type
-    proj_m = _re.search(r'Type of Project:\s*(\w+)', body)
-    if proj_m:
-        customer_project_type = proj_m.group(1).strip()
+    if parsed_fields.get("project_type"):
+        customer_project_type = parsed_fields["project_type"].strip()
+    if not customer_project_type:
+        proj_m = _re.search(r'Type of Project:\s*([^\n]+?)(?=\s+\b(?:Project|Comments|Email|Phone)\b\s*:|$)', body, _re.I)
+        if proj_m:
+            customer_project_type = proj_m.group(1).strip()
 
     # Extract company
-    comp_m = _re.search(r'Company\s*Name[^:]*:\s*([^\n]+?)(?:\s*Type|\s*$)', body)
-    if comp_m:
-        val = comp_m.group(1).strip()
+    if parsed_fields.get("company_name"):
+        val = parsed_fields["company_name"].strip()
         if val and val.lower() not in ("n/a", "na", "none", ""):
             customer_company = val
 
+    if not submission_source:
+        submission_source_m = _re.search(r'(?i)submission\s+source\s*:\s*([^\s]+)', body)
+        if submission_source_m:
+            submission_source = submission_source_m.group(1).strip()
+    if not submission_host:
+        submission_host_m = _re.search(r'(?i)submission\s+host\s*:\s*([^\s]+)', body)
+        if submission_host_m:
+            submission_host = submission_host_m.group(1).strip()
+    if submission_source and not submission_host:
+        submission_host = _extract_host_from_urlish(submission_source)
+    elif submission_host:
+        submission_host = _extract_host_from_urlish(submission_host)
+    submission_source = _extract_first_urlish(submission_source)
+
+    if customer_province:
+        customer_province = customer_province.replace(".", "").strip()
+        if len(customer_province) <= 3:
+            customer_province = customer_province.upper()
+
     # Must have at least a name AND email to create a lead
     if not customer_email or not customer_first:
-        return (None, 0, None)
-
-    # Don't create if this email already exists in leads cache
-    if customer_email and customer_email in leads_cache["by_email"]:
-        # Already exists — return the match
-        return (leads_cache["by_email"][customer_email], 0.90, "body_email")
-
-    # Don't create if this name already exists
-    if customer_first and customer_last:
-        name_key = f"{customer_first.lower()} {customer_last.lower()}"
-        if name_key in leads_cache["by_name"]:
-            return (leads_cache["by_name"][name_key], 0.85, "body_name")
+        return None
 
     # Extract dealer info from recipients (who Colin is forwarding to)
     recipients_raw = email_record.get("recipient_emails", "[]")
@@ -607,31 +994,229 @@ def _try_auto_create_lead(email_record: dict, mailbox_email: str, leads_cache: d
             dealer_email = r.lower().strip()
             break
 
-    # Create the lead
-    full_name = f"{customer_first or ''} {customer_last or ''}".strip()
-    result = execute_query(
-        """INSERT INTO leads (
-            name, first_name, last_name, email, phone,
-            city, province, company_name, project_type,
-            dealer_email, source, status, email_match_count
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id""",
+    return {
+        "full_name": f"{customer_first or ''} {customer_last or ''}".strip(),
+        "first_name": customer_first,
+        "last_name": customer_last,
+        "email": customer_email,
+        "phone": customer_phone or "",
+        "city": customer_city or "",
+        "province": customer_province or "",
+        "company_name": customer_company or "",
+        "project_type": customer_project_type or "",
+        "dealer_email": dealer_email or "",
+        "lead_source": "Email Auto-Created",
+        "landing_page": submission_host or "",
+        "landing_page_url": submission_source or "",
+        "comments": comments or "",
+    }
+
+
+def _insert_email_candidate_lead(candidate: dict, email_record: dict, leads_cache: dict, created_by: str = "") -> Optional[int]:
+    """Create a lead from extracted email fields and refresh the in-memory cache."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO leads (
+                    name, first_name, last_name, email, phone,
+                    city, province, company_name, project_type,
+                    dealer_email, lead_source, source, status,
+                    email_match_count, last_email_activity, form_submit_date,
+                    landing_page, landing_page_url, comments
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id""",
+                (
+                    candidate["full_name"],
+                    candidate["first_name"],
+                    candidate["last_name"],
+                    candidate["email"],
+                    candidate["phone"],
+                    candidate["city"],
+                    candidate["province"],
+                    candidate["company_name"],
+                    candidate["project_type"],
+                    candidate["dealer_email"],
+                    candidate["lead_source"],
+                    candidate["lead_source"],
+                    "active",
+                    0,
+                    email_record.get("received_at"),
+                    email_record.get("received_at"),
+                    candidate.get("landing_page", ""),
+                    candidate.get("landing_page_url", ""),
+                    candidate.get("comments", ""),
+                ),
+            )
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return None
+
+            new_id = row["id"]
+            cursor.execute(
+                """INSERT INTO lead_logs (lead_id, log_type, message, created_by, created_at)
+                   VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)""",
+                (
+                    new_id,
+                    "email_intel",
+                    f"Lead created from email candidate: {email_record.get('subject', '')[:200]}",
+                    created_by or "email_intel",
+                ),
+            )
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    if candidate["email"]:
+        leads_cache["by_email"][candidate["email"]] = new_id
+    if candidate["first_name"] and candidate["last_name"]:
+        name_key = f"{candidate['first_name'].lower()} {candidate['last_name'].lower()}"
+        leads_cache["by_name"][name_key] = new_id
+
+    return new_id
+
+
+def _enrich_existing_lead_from_candidate(lead_id: int, candidate: dict):
+    """Fill in missing lead metadata from an email-derived candidate payload."""
+    execute_query(
+        """
+        UPDATE leads
+        SET phone = CASE WHEN COALESCE(NULLIF(TRIM(phone), ''), '') = '' THEN %s ELSE phone END,
+            city = CASE WHEN COALESCE(NULLIF(TRIM(city), ''), '') = '' THEN %s ELSE city END,
+            province = CASE WHEN COALESCE(NULLIF(TRIM(province), ''), '') = '' THEN %s ELSE province END,
+            company_name = CASE WHEN COALESCE(NULLIF(TRIM(company_name), ''), '') = '' THEN %s ELSE company_name END,
+            project_type = CASE WHEN COALESCE(NULLIF(TRIM(project_type), ''), '') = '' THEN %s ELSE project_type END,
+            dealer_email = CASE WHEN COALESCE(NULLIF(TRIM(dealer_email), ''), '') = '' THEN %s ELSE dealer_email END,
+            landing_page = CASE WHEN COALESCE(NULLIF(TRIM(landing_page), ''), '') = '' THEN %s ELSE landing_page END,
+            landing_page_url = CASE WHEN COALESCE(NULLIF(TRIM(landing_page_url), ''), '') = '' THEN %s ELSE landing_page_url END,
+            comments = CASE WHEN COALESCE(NULLIF(TRIM(comments), ''), '') = '' THEN %s ELSE comments END
+        WHERE id = %s
+        """,
         (
-            full_name, customer_first, customer_last, customer_email or "",
-            customer_phone or "", customer_city or "", customer_province or "",
-            customer_company or "", customer_project_type or "",
-            dealer_email or "", "Email Auto-Created", "active", 1,
+            candidate.get("phone", ""),
+            candidate.get("city", ""),
+            candidate.get("province", ""),
+            candidate.get("company_name", ""),
+            candidate.get("project_type", ""),
+            candidate.get("dealer_email", ""),
+            candidate.get("landing_page", ""),
+            candidate.get("landing_page_url", ""),
+            candidate.get("comments", ""),
+            lead_id,
         ),
+        fetch=False,
     )
-    if result:
-        new_id = result[0]["id"]
-        # Update the in-memory cache so subsequent emails can match
-        if customer_email:
-            leads_cache["by_email"][customer_email] = new_id
-        if customer_first and customer_last:
-            name_key = f"{customer_first.lower()} {customer_last.lower()}"
-            leads_cache["by_name"][name_key] = new_id
-        print(f"[EMAIL_INTEL] AUTO-CREATED Lead #{new_id}: {full_name} ({customer_email}) from '{email_record.get('subject', '')[:50]}'", flush=True)
+
+
+def _refresh_lead_email_rollup(lead_id: int):
+    """Recompute email rollup fields from matched email rows."""
+    stats_rows = execute_query(
+        """SELECT COUNT(*) AS cnt, MAX(received_at) AS last_email_at
+           FROM email_messages
+           WHERE matched_lead_id = %s""",
+        (lead_id,),
+    )
+    latest_sentiment_rows = execute_query(
+        """SELECT ai_sentiment
+           FROM email_messages
+           WHERE matched_lead_id = %s
+             AND ai_sentiment IS NOT NULL
+           ORDER BY received_at DESC NULLS LAST, id DESC
+           LIMIT 1""",
+        (lead_id,),
+    )
+    stats = stats_rows[0] if stats_rows else {"cnt": 0, "last_email_at": None}
+    latest_sentiment = latest_sentiment_rows[0]["ai_sentiment"] if latest_sentiment_rows else None
+    execute_query(
+        """UPDATE leads
+           SET email_match_count = %s,
+               last_email_activity = %s,
+               email_sentiment = COALESCE(%s, email_sentiment)
+           WHERE id = %s""",
+        (stats.get("cnt", 0), stats.get("last_email_at"), latest_sentiment, lead_id),
+        fetch=False,
+    )
+
+
+def _attach_email_candidate_to_lead(email_row: dict, lead_id: int, method: str, confidence: float) -> int:
+    """Attach a candidate email and any unmatched thread siblings to a lead."""
+    conversation_id = (email_row.get("conversation_id") or "").strip()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            if conversation_id:
+                cursor.execute(
+                    """UPDATE email_messages
+                       SET matched_lead_id = %s,
+                           match_confidence = CASE WHEN id = %s THEN %s ELSE 0.80 END,
+                           match_method = CASE WHEN id = %s THEN %s ELSE 'thread' END
+                       WHERE matched_lead_id IS NULL
+                         AND (id = %s OR conversation_id = %s)
+                       RETURNING id""",
+                    (lead_id, email_row["id"], confidence, email_row["id"], method, email_row["id"], conversation_id),
+                )
+            else:
+                cursor.execute(
+                    """UPDATE email_messages
+                       SET matched_lead_id = %s,
+                           match_confidence = %s,
+                           match_method = %s
+                       WHERE matched_lead_id IS NULL
+                         AND id = %s
+                       RETURNING id""",
+                    (lead_id, confidence, method, email_row["id"]),
+                )
+            updated = cursor.fetchall()
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    matched_count = len(updated or [])
+    _refresh_lead_email_rollup(lead_id)
+    return matched_count
+
+
+def _try_auto_create_lead(email_record: dict, mailbox_email: str, leads_cache: dict) -> tuple:
+    """
+    If an email contains customer info from a form submission (Name, Email, Phone)
+    and no matching lead exists, auto-create the lead.
+
+    This handles the case where Colin forwards form submissions to dealers
+    before the lead is created in Lasso/the CRM.
+
+    Returns: (lead_id, confidence, method) or (None, 0, None)
+    """
+    candidate = _extract_candidate_lead_fields(email_record, mailbox_email)
+    if not candidate:
+        return (None, 0, None)
+
+    # Don't create if this email already exists in leads cache
+    customer_email = candidate["email"]
+    if customer_email and customer_email in leads_cache["by_email"]:
+        # Already exists — return the match
+        return (leads_cache["by_email"][customer_email], 0.90, "body_email")
+
+    # Don't create if this name already exists
+    if candidate["first_name"] and candidate["last_name"]:
+        name_key = f"{candidate['first_name'].lower()} {candidate['last_name'].lower()}"
+        if name_key in leads_cache["by_name"]:
+            return (leads_cache["by_name"][name_key], 0.85, "body_name")
+
+    # Create the lead
+    new_id = _insert_email_candidate_lead(candidate, email_record, leads_cache)
+    if new_id:
+        print(
+            f"[EMAIL_INTEL] AUTO-CREATED Lead #{new_id}: {candidate['full_name']} ({candidate['email']}) "
+            f"from '{email_record.get('subject', '')[:50]}'",
+            flush=True,
+        )
         return (new_id, 0.95, "auto_created")
 
     return (None, 0, None)
@@ -861,7 +1446,6 @@ def _refresh_access_token(config: dict) -> str:
             "client_secret": config["ms_client_secret"],
             "refresh_token": config["refresh_token"],
             "grant_type": "refresh_token",
-            "scope": OAUTH_SCOPES,
         },
         timeout=30,
     )
@@ -889,8 +1473,37 @@ def _graph_get(token: str, url: str) -> dict:
         timeout=30,
     )
     if resp.status_code != 200:
+        error_code = ""
+        error_message = ""
+        try:
+            payload = resp.json()
+            error = payload.get("error") or {}
+            error_code = (error.get("code") or "").strip()
+            error_message = (error.get("message") or "").strip()
+        except Exception:
+            payload = None
+
         logger.error(f"Graph API error {resp.status_code}: {resp.text[:300]}")
-        raise HTTPException(status_code=502, detail=f"Graph API error: {resp.status_code}")
+
+        mailbox_hint = ""
+        marker = "/users/"
+        if marker in url:
+            mailbox_hint = unquote(url.split(marker, 1)[1].split("/", 1)[0]).strip()
+
+        if error_code == "ErrorGroupIsUsedInNonGroupURI":
+            target = mailbox_hint or "the configured target mailbox"
+            raise RuntimeError(
+                f"{target} is being treated by Microsoft Graph as a Microsoft 365 Group, not a shared/user mailbox. "
+                "This sync path uses /users/{mailbox}/messages, so it cannot read that address directly. "
+                "Use Colin's mailbox as the sync target, or add Group mailbox support with the required Graph Group permissions."
+            )
+
+        detail = f"Graph API error {resp.status_code}"
+        if error_code:
+            detail += f" ({error_code})"
+        if error_message:
+            detail += f": {error_message}"
+        raise RuntimeError(detail)
     return resp.json()
 
 
@@ -918,6 +1531,10 @@ async def get_config(current_user: AdminUser = Depends(get_current_user)):
         "ms_tenant_id": config.get("ms_tenant_id"),
         "ms_client_id": config.get("ms_client_id"),
         "ms_redirect_uri": config.get("ms_redirect_uri"),
+        "shared_mailbox_email": config.get("shared_mailbox_email"),
+        "target_mailbox_type": _get_target_mailbox_type(config),
+        "target_mailbox_email": _get_target_mailbox_email(config) or config.get("user_email"),
+        "target_group_id": config.get("target_group_id"),
         "sync_enabled": config.get("sync_enabled", False),
         "sync_interval_minutes": config.get("sync_interval_minutes", 15),
         "last_sync_at": config.get("last_sync_at"),
@@ -936,12 +1553,37 @@ async def save_config(
     if not updates:
         return {"success": True}
 
+    if "target_mailbox_type" in updates:
+        mailbox_type = (updates.get("target_mailbox_type") or "").strip().lower()
+        if mailbox_type not in VALID_TARGET_MAILBOX_TYPES:
+            raise HTTPException(status_code=400, detail="Invalid target_mailbox_type")
+        updates["target_mailbox_type"] = mailbox_type
+
+    if "shared_mailbox_email" in updates:
+        normalized_mailbox = (updates.get("shared_mailbox_email") or "").strip().lower()
+        updates["shared_mailbox_email"] = normalized_mailbox or None
+
     existing = _get_sync_config()
     if not existing:
         required_fields = ("ms_tenant_id", "ms_client_id", "ms_client_secret", "ms_redirect_uri")
         missing = [field for field in required_fields if not updates.get(field)]
         if missing:
             raise HTTPException(status_code=400, detail=f"Missing required config fields: {', '.join(missing)}")
+
+    effective_type = updates.get("target_mailbox_type") or _get_target_mailbox_type(existing)
+    effective_shared = updates.get("shared_mailbox_email")
+    if effective_shared is None and existing:
+        effective_shared = (existing.get("shared_mailbox_email") or "").strip().lower() or None
+    if effective_type in {MAILBOX_TYPE_SHARED, MAILBOX_TYPE_GROUP} and not effective_shared:
+        raise HTTPException(status_code=400, detail="A shared/group mailbox email is required for this mailbox type.")
+
+    if existing:
+        previous_mailbox = (existing.get("shared_mailbox_email") or "").strip().lower()
+        new_mailbox = (updates.get("shared_mailbox_email") or previous_mailbox).strip().lower()
+        previous_type = _get_target_mailbox_type(existing)
+        new_type = updates.get("target_mailbox_type") or previous_type
+        if new_mailbox != previous_mailbox or new_type != previous_type:
+            updates["target_group_id"] = None
 
     _upsert_sync_config(**updates)
     audit_log("CONFIG_UPDATED", "OAuth config saved/updated", current_user.username)
@@ -961,7 +1603,10 @@ async def oauth_authorize(current_user: AdminUser = Depends(get_current_user)):
         "redirect_uri": config["ms_redirect_uri"],
         "response_mode": "query",
         "scope": OAUTH_SCOPES,
+        "prompt": "select_account",
     }
+    if config.get("user_email"):
+        params["login_hint"] = config["user_email"]
     auth_url = (
         f"{MS_LOGIN_BASE}/{config['ms_tenant_id']}/oauth2/v2.0/authorize?"
         + urlencode(params)
@@ -1005,7 +1650,6 @@ async def oauth_callback_redirect(code: str = None, error: str = None, error_des
         return RedirectResponse(url=f"{frontend_url}?oauth_success=true&email={result['email']}")
     except Exception as e:
         logger.error(f"OAuth token exchange failed: {e}")
-        print(f"[EMAIL_INTEL] OAuth token exchange FAILED: {e}")
         from urllib.parse import quote
         return RedirectResponse(url=f"{frontend_url}?oauth_error={quote(str(e)[:200])}")
 
@@ -1016,31 +1660,19 @@ def _exchange_code_for_tokens(code: str) -> dict:
     if not config:
         raise HTTPException(status_code=400, detail="OAuth config not set.")
 
-    secret = config["ms_client_secret"]
-    # Debug: verify decrypted secret is intact (log length + first/last 4 chars only)
-    print(f"[EMAIL_INTEL] Exchanging code:")
-    print(f"  tenant   = {config['ms_tenant_id']}")
-    print(f"  client   = {config['ms_client_id']}")
-    print(f"  redirect = {config['ms_redirect_uri']}")
-    print(f"  secret   = {secret[:4]}...{secret[-4:]} (len={len(secret)})")
-    print(f"  scope    = {OAUTH_SCOPES}")
-    print(f"  code     = {code[:10]}... (len={len(code)})")
-
     token_url = f"{MS_LOGIN_BASE}/{config['ms_tenant_id']}/oauth2/v2.0/token"
     payload = {
         "client_id": config["ms_client_id"],
-        "client_secret": secret,
+        "client_secret": config["ms_client_secret"],
         "code": code,
         "redirect_uri": config["ms_redirect_uri"],
         "grant_type": "authorization_code",
         "scope": OAUTH_SCOPES,
     }
 
-    # Use explicit Content-Type header and encode body manually to avoid any encoding issues
+    logger.info("Exchanging Microsoft OAuth authorization code for Graph access token")
     from urllib.parse import urlencode
     encoded_body = urlencode(payload)
-    print(f"[EMAIL_INTEL] POST {token_url}")
-    print(f"[EMAIL_INTEL] Body (first 200): {encoded_body[:200]}")
 
     resp = http_requests.post(
         token_url,
@@ -1049,19 +1681,39 @@ def _exchange_code_for_tokens(code: str) -> dict:
         timeout=30,
     )
     if resp.status_code != 200:
-        print(f"[EMAIL_INTEL] Token exchange failed ({resp.status_code}): {resp.text[:500]}")
         raise Exception(f"Token exchange failed ({resp.status_code}): {resp.text[:300]}")
 
     data = resp.json()
     expires_at = datetime.utcnow() + timedelta(seconds=data.get("expires_in", 3600))
+    token_email = _infer_user_email_from_token(data.get("access_token", ""))
 
     # Fetch user profile to get email
-    profile = http_requests.get(
+    profile_resp = http_requests.get(
         f"{GRAPH_BASE}/me",
         headers={"Authorization": f"Bearer {data['access_token']}"},
         timeout=15,
-    ).json()
-    user_email = profile.get("mail") or profile.get("userPrincipalName", "")
+    )
+    if profile_resp.status_code == 200:
+        profile = profile_resp.json()
+        user_email = (
+            (profile.get("mail") or "").strip()
+            or (profile.get("userPrincipalName") or "").strip()
+            or token_email
+        ).lower()
+    else:
+        actual_identity = token_email or "the selected Microsoft account"
+        logger.error("Graph /me lookup failed during OAuth connect: %s", profile_resp.text[:300])
+        raise Exception(
+            "Connected account is not a usable Microsoft 365 mailbox user context for Graph. "
+            f"Signed in as {actual_identity}. Reconnect as Colin's Microsoft 365 work account "
+            "(cmacleod@windowfilmcanada.ca), not a guest or personal account."
+        )
+
+    if not user_email:
+        raise Exception(
+            "OAuth completed but Microsoft Graph did not return a mailbox identity. "
+            "Reconnect as Colin's Microsoft 365 work account (cmacleod@windowfilmcanada.ca)."
+        )
 
     _upsert_sync_config(
         access_token=data["access_token"],
@@ -1195,32 +1847,67 @@ async def _perform_sync_job(started_by: str):
         print("[EMAIL_INTEL] Config loaded, refreshing token...", flush=True)
         _update_sync_state(current_phase="Refreshing access token")
         token = _refresh_access_token(config)
-        print(f"[EMAIL_INTEL] Token ready, starting inbox sync...", flush=True)
+        mailbox_type = _get_target_mailbox_type(config)
+        mailbox_email = _get_target_mailbox_email(config)
+        matching_mailbox_email = _get_matching_mailbox_email(config)
+        print(
+            f"[EMAIL_INTEL] Token ready, starting {mailbox_type} sync for {mailbox_email or 'connected mailbox'}...",
+            flush=True,
+        )
 
         synced = 0
         matched = 0
+        history_limit = EMAIL_SYNC_HISTORY_LIMIT
 
-        _update_sync_state(current_phase="Syncing inbox")
-        url = (
-            f"{GRAPH_BASE}/me/messages?"
-            "$top=1000&$orderby=receivedDateTime desc"
-            "&$select=id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,isRead,conversationId"
-        )
-        synced_inbound, matched_inbound = await _sync_messages(token, url, direction="inbound")
-        synced += synced_inbound
-        matched += matched_inbound
-        _update_sync_state(synced=synced, matched=matched)
+        if mailbox_type == MAILBOX_TYPE_GROUP:
+            group = _resolve_group_target(token, config)
+            group_label = group.get("displayName") or group.get("mail") or mailbox_email or "configured group"
+            _update_sync_state(current_phase=f"Syncing Microsoft 365 Group ({group_label})")
+            synced_group, matched_group = await _sync_group_threads(
+                token,
+                group,
+                config=config,
+                max_messages=history_limit,
+            )
+            synced += synced_group
+            matched += matched_group
+            _update_sync_state(synced=synced, matched=matched)
+        else:
+            mailbox_base = _graph_mailbox_base(config)
 
-        _update_sync_state(current_phase="Syncing sent mail")
-        url_sent = (
-            f"{GRAPH_BASE}/me/mailFolders/SentItems/messages?"
-            "$top=1000&$orderby=receivedDateTime desc"
-            "&$select=id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,isRead,conversationId"
-        )
-        synced_outbound, matched_outbound = await _sync_messages(token, url_sent, direction="outbound")
-        synced += synced_outbound
-        matched += matched_outbound
-        _update_sync_state(synced=synced, matched=matched)
+            _update_sync_state(current_phase="Syncing inbox")
+            url = (
+                f"{mailbox_base}/messages?"
+                f"$top={GRAPH_SYNC_PAGE_SIZE}&$orderby=receivedDateTime desc"
+                "&$select=id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,isRead,conversationId"
+            )
+            synced_inbound, matched_inbound = await _sync_messages(
+                token,
+                url,
+                direction="inbound",
+                mailbox_email=matching_mailbox_email,
+                max_messages=history_limit,
+            )
+            synced += synced_inbound
+            matched += matched_inbound
+            _update_sync_state(synced=synced, matched=matched)
+
+            _update_sync_state(current_phase="Syncing sent mail")
+            url_sent = (
+                f"{mailbox_base}/mailFolders/SentItems/messages?"
+                f"$top={GRAPH_SYNC_PAGE_SIZE}&$orderby=receivedDateTime desc"
+                "&$select=id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,isRead,conversationId"
+            )
+            synced_outbound, matched_outbound = await _sync_messages(
+                token,
+                url_sent,
+                direction="outbound",
+                mailbox_email=matching_mailbox_email,
+                max_messages=history_limit,
+            )
+            synced += synced_outbound
+            matched += matched_outbound
+            _update_sync_state(synced=synced, matched=matched)
 
         # --- Thread propagation: if any email in a conversation matched,
         #     propagate that match to ALL emails in the same conversation ---
@@ -1254,6 +1941,7 @@ async def _perform_sync_job(started_by: str):
         audit_log("EMAIL_SYNC", f"Synced {synced} emails, matched {matched}, flagged {flagged}", started_by)
     except Exception as exc:
         import traceback
+        error_message = str(exc).strip() or exc.__class__.__name__
         print(f"[EMAIL_INTEL] SYNC FAILED: {exc}")
         traceback.print_exc()
         logger.exception("Email sync job failed")
@@ -1261,22 +1949,27 @@ async def _perform_sync_job(started_by: str):
             is_running=False,
             finished_at=datetime.utcnow(),
             current_phase="Failed",
-            last_error=str(exc),
+            last_error=error_message,
         )
-        audit_log("EMAIL_SYNC_FAILED", str(exc), started_by)
+        audit_log("EMAIL_SYNC_FAILED", error_message, started_by)
 
 
-async def _sync_messages(token: str, url: str, direction: str = "inbound"):
+async def _sync_messages(
+    token: str,
+    url: str,
+    direction: str = "inbound",
+    mailbox_email: str = "",
+    max_messages: int = EMAIL_SYNC_HISTORY_LIMIT,
+):
     """
     Paginate through Graph messages and sync them.
     Fast: parallel AI calls in batches, skips AI for unmatched emails.
     """
     synced = 0
     matched = 0
+    scanned = 0
 
-    # Cache mailbox email once
-    config = _get_sync_config()
-    mailbox_email = (config.get("user_email") or "").lower().strip() if config else ""
+    mailbox_email = mailbox_email.lower().strip()
 
     # Pre-load existing message IDs to skip duplicates instantly
     existing_ids_rows = execute_query("SELECT ms_message_id FROM email_messages")
@@ -1286,12 +1979,22 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
     leads_cache = _load_leads_cache(mailbox_email)
 
     page_num = 0
-    while url:
+    while url and scanned < max_messages:
         page_num += 1
         print(f"[EMAIL_INTEL] Fetching page {page_num} from Graph API...", flush=True)
         data = _graph_get(token, url)
         messages = data.get("value", [])
-        print(f"[EMAIL_INTEL] Page {page_num}: got {len(messages)} messages", flush=True)
+        remaining_budget = max_messages - scanned
+        if remaining_budget <= 0:
+            break
+        if len(messages) > remaining_budget:
+            messages = messages[:remaining_budget]
+        scanned += len(messages)
+        print(
+            f"[EMAIL_INTEL] Page {page_num}: got {len(messages)} messages "
+            f"(scanned {scanned}/{max_messages} for {direction})",
+            flush=True,
+        )
         if not messages:
             break
 
@@ -1319,8 +2022,10 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
             # Strip HTML tags to get plain text for matching
             full_body_text = _re.sub(r'<[^>]+>', ' ', full_body_html)
             full_body_text = _re.sub(r'\s+', ' ', full_body_text).strip()
-            # Use full body for matching, but store truncated preview for display
-            body_preview = _normalize_email_text(msg.get("bodyPreview", "") or full_body_text[:500], 500)
+            graph_body_preview = _normalize_email_text(msg.get("bodyPreview", "") or "", 1200)
+            full_body_preview = _normalize_email_text(full_body_text, 1200)
+            # Prefer the richer preview when Graph bodyPreview is shorter than the extracted body content.
+            body_preview = full_body_preview if len(full_body_preview) > len(graph_body_preview) else graph_body_preview
 
             # Detect REAL direction: if sender is the mailbox owner, it's outbound
             actual_direction = "outbound" if sender_email.lower().strip() == mailbox_email else "inbound"
@@ -1334,7 +2039,7 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
                 "sender_name": sender_name,
                 "recipient_emails": json.dumps(recipients),
                 "body_preview": body_preview,
-                "body_text": full_body_text[:2000],  # Full body for matching (up to 2000 chars)
+                "body_text": _normalize_email_text(full_body_text, 4000),
                 "received_at": received_at,
                 "is_read": msg.get("isRead", False),
                 "direction": actual_direction,
@@ -1406,8 +2111,7 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
                     rec["match_method"] = None
 
             try:
-                # Exclude body_text from DB insert (used for matching only, not stored beyond body_preview)
-                insert_rec = {k: v for k, v in rec.items() if k != "body_text"}
+                insert_rec = rec
                 cols = list(insert_rec.keys())
                 placeholders = ", ".join(["%s"] * len(cols))
                 execute_query(
@@ -1430,11 +2134,260 @@ async def _sync_messages(token: str, url: str, direction: str = "inbound"):
                 print(f"[EMAIL_INTEL] WARNING: Failed to insert email '{rec.get('subject','')[:50]}': {insert_err}", flush=True)
                 continue
 
-        print(f"[EMAIL_INTEL] Page {page_num} complete: total synced={synced}, matched={matched}", flush=True)
-        _update_sync_state(synced=synced, matched=matched, current_phase=f"Processing {direction} ({synced} done)")
-        url = data.get("@odata.nextLink")
+        print(
+            f"[EMAIL_INTEL] Page {page_num} complete: total synced={synced}, matched={matched}, "
+            f"scanned={scanned}/{max_messages}",
+            flush=True,
+        )
+        _update_sync_state(
+            synced=synced,
+            matched=matched,
+            current_phase=f"Processing {direction} ({scanned}/{max_messages} scanned, {synced} saved)",
+        )
+        url = data.get("@odata.nextLink") if scanned < max_messages else None
 
-    print(f"[EMAIL_INTEL] {direction} sync finished: synced={synced}, matched={matched}", flush=True)
+    print(
+        f"[EMAIL_INTEL] {direction} sync finished: synced={synced}, matched={matched}, "
+        f"scanned={scanned}/{max_messages}",
+        flush=True,
+    )
+    _update_sync_state(synced=synced, matched=matched)
+    return synced, matched
+
+
+async def _sync_group_threads(
+    token: str,
+    group: dict,
+    config: Optional[dict] = None,
+    max_messages: int = EMAIL_SYNC_HISTORY_LIMIT,
+):
+    """
+    Sync a Microsoft 365 Group mailbox via group threads/posts.
+    We translate posts into the same email_messages shape used by the rest of the app.
+    """
+    synced = 0
+    matched = 0
+    scanned = 0
+
+    group_id = (group.get("id") or "").strip()
+    if not group_id:
+        raise RuntimeError("Microsoft 365 Group sync could not resolve a valid group id.")
+
+    target_mailbox_email = _get_target_mailbox_email(config)
+    matching_mailbox_email = _get_matching_mailbox_email(config) or target_mailbox_email
+
+    existing_ids_rows = execute_query("SELECT ms_message_id FROM email_messages")
+    existing_ids = {r["ms_message_id"] for r in (existing_ids_rows or [])}
+    leads_cache = _load_leads_cache(matching_mailbox_email)
+
+    query = urlencode(
+        {
+            "$top": 100,
+            "$orderby": "lastDeliveredDateTime desc",
+            "$select": "id,topic,preview,lastDeliveredDateTime,toRecipients,ccRecipients,uniqueSenders",
+            "$expand": "posts($select=id,conversationId,conversationThreadId,receivedDateTime,createdDateTime,body,from,sender)",
+        }
+    )
+    url = f"{GRAPH_BASE}/groups/{group_id}/threads?{query}"
+
+    page_num = 0
+    while url and scanned < max_messages:
+        page_num += 1
+        print(f"[EMAIL_INTEL] Fetching group thread page {page_num} from Graph API...", flush=True)
+        data = _graph_get(token, url)
+        threads = data.get("value", [])
+        print(
+            f"[EMAIL_INTEL] Group page {page_num}: got {len(threads)} threads "
+            f"(scanned {scanned}/{max_messages} posts so far)",
+            flush=True,
+        )
+        if not threads:
+            break
+
+        page_records = []
+        skipped = 0
+        for thread_idx, thread in enumerate(threads):
+            if thread_idx % 50 == 0 and thread_idx > 0:
+                print(
+                    f"[EMAIL_INTEL]   ... processed {thread_idx}/{len(threads)} group threads",
+                    flush=True,
+                )
+
+            recipients = _flatten_graph_recipients(
+                thread.get("toRecipients"),
+                thread.get("ccRecipients"),
+            )
+            posts = thread.get("posts") or []
+            if not posts and thread.get("id"):
+                posts = _fetch_group_thread_posts(token, group_id, thread["id"])
+
+            for post in posts:
+                if scanned >= max_messages:
+                    break
+
+                post_id = (post.get("id") or "").strip()
+                if not post_id:
+                    continue
+
+                scanned += 1
+                ms_id = _group_post_message_id(group_id, post_id)
+                if ms_id in existing_ids:
+                    skipped += 1
+                    continue
+
+                sender_obj = post.get("sender") or post.get("from") or {}
+                sender_email = _extract_graph_recipient_email(sender_obj)
+                sender_name = _extract_graph_recipient_name(sender_obj)
+                body_preview, body_text = _extract_email_text_from_graph_message(
+                    {
+                        "body": post.get("body") or {},
+                        "bodyPreview": thread.get("preview") or "",
+                    }
+                )
+                actual_direction = (
+                    "outbound" if _is_group_internal_sender(sender_email, config) else "inbound"
+                )
+                received_at = post.get("receivedDateTime") or post.get("createdDateTime")
+
+                email_record = {
+                    "ms_message_id": ms_id,
+                    "conversation_id": post.get("conversationId") or f"group-thread:{group_id}:{thread.get('id', '')}",
+                    "subject": thread.get("topic", "") or "",
+                    "sender_email": sender_email,
+                    "sender_name": sender_name,
+                    "recipient_emails": json.dumps(recipients),
+                    "body_preview": body_preview,
+                    "body_text": body_text,
+                    "received_at": received_at,
+                    "is_read": True,
+                    "direction": actual_direction,
+                    "folder": "Group",
+                }
+
+                lead_id, confidence, method = match_email_to_lead(
+                    email_record,
+                    matching_mailbox_email,
+                    leads_cache,
+                )
+                if not lead_id:
+                    lead_id, confidence, method = _try_auto_create_lead(
+                        email_record,
+                        matching_mailbox_email,
+                        leads_cache,
+                    )
+
+                email_record["matched_lead_id"] = lead_id
+                email_record["match_confidence"] = confidence
+                email_record["match_method"] = method
+                page_records.append(email_record)
+
+        ai_tasks = []
+        ai_indices = []
+        for i, rec in enumerate(page_records):
+            if rec["matched_lead_id"]:
+                lead_rows = execute_query(
+                    "SELECT first_name, last_name, email, status FROM leads WHERE id = %s",
+                    (rec["matched_lead_id"],),
+                )
+                lead_data = lead_rows[0] if lead_rows else None
+                ai_tasks.append(
+                    analyze_email_with_ai(
+                        email_body=rec["body_preview"],
+                        email_subject=rec["subject"],
+                        lead_data=lead_data,
+                    )
+                )
+                ai_indices.append(i)
+
+        print(
+            f"[EMAIL_INTEL] Group page {page_num}: {len(page_records)} new records, "
+            f"{len(ai_tasks)} need AI analysis, {skipped} skipped",
+            flush=True,
+        )
+        if ai_tasks:
+            ai_results = await asyncio.gather(*ai_tasks, return_exceptions=True)
+            print(f"[EMAIL_INTEL] Group page {page_num}: AI analysis complete", flush=True)
+        else:
+            ai_results = []
+
+        ai_map = {}
+        for idx, ai_idx in enumerate(ai_indices):
+            result = ai_results[idx]
+            if isinstance(result, Exception):
+                logger.error("AI batch call failed: %s", result)
+                result = dict(_DEFAULT_AI_RESULT)
+            ai_map[ai_idx] = result
+
+        for i, rec in enumerate(page_records):
+            ai_result = ai_map.get(i, _DEFAULT_AI_RESULT)
+            rec["ai_summary"] = ai_result.get("summary", "")
+            rec["ai_sentiment"] = ai_result.get("sentiment", "neutral")
+            rec["ai_action_items"] = json.dumps(ai_result.get("action_items", []))
+            rec["ai_ready_to_close"] = ai_result.get("deal_stage") in ("closed", "closing")
+            rec["ai_close_reasoning"] = (
+                f"Deal stage: {ai_result.get('deal_stage', 'unknown')}"
+                if rec["matched_lead_id"]
+                else ""
+            )
+            rec["processed_at"] = datetime.utcnow()
+
+            if rec["matched_lead_id"]:
+                exists = execute_query("SELECT id FROM leads WHERE id = %s", (rec["matched_lead_id"],))
+                if not exists:
+                    print(
+                        f"[EMAIL_INTEL] WARNING: Lead #{rec['matched_lead_id']} missing, "
+                        f"clearing group match for '{rec.get('subject','')[:50]}'",
+                        flush=True,
+                    )
+                    rec["matched_lead_id"] = None
+                    rec["match_confidence"] = 0
+                    rec["match_method"] = None
+
+            try:
+                insert_rec = rec
+                cols = list(insert_rec.keys())
+                placeholders = ", ".join(["%s"] * len(cols))
+                execute_query(
+                    f"INSERT INTO email_messages ({', '.join(cols)}) VALUES ({placeholders})",
+                    tuple(insert_rec[c] for c in cols),
+                    fetch=False,
+                )
+                existing_ids.add(rec["ms_message_id"])
+                synced += 1
+
+                if rec["matched_lead_id"]:
+                    matched += 1
+                    execute_query(
+                        "UPDATE leads SET email_match_count = email_match_count + 1, "
+                        "last_email_activity = %s, email_sentiment = %s WHERE id = %s",
+                        (rec["received_at"], rec["ai_sentiment"], rec["matched_lead_id"]),
+                        fetch=False,
+                    )
+            except Exception as insert_err:
+                print(
+                    f"[EMAIL_INTEL] WARNING: Failed to insert group post '{rec.get('subject','')[:50]}': "
+                    f"{insert_err}",
+                    flush=True,
+                )
+                continue
+
+        print(
+            f"[EMAIL_INTEL] Group page {page_num} complete: total synced={synced}, matched={matched}, "
+            f"scanned={scanned}/{max_messages}",
+            flush=True,
+        )
+        _update_sync_state(
+            synced=synced,
+            matched=matched,
+            current_phase=f"Processing Microsoft 365 Group ({scanned}/{max_messages} scanned, {synced} saved)",
+        )
+        url = data.get("@odata.nextLink") if scanned < max_messages else None
+
+    print(
+        f"[EMAIL_INTEL] Group sync finished: synced={synced}, matched={matched}, "
+        f"scanned={scanned}/{max_messages}",
+        flush=True,
+    )
     _update_sync_state(synced=synced, matched=matched)
     return synced, matched
 
@@ -1616,6 +2569,304 @@ async def get_lead_context(
 
 
 # ---------------------------------------------------------------------------
+# Active matched lead review & new lead candidates
+# ---------------------------------------------------------------------------
+
+@router.get("/active-match-review")
+async def get_active_match_review(current_user: AdminUser = Depends(get_current_user)):
+    """Return active/follow-up leads with matched email activity and cleanup flags."""
+    audit_log("EMAIL_READ", "Viewed active matched lead review", current_user.username)
+    rows = execute_query(
+        """
+        WITH match_rollup AS (
+            SELECT
+                l.id AS lead_id,
+                COALESCE(
+                    NULLIF(TRIM(CONCAT(COALESCE(l.first_name, ''), ' ', COALESCE(l.last_name, ''))), ''),
+                    NULLIF(TRIM(COALESCE(l.name, '')), ''),
+                    'Lead'
+                ) AS lead_name,
+                COALESCE(NULLIF(TRIM(l.email), ''), '') AS lead_email,
+                COALESCE(NULLIF(TRIM(l.phone), ''), '') AS lead_phone,
+                l.status AS lead_status,
+                COALESCE(NULLIF(TRIM(l.source), ''), '') AS lead_source,
+                COALESCE(NULLIF(TRIM(l.landing_page), ''), '') AS landing_page,
+                COALESCE(NULLIF(TRIM(l.landing_page_url), ''), '') AS landing_page_url,
+                l.assigned_dealer_id,
+                d.name AS assigned_dealer_name,
+                COALESCE(l.email_match_count, 0) AS email_match_count,
+                l.last_email_activity,
+                l.created_at,
+                COUNT(em.id) AS matched_email_count,
+                COUNT(*) FILTER (WHERE em.match_method IN ('name', 'phone')) AS weak_match_count,
+                COUNT(*) FILTER (
+                    WHERE em.match_method IN ('email', 'dealer_email', 'body_email', 'body_name', 'auto_created', 'thread')
+                ) AS strong_match_count,
+                MAX(em.received_at) AS latest_email_at,
+                MAX(em.match_confidence) AS max_match_confidence,
+                STRING_AGG(
+                    DISTINCT COALESCE(em.match_method, '<null>'),
+                    ', '
+                    ORDER BY COALESCE(em.match_method, '<null>')
+                ) AS match_methods,
+                STRING_AGG(
+                    DISTINCT COALESCE(NULLIF(BTRIM(em.sender_email), ''), '<unknown>'),
+                    ' | '
+                    ORDER BY COALESCE(NULLIF(BTRIM(em.sender_email), ''), '<unknown>')
+                ) AS contact_emails
+            FROM leads l
+            JOIN email_messages em ON em.matched_lead_id = l.id
+            LEFT JOIN dealers d ON d.id = l.assigned_dealer_id
+            WHERE l.status IN ('active', 'follow_up')
+            GROUP BY
+                l.id,
+                lead_name,
+                lead_email,
+                lead_phone,
+                l.status,
+                lead_source,
+                landing_page,
+                landing_page_url,
+                l.assigned_dealer_id,
+                d.name,
+                l.email_match_count,
+                l.last_email_activity,
+                l.created_at
+        ),
+        latest_email AS (
+            SELECT DISTINCT ON (em.matched_lead_id)
+                em.matched_lead_id AS lead_id,
+                em.id AS latest_email_id,
+                em.received_at AS latest_email_at,
+                COALESCE(NULLIF(BTRIM(em.sender_email), ''), '<unknown>') AS latest_sender_email,
+                COALESCE(NULLIF(BTRIM(em.sender_name), ''), '<unknown>') AS latest_sender_name,
+                COALESCE(em.subject, '') AS latest_subject,
+                COALESCE(em.match_method, '<null>') AS latest_match_method,
+                em.match_confidence AS latest_match_confidence,
+                COALESCE(em.ai_summary, '') AS latest_ai_summary,
+                COALESCE(em.ai_sentiment, 'neutral') AS latest_ai_sentiment,
+                COALESCE(em.ai_ready_to_close, FALSE) AS latest_ai_ready_to_close
+            FROM email_messages em
+            JOIN leads l ON l.id = em.matched_lead_id
+            WHERE l.status IN ('active', 'follow_up')
+            ORDER BY em.matched_lead_id, em.received_at DESC, em.id DESC
+        ),
+        dup_email AS (
+            SELECT
+                LOWER(BTRIM(email)) AS email_key,
+                COUNT(*) FILTER (WHERE status IN ('active', 'follow_up')) AS active_duplicate_email_count
+            FROM leads
+            WHERE email IS NOT NULL AND BTRIM(email) <> ''
+            GROUP BY 1
+        )
+        SELECT
+            mr.*,
+            le.latest_email_id,
+            le.latest_sender_email,
+            le.latest_sender_name,
+            le.latest_subject,
+            le.latest_match_method,
+            le.latest_match_confidence,
+            le.latest_ai_summary,
+            le.latest_ai_sentiment,
+            le.latest_ai_ready_to_close,
+            ROUND(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - mr.created_at)) / 86400.0, 1) AS lead_age_days,
+            ROUND(
+                EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(mr.last_email_activity, mr.latest_email_at)))
+                / 86400.0,
+                1
+            ) AS days_since_last_email,
+            COALESCE(de.active_duplicate_email_count, 0) AS active_duplicate_email_count,
+            (mr.assigned_dealer_id IS NULL) AS missing_dealer,
+            (
+                mr.weak_match_count > 0
+                OR COALESCE(de.active_duplicate_email_count, 0) > 1
+                OR COALESCE(mr.max_match_confidence, 0) < 0.90
+            ) AS needs_match_review,
+            CASE
+                WHEN mr.assigned_dealer_id IS NULL THEN 'high'
+                WHEN mr.weak_match_count > 0 OR COALESCE(de.active_duplicate_email_count, 0) > 1 THEN 'medium'
+                ELSE 'low'
+            END AS review_priority,
+            CASE
+                WHEN mr.assigned_dealer_id IS NULL AND COALESCE(mr.landing_page, '') <> '' THEN
+                    'Matched email activity exists, the lead is missing a dealer assignment, and the lead came from ' || mr.landing_page || '.'
+                WHEN mr.assigned_dealer_id IS NULL THEN 'Matched email activity exists, but the lead is still missing a dealer assignment.'
+                WHEN COALESCE(de.active_duplicate_email_count, 0) > 1 THEN 'Multiple open leads share this customer email, so email activity may be split across duplicates.'
+                WHEN mr.weak_match_count > 0 THEN 'This lead includes at least one weak email match from a name- or phone-based fallback.'
+                ELSE 'Matched email activity is available for manual review.'
+            END AS review_reason
+        FROM match_rollup mr
+        LEFT JOIN latest_email le ON le.lead_id = mr.lead_id
+        LEFT JOIN dup_email de ON de.email_key = LOWER(BTRIM(mr.lead_email))
+        ORDER BY
+            (mr.assigned_dealer_id IS NULL) DESC,
+            (
+                mr.weak_match_count > 0
+                OR COALESCE(de.active_duplicate_email_count, 0) > 1
+                OR COALESCE(mr.max_match_confidence, 0) < 0.90
+            ) DESC,
+            COALESCE(le.latest_email_at, mr.latest_email_at) DESC,
+            mr.lead_id DESC
+        """
+    )
+    return rows or []
+
+
+@router.get("/new-lead-candidates")
+async def get_new_lead_candidates(current_user: AdminUser = Depends(get_current_user)):
+    """Return unmatched inbound emails that look likely to be net-new leads."""
+    audit_log("EMAIL_READ", "Viewed new lead candidates", current_user.username)
+    rows = execute_query(
+        """
+        WITH candidates AS (
+            SELECT
+                em.id,
+                em.received_at,
+                COALESCE(NULLIF(BTRIM(em.sender_email), ''), '<unknown>') AS sender_email,
+                COALESCE(NULLIF(BTRIM(em.sender_name), ''), '<unknown>') AS sender_name,
+                COALESCE(em.subject, '') AS subject,
+                COALESCE(em.body_preview, '') AS body_preview,
+                LOWER(COALESCE(em.subject, '')) AS subject_lc,
+                LOWER(COALESCE(em.body_preview, '')) AS preview_lc,
+                CASE
+                    WHEN LOWER(COALESCE(em.sender_email, '')) LIKE 'lead@%' THEN 'dealer-site forwarded lead'
+                    WHEN LOWER(COALESCE(em.subject, '')) LIKE '%contact form submission%' THEN 'contact form submission'
+                    WHEN LOWER(COALESCE(em.subject, '')) LIKE '%form submission%' THEN 'website form submission'
+                    WHEN LOWER(COALESCE(em.subject, '')) LIKE '%request a quote%' THEN 'quote request'
+                    WHEN LOWER(COALESCE(em.subject, '')) LIKE '%consultation%' THEN 'consultation request'
+                    WHEN LOWER(COALESCE(em.subject, '')) LIKE '%3m lead%' THEN 'lead assignment email'
+                    WHEN LOWER(COALESCE(em.body_preview, '')) LIKE '%submission data%' THEN 'submission data in body'
+                    ELSE 'manual review'
+                END AS candidate_reason,
+                (
+                    CASE WHEN LOWER(COALESCE(em.sender_email, '')) LIKE 'lead@%' THEN 5 ELSE 0 END
+                    + CASE
+                        WHEN LOWER(COALESCE(em.subject, '')) LIKE '%contact form submission%' THEN 4
+                        WHEN LOWER(COALESCE(em.subject, '')) LIKE '%form submission%' THEN 4
+                        ELSE 0
+                    END
+                    + CASE
+                        WHEN LOWER(COALESCE(em.subject, '')) LIKE '%request a quote%' THEN 3
+                        WHEN LOWER(COALESCE(em.subject, '')) LIKE '%consultation%' THEN 3
+                        WHEN LOWER(COALESCE(em.subject, '')) LIKE '%3m lead%' THEN 3
+                        ELSE 0
+                    END
+                    + CASE WHEN LOWER(COALESCE(em.body_preview, '')) LIKE '%submission data%' THEN 2 ELSE 0 END
+                    + CASE WHEN LOWER(COALESCE(em.body_preview, '')) LIKE '%first_name:%' THEN 2 ELSE 0 END
+                    + CASE WHEN LOWER(COALESCE(em.body_preview, '')) LIKE '%email:%' THEN 1 ELSE 0 END
+                    + CASE WHEN LOWER(COALESCE(em.body_preview, '')) LIKE '%phone:%' THEN 1 ELSE 0 END
+                ) AS candidate_score
+            FROM email_messages em
+            WHERE em.matched_lead_id IS NULL
+              AND em.direction = 'inbound'
+              AND (
+                  LOWER(COALESCE(em.sender_email, '')) LIKE 'lead@%'
+                  OR LOWER(COALESCE(em.subject, '')) LIKE '%form submission%'
+                  OR LOWER(COALESCE(em.subject, '')) LIKE '%request a quote%'
+                  OR LOWER(COALESCE(em.subject, '')) LIKE '%consultation%'
+                  OR LOWER(COALESCE(em.subject, '')) LIKE '%3m lead%'
+                  OR LOWER(COALESCE(em.body_preview, '')) LIKE '%submission data%'
+                  OR LOWER(COALESCE(em.body_preview, '')) LIKE '%first_name:%'
+              )
+        )
+        SELECT
+            c.id,
+            c.received_at,
+            c.sender_email,
+            c.sender_name,
+            c.subject,
+            c.body_preview,
+            c.candidate_reason,
+            c.candidate_score,
+            COALESCE(existing.sender_lead_count, 0) AS existing_sender_lead_count
+        FROM candidates c
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS sender_lead_count
+            FROM leads l
+            WHERE l.email IS NOT NULL
+              AND BTRIM(l.email) <> ''
+              AND LOWER(BTRIM(l.email)) = LOWER(BTRIM(c.sender_email))
+        ) existing ON TRUE
+        WHERE c.candidate_score >= 3
+        ORDER BY c.candidate_score DESC, c.received_at DESC, c.id DESC
+        LIMIT 100
+        """
+    )
+    return rows or []
+
+
+@router.post("/new-lead-candidates/{email_id}/create")
+async def create_lead_from_candidate(email_id: int, current_user: AdminUser = Depends(get_current_user)):
+    """Create or match a lead from a high-signal unmatched inbound email."""
+    rows = execute_query(
+        """
+        SELECT id, ms_message_id, conversation_id, subject, sender_email, sender_name, recipient_emails,
+               body_preview, body_text, received_at, matched_lead_id, direction
+        FROM email_messages
+        WHERE id = %s
+        """,
+        (email_id,),
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Candidate email not found")
+
+    email_row = rows[0]
+    if email_row.get("matched_lead_id"):
+        raise HTTPException(status_code=400, detail="This email is already matched to a lead")
+    if email_row.get("direction") != "inbound":
+        raise HTTPException(status_code=400, detail="Only inbound candidate emails can be turned into leads")
+
+    config = _get_sync_config_decrypted()
+    mailbox_email = _get_target_mailbox_email(config)
+    token = _refresh_access_token(config) if config and config.get("access_token") else ""
+    email_row = _hydrate_email_record_for_parsing(email_row, token, config)
+    leads_cache = _load_leads_cache(mailbox_email)
+    candidate = _extract_candidate_lead_fields(email_row, mailbox_email)
+    if not candidate:
+        raise HTTPException(status_code=400, detail="Could not extract enough lead details from this email")
+
+    action = "created"
+    match_method = "manual_candidate_create"
+    match_confidence = 0.97
+
+    lead_id = None
+    email_key = candidate["email"]
+    if email_key and email_key in leads_cache["by_email"]:
+        lead_id = leads_cache["by_email"][email_key]
+        action = "matched_existing"
+        match_method = "body_email"
+        match_confidence = 0.90
+    elif candidate["first_name"] and candidate["last_name"]:
+        name_key = f"{candidate['first_name'].lower()} {candidate['last_name'].lower()}"
+        if name_key in leads_cache["by_name"]:
+            lead_id = leads_cache["by_name"][name_key]
+            action = "matched_existing"
+            match_method = "body_name"
+            match_confidence = 0.85
+
+    if not lead_id:
+        lead_id = _insert_email_candidate_lead(candidate, email_row, leads_cache, current_user.username)
+        if not lead_id:
+            raise HTTPException(status_code=500, detail="Failed to create lead from candidate email")
+    else:
+        _enrich_existing_lead_from_candidate(lead_id, candidate)
+
+    matched_email_count = _attach_email_candidate_to_lead(email_row, lead_id, match_method, match_confidence)
+    audit_log(
+        "EMAIL_CREATE_LEAD",
+        f"{action} lead {lead_id} from email candidate {email_id} ({candidate['email']})",
+        current_user.username,
+    )
+    return {
+        "success": True,
+        "action": action,
+        "lead_id": lead_id,
+        "matched_email_count": matched_email_count,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Closure Review Queue
 # ---------------------------------------------------------------------------
 
@@ -1628,7 +2879,7 @@ async def get_review_queue(current_user: AdminUser = Depends(get_current_user)):
                crq.email_count, crq.status,
                TRIM(CONCAT(COALESCE(l.first_name, ''), ' ', COALESCE(l.last_name, ''))) AS lead_name,
                l.email AS lead_email,
-               COALESCE(d.name, l.final_installer_selection, 'Unassigned') AS dealer_name,
+               COALESCE(d.name, l.final_dealer_selection, 'Unassigned') AS dealer_name,
                l.phone, l.province, l.status AS lead_status,
                l.email_match_count, l.last_email_activity, l.email_sentiment
         FROM closure_review_queue crq

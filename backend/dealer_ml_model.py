@@ -1,5 +1,5 @@
 """Utility module that encapsulates the machine learning model used to
-recommend installers for incoming leads.
+recommend dealers for incoming leads.
 
 The model is trained on historical data stored in the ``historical_data``
 table.  It learns relationships between project attributes and the dealer
@@ -16,11 +16,11 @@ from typing import Callable, Dict, Optional
 
 from collections import Counter
 
-logger = logging.getLogger("installer_ml")
+logger = logging.getLogger("dealer_ml")
 
 
-class InstallerMLModel:
-    """Encapsulates training and inference for installer predictions."""
+class DealerMLModel:
+    """Encapsulates training and inference for dealer predictions."""
 
     def __init__(
         self,
@@ -66,7 +66,7 @@ class InstallerMLModel:
             try:
                 return self._train_model()
             except Exception as exc:  # pragma: no cover - defensive logging
-                logger.exception("Failed to train installer ML model: %s", exc)
+                logger.exception("Failed to train dealer ML model: %s", exc)
                 self._pipeline = None
                 self._last_error = str(exc)
                 return False
@@ -129,14 +129,14 @@ class InstallerMLModel:
     def _train_model(self) -> bool:
         """Fetch data from the database and train the estimator."""
 
-        logger.info("Training installer ML model from historical data")
+        logger.info("Training dealer ML model from historical data")
         self._last_attempt_at = datetime.utcnow()
         try:
             records = self._query_executor(
                 """
-                SELECT final_installer_selection, dealer_name, project_type, square_footage, current_status
+                SELECT final_dealer_selection, dealer_name, project_type, square_footage, current_status
                 FROM historical_data
-                WHERE final_installer_selection IS NOT NULL
+                WHERE final_dealer_selection IS NOT NULL
                 """,
                 None,
                 True,
@@ -159,7 +159,7 @@ class InstallerMLModel:
 
         cleaned = []
         for record in records:
-            label = (record.get("final_installer_selection") or "").strip()
+            label = (record.get("final_dealer_selection") or "").strip()
             if not label:
                 continue
             cleaned.append(label)
@@ -184,7 +184,7 @@ class InstallerMLModel:
         self._last_trained_at = datetime.utcnow()
         self._last_row_count = len(cleaned)
         self._last_error = None
-        logger.info("Installer ML model trained on %s rows", len(cleaned))
+        logger.info("Dealer ML model trained on %s rows", len(cleaned))
         return True
 
 

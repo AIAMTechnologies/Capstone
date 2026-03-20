@@ -7,7 +7,6 @@ import type {
   LeadsResponse,
   Lead,
   LeadStatus,
-  Installer,
   HistoricalDataResponse,
   ExtendedLead,
   Dealer,
@@ -30,6 +29,9 @@ import type {
   EmailSyncConfig,
   EmailMessage,
   ClosureReview,
+  ActiveMatchReviewItem,
+  NewLeadCandidate,
+  EmailCandidateActionResult,
   EmailLeadContext,
   EmailSyncStatus,
   EmailSyncResult,
@@ -141,29 +143,6 @@ export const updateLeadStatus = async (
   const response = await api.patch(`/admin/leads/${leadId}/status`, null, {
     params: { status }
   });
-  return response.data;
-};
-
-export const updateInstallerOverride = async (
-  leadId: number,
-  installerId: number | null
-): Promise<{
-  message: string;
-  lead_id: number;
-  installer_id: number | null;
-  assigned_installer_id?: number | null;
-  final_installer_selection?: string;
-  installer_name?: string | null;
-  installer_city?: string | null;
-}> => {
-  const response = await api.patch(`/admin/leads/${leadId}/installer-override`, {
-    installer_id: installerId
-  });
-  return response.data;
-};
-
-export const getInstallers = async (): Promise<{ installers: Installer[]; count: number }> => {
-  const response = await api.get('/admin/installers');
   return response.data;
 };
 
@@ -496,6 +475,21 @@ export const getLeadEmailContext = async (leadId: number): Promise<EmailLeadCont
 
 export const getClosureReviewQueue = async (): Promise<ClosureReview[]> => {
   const response = await api.get('/email-intel/review-queue', { timeout: 30000 });
+  return response.data;
+};
+
+export const getActiveMatchReview = async (): Promise<ActiveMatchReviewItem[]> => {
+  const response = await api.get('/email-intel/active-match-review', { timeout: 30000 });
+  return response.data;
+};
+
+export const getNewLeadCandidates = async (): Promise<NewLeadCandidate[]> => {
+  const response = await api.get('/email-intel/new-lead-candidates', { timeout: 30000 });
+  return response.data;
+};
+
+export const createLeadFromEmailCandidate = async (emailId: number): Promise<EmailCandidateActionResult> => {
+  const response = await api.post(`/email-intel/new-lead-candidates/${emailId}/create`);
   return response.data;
 };
 

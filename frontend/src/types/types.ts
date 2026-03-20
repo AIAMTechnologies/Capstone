@@ -12,24 +12,23 @@ export interface Lead {
   job_type: 'residential' | 'commercial';
   comments?: string;
   status: 'active' | 'converted' | 'dead'|'follow_up' ;
-  assigned_installer_id?: number | null;
-  assigned_installer_name?: string | null;
-  installer_name?: string | null;
-  final_installer_selection?: string | null;
-  installer_city?: string | null;
+  assigned_dealer_id?: number | null;
+  dealer_name_assigned?: string | null;
+  recommended_dealer_id?: number | null;
+  recommended_dealer_name?: string | null;
+  final_dealer_selection?: string | null;
   allocation_score?: number;
-  distance_to_installer_km?: number;
-  installer_ml_probability?: number;
+  distance_to_dealer_km?: number;
+  dealer_ml_probability?: number;
   distance_review_required?: boolean;
-  installer_override_id?: number | null;
-  alternative_installers?: AlternativeInstaller[];
+  alternative_dealers?: AlternativeDealer[];
   created_at: string;
   updated_at?: string;
   latitude?: number;
   longitude?: number;
 }
 
-export interface AlternativeInstaller {
+export interface AlternativeDealer {
   id: number;
   name: string;
   city: string;
@@ -75,26 +74,13 @@ export interface DashboardStats {
   completed_leads: number;
   conversion_rate: number;
   avg_allocation_score: number;
-  active_installers: number;
+  active_dealers: number;
 }
 
 export interface LeadsResponse {
   leads: Lead[];
   count: number;
   total: number;
-}
-
-export interface Installer {
-  id: number;
-  name: string;
-  email: string;
-  phone: string;
-  city: string;
-  province: string;
-  is_active: boolean;
-  total_leads?: number;
-  converted_leads?: number;
-  active_leads?: number;
 }
 
 export type LeadStatus = 'active' | 'converted' | 'dead'| 'follow_up';
@@ -114,7 +100,7 @@ export interface HistoricalData {
   province?: string;
   postal?: string;
   dealer_name?: string;
-  final_installer_selection?: string;
+  final_dealer_selection?: string;
   project_type?: string;
   product_type?: string;
   square_footage?: number;
@@ -320,6 +306,10 @@ export interface EmailSyncConfig {
   ms_tenant_id: string;
   ms_client_id: string;
   ms_redirect_uri: string;
+  shared_mailbox_email?: string | null;
+  target_mailbox_type?: 'connected' | 'shared' | 'group';
+  target_mailbox_email?: string | null;
+  target_group_id?: string | null;
   sync_enabled: boolean;
   sync_interval_minutes: number;
   last_sync_at: string | null;
@@ -360,6 +350,64 @@ export interface ClosureReview {
   last_email_at: string | null;
   email_count: number;
   status: 'pending' | 'approved' | 'dismissed';
+}
+
+export interface ActiveMatchReviewItem {
+  lead_id: number;
+  lead_name: string;
+  lead_email: string;
+  lead_phone: string;
+  lead_status: 'active' | 'follow_up';
+  lead_source: string;
+  landing_page?: string;
+  landing_page_url?: string;
+  assigned_dealer_id: number | null;
+  assigned_dealer_name?: string | null;
+  email_match_count: number;
+  matched_email_count: number;
+  weak_match_count: number;
+  strong_match_count: number;
+  max_match_confidence: number | null;
+  match_methods: string;
+  contact_emails: string;
+  latest_email_id: number | null;
+  latest_sender_email: string;
+  latest_sender_name: string;
+  latest_subject: string;
+  latest_match_method: string;
+  latest_match_confidence: number | null;
+  latest_ai_summary: string;
+  latest_ai_sentiment: 'positive' | 'neutral' | 'negative';
+  latest_ai_ready_to_close: boolean;
+  last_email_activity?: string | null;
+  latest_email_at?: string | null;
+  created_at: string;
+  lead_age_days: number;
+  days_since_last_email: number | null;
+  active_duplicate_email_count: number;
+  missing_dealer: boolean;
+  needs_match_review: boolean;
+  review_priority: 'high' | 'medium' | 'low';
+  review_reason: string;
+}
+
+export interface NewLeadCandidate {
+  id: number;
+  received_at: string;
+  sender_email: string;
+  sender_name: string;
+  subject: string;
+  body_preview: string;
+  candidate_reason: string;
+  candidate_score: number;
+  existing_sender_lead_count: number;
+}
+
+export interface EmailCandidateActionResult {
+  success: boolean;
+  action: 'created' | 'matched_existing';
+  lead_id: number;
+  matched_email_count: number;
 }
 
 export interface EmailLeadContext {

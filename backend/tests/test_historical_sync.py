@@ -14,7 +14,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from backend import main
-from backend.ml_model import InstallerMLModel
+from backend.dealer_ml_model import DealerMLModel
 
 
 @pytest.fixture
@@ -43,15 +43,15 @@ def memory_db(monkeypatch) -> Dict[str, Dict]:
                 "postal_code": "T2A1B2",
                 "job_type": "Residential",
                 "status": "active",
-                "assigned_installer_id": 11,
-                "installer_override_id": None,
-                "final_installer_selection": "Installer A",
+                "assigned_dealer_id": 11,
+                "recommended_dealer_id": 11,
+                "final_dealer_selection": "Dealer A",
                 "created_at": datetime(2024, 1, 1),
             }
         },
-        "installers": {
-            11: {"id": 11, "name": "Installer A", "city": "Calgary", "is_active": True},
-            12: {"id": 12, "name": "Installer B", "city": "Edmonton", "is_active": True},
+        "dealers": {
+            11: {"id": 11, "name": "Dealer A", "city": "Calgary", "is_active": True},
+            12: {"id": 12, "name": "Dealer B", "city": "Edmonton", "is_active": True},
         },
         "historical": {},
     }
@@ -59,19 +59,19 @@ def memory_db(monkeypatch) -> Dict[str, Dict]:
     def fake_execute(query: str, params=None, fetch: bool = True):
         normalized = " ".join(query.split())
 
-        if "FROM leads l" in normalized and "assigned_installer_name" in normalized:
+        if "FROM leads l" in normalized and "dealer_name_assigned" in normalized:
             lead_id = params[0]
             lead = state["leads"].get(lead_id)
             if not lead:
                 return []
-            installer = state["installers"].get(lead.get("assigned_installer_id"))
+
             row = {**lead}
-            if installer:
-                row["assigned_installer_name"] = installer.get("name")
-                row["assigned_installer_city"] = installer.get("city")
-            override_installer = state["installers"].get(lead.get("installer_override_id"))
-            if override_installer:
-                row["override_installer_name"] = override_installer.get("name")
+            dealer = state["dealers"].get(lead.get("assigned_dealer_id"))
+            if dealer:
+                row["dealer_name_assigned"] = dealer.get("name")
+            recommended = state["dealers"].get(lead.get("recommended_dealer_id"))
+            if recommended:
+                row["recommended_dealer_name"] = recommended.get("name")
             return [row]
 
         if normalized.startswith("UPDATE leads SET status"):
@@ -79,37 +79,14 @@ def memory_db(monkeypatch) -> Dict[str, Dict]:
             state["leads"][lead_id]["status"] = status_value
             return True
 
-        if normalized.startswith("UPDATE leads SET final_installer_selection"):
+        if normalized.startswith("UPDATE leads SET final_dealer_selection"):
             final_name, lead_id = params
-            state["leads"][lead_id]["final_installer_selection"] = final_name
+            state["leads"][lead_id]["final_dealer_selection"] = final_name
             return True
 
-        if "UPDATE leads SET installer_override_id" in normalized:
-            override_id, assigned_id, final_selection, lead_id = params
-            lead = state["leads"][lead_id]
-            lead["installer_override_id"] = override_id
-            # Preserve the ML recommendation unless it was missing.
-            if lead.get("assigned_installer_id") is None:
-                lead["assigned_installer_id"] = assigned_id
-            lead["final_installer_selection"] = final_selection
-            return True
-
-        if normalized.startswith("SELECT id, name, city FROM installers"):
-            installer_id = params[0]
-            installer = state["installers"].get(installer_id)
-            if installer and installer.get("is_active"):
-                return [installer]
-            return []
-
-        if normalized.startswith("SELECT name FROM installers WHERE id"):
-            installer_id = params[0]
-            installer = state["installers"].get(installer_id)
-            return [installer] if installer else []
-
-        if normalized.startswith("SELECT name, city FROM installers WHERE id"):
-            installer_id = params[0]
-            installer = state["installers"].get(installer_id)
-            return [installer] if installer else []
+        if normalized.startswith("SELECT 1 FROM historical_data WHERE id"):
+            lead_id = params[0]
+            return [1] if lead_id in state["historical"] else []
 
         if "INSERT INTO historical_data" in normalized:
             (
@@ -123,7 +100,7 @@ def memory_db(monkeypatch) -> Dict[str, Dict]:
                 dealer_name,
                 project_type,
                 current_status,
-                final_installer_selection,
+                final_dealer_selection,
             ) = params
             state["historical"][lead_id] = {
                 "id": lead_id,
@@ -136,13 +113,9 @@ def memory_db(monkeypatch) -> Dict[str, Dict]:
                 "dealer_name": dealer_name,
                 "project_type": project_type,
                 "current_status": current_status,
-                "final_installer_selection": final_installer_selection,
+                "final_dealer_selection": final_dealer_selection,
             }
             return True
-
-        if normalized.startswith("SELECT 1 FROM historical_data WHERE id"):
-            lead_id = params[0]
-            return [1] if lead_id in state["historical"] else []
 
         raise AssertionError(f"Unhandled query: {normalized}")
 
@@ -155,12 +128,10 @@ def test_status_change_syncs_historical_data(memory_db, admin_user):
 
     record = memory_db["historical"][1]
     assert record["current_status"] == "converted"
-    assert record["final_installer_selection"] == "Installer A"
+    assert record["final_dealer_selection"] == "Dealer A"
 
 
 def test_non_standard_status_allows_historical_sync(memory_db, admin_user):
-    # Frontend may send user-friendly labels; these should still flow through and
-    # create a historical record when the lead leaves the active pipeline.
     asyncio.run(main.update_lead_status(1, "Converted Sale", current_user=admin_user))
 
     record = memory_db["historical"][1]
@@ -175,37 +146,24 @@ def test_subsequent_status_updates_refresh_historical(memory_db, admin_user):
     assert record["current_status"] == "dead lead"
 
 
-def test_override_updates_final_installer(memory_db, admin_user):
-    asyncio.run(main.update_installer_override(1, installer_id=12, current_user=admin_user))
-    asyncio.run(main.update_lead_status(1, "converted", current_user=admin_user))
-
-    lead = memory_db["leads"][1]
-    # ML recommendation should remain intact when an override is chosen.
-    assert lead["assigned_installer_id"] == 11
-    assert lead["final_installer_selection"] == "Installer B"
-
-    record = memory_db["historical"][1]
-    assert record["final_installer_selection"] == "Installer B"
-
-
-def test_training_uses_final_installer_selection_label():
+def test_training_uses_final_dealer_selection_label():
     rows = [
         {
-            "final_installer_selection": "Installer A",
+            "final_dealer_selection": "Dealer A",
             "dealer_name": "Dealer A",
             "project_type": "Residential",
             "square_footage": 1200,
             "current_status": "converted",
         },
         {
-            "final_installer_selection": None,
+            "final_dealer_selection": None,
             "dealer_name": "Dealer B",
             "project_type": "Commercial",
             "square_footage": 800,
             "current_status": "converted",
         },
         {
-            "final_installer_selection": "Installer C",
+            "final_dealer_selection": "Dealer C",
             "dealer_name": "Dealer C",
             "project_type": "Residential",
             "square_footage": 900,
@@ -216,11 +174,11 @@ def test_training_uses_final_installer_selection_label():
     def fake_query(_query: str, _params=None, _fetch: bool = True):
         return rows
 
-    model = InstallerMLModel(fake_query, min_training_rows=2)
+    model = DealerMLModel(fake_query, min_training_rows=2)
 
     assert model.train(force=True)
     labels = set(model._pipeline.named_steps["model"].classes_)
-    assert labels == {"Installer A", "Installer C"}
+    assert labels == {"Dealer A", "Dealer C"}
     assert model.status().get("training_rows") == 2
 
 
@@ -230,24 +188,20 @@ def test_backfill_historical_when_lead_already_non_active(memory_db, admin_user)
         "name": "John Smith",
         "email": "john@example.com",
         "phone": "555",
-        "address": "789 Oak", 
+        "address": "789 Oak",
         "city": "Calgary",
         "province": "AB",
         "postal_code": "T2A1B3",
         "job_type": "Commercial",
         "status": "converted",
-        "assigned_installer_id": 11,
-        "installer_override_id": None,
-        "final_installer_selection": None,
+        "assigned_dealer_id": 11,
+        "recommended_dealer_id": 11,
+        "final_dealer_selection": None,
         "created_at": datetime(2024, 2, 1),
     }
 
-    # Even though the lead is already converted, calling the status endpoint
-    # should backfill historical_data if the record is missing.
     asyncio.run(main.update_lead_status(2, "converted", current_user=admin_user))
 
     record = memory_db["historical"][2]
     assert record["current_status"] == "converted"
-    # Fallback should capture installer name for training even when the lead
-    # lacked an explicit final_installer_selection.
-    assert record["final_installer_selection"] == "Installer A"
+    assert record["final_dealer_selection"] == "Dealer A"
