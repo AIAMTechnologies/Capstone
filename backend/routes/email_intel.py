@@ -807,20 +807,28 @@ def _reasoning_json_completion(
 async def analyze_email_with_ai(
     email_body: str, email_subject: str, lead_data: dict = None
 ) -> dict:
-    """Use cheapest available OpenAI model for email analysis."""
+    """Extract structured window-film sales intelligence from an email."""
     lead_context = ""
     if lead_data:
         lead_context = (
-            f"\nLead: {lead_data.get('first_name', '')} {lead_data.get('last_name', '')} "
-            f"({lead_data.get('email', '')}) Status: {lead_data.get('status', '')}"
+            f"\nLead on file: {lead_data.get('first_name', '')} {lead_data.get('last_name', '')} "
+            f"({lead_data.get('email', '')}) — current status: {lead_data.get('status', '')}"
         )
 
     result, model = _openai_json_completion(
         system_prompt=(
-            "Analyse the sales email. Return JSON: "
-            '{"summary":"1 sentence","sentiment":"positive|neutral|negative",'
-            '"action_items":["..."],"is_deal_related":true/false,'
-            '"deal_stage":"inquiry|quoting|negotiation|closing|closed"}'
+            "You are an assistant for Window Film Canada (WFC), a national network of window film "
+            "installation dealers. Analyse the incoming customer email and extract key details. "
+            "Return ONLY valid JSON with these exact keys:\n"
+            '{"summary":"1 sentence describing what the customer wants",'
+            '"sentiment":"positive|neutral|negative",'
+            '"action_items":["specific next step — be concrete, e.g. Call customer to discuss film options"],'
+            '"deal_stage":"inquiry|quoting|negotiation|closing|closed",'
+            '"urgency":"high|medium|low",'
+            '"job_type":"residential|commercial|replacement|unknown",'
+            '"product":"brief description of film type they want, or null",'
+            '"window_count":"number or description of windows mentioned, or null",'
+            '"next_action":"the single most important thing Colin should do right now"}'
         ),
         user_prompt=(
             f"Subject: {email_subject}\n"
@@ -842,55 +850,52 @@ async def analyze_email_with_ai(
 
 def _load_leads_cache(mailbox_email: str = "") -> dict:
     """
-    Pre-load ALL leads into in-memory lookup dicts for fast matching.
+    Pre-load ALL Lasso leads into in-memory lookup dicts for fast matching.
+    Sources: dashboard_active_leads + dashboard_unassigned_leads (Lasso snapshots).
     Called once per sync, NOT per email.
-    Returns dict with lookup tables.
+    Returns dict with lookup tables keyed by lasso_lead_id.
     """
     mailbox_email = mailbox_email.lower().strip()
-    exclude_clause = ""
-    exclude_params: tuple = ()
-    if mailbox_email:
-        exclude_clause = " WHERE LOWER(email) != %s"
-        exclude_params = (mailbox_email,)
 
     rows = execute_query(
-        f"SELECT id, email, dealer_email, first_name, last_name, phone, created_at "
-        f"FROM leads{exclude_clause} ORDER BY created_at DESC",
-        exclude_params,
+        """
+        SELECT lasso_lead_id AS id, email, first_name, last_name
+        FROM dashboard_active_leads
+        WHERE email IS NOT NULL AND BTRIM(email) <> ''
+          AND (%s = '' OR LOWER(BTRIM(email)) != %s)
+        UNION
+        SELECT lasso_lead_id AS id, email, first_name, last_name
+        FROM dashboard_unassigned_leads
+        WHERE email IS NOT NULL AND BTRIM(email) <> ''
+          AND (%s = '' OR LOWER(BTRIM(email)) != %s)
+        ORDER BY id DESC
+        """,
+        (mailbox_email, mailbox_email, mailbox_email, mailbox_email),
     ) or []
 
-    # Build lookup dicts
-    by_email: dict[str, int] = {}          # lowercase email -> lead id
-    by_dealer_email: dict[str, int] = {}   # lowercase dealer_email -> lead id
-    by_name: dict[str, int] = {}           # "first last" -> lead id
-    phones: list[tuple[int, str]] = []     # [(lead_id, normalized_phone), ...]
+    by_email: dict[str, int] = {}        # lowercase email -> lasso_lead_id
+    by_dealer_email: dict[str, int] = {} # unused in Lasso mode, kept for compat
+    by_name: dict[str, int] = {}         # "first last" -> lasso_lead_id
+    phones: list[tuple[int, str]] = []   # no phone data in Lasso snapshots
 
     for r in rows:
         lid = r["id"]
         email = (r.get("email") or "").lower().strip()
-        dealer_email = (r.get("dealer_email") or "").lower().strip()
         first = (r.get("first_name") or "").lower().strip()
         last = (r.get("last_name") or "").lower().strip()
-        phone = _normalize_phone((r.get("phone") or "").strip())
 
-        # First match wins (rows are ordered by created_at DESC = newest first)
         if email and email not in by_email:
             by_email[email] = lid
-        if dealer_email and dealer_email not in by_dealer_email:
-            by_dealer_email[dealer_email] = lid
         if first and last:
             name_key = f"{first} {last}"
             if name_key not in by_name:
                 by_name[name_key] = lid
-        if (
-            phone
-            and len(phone) >= 10
-            and not phone.startswith("0000")
-            and len(set(phone)) > 2
-        ):
-            phones.append((lid, phone))
 
-    print(f"[EMAIL_INTEL] Leads cache loaded: {len(rows)} leads, {len(by_email)} emails, {len(by_dealer_email)} dealer emails, {len(by_name)} names, {len(phones)} phones", flush=True)
+    print(
+        f"[EMAIL_INTEL] Lasso leads cache loaded: {len(rows)} leads, "
+        f"{len(by_email)} emails, {len(by_name)} names",
+        flush=True,
+    )
     return {
         "by_email": by_email,
         "by_dealer_email": by_dealer_email,
@@ -1846,38 +1851,32 @@ def _propagate_thread_matches() -> int:
     """
     propagated = 0
 
-    # Find conversations where at least one email is matched
+    # Find conversations where at least one email is matched to a Lasso lead
     matched_threads = execute_query("""
-        SELECT DISTINCT conversation_id, matched_lead_id
+        SELECT DISTINCT conversation_id, lasso_lead_id
         FROM email_messages
         WHERE conversation_id IS NOT NULL AND conversation_id != ''
-          AND matched_lead_id IS NOT NULL
+          AND lasso_lead_id IS NOT NULL
     """)
     if not matched_threads:
         return 0
 
     for thread in matched_threads:
         conv_id = thread["conversation_id"]
-        lead_id = thread["matched_lead_id"]
+        lead_id = thread["lasso_lead_id"]
 
-        # Update all unmatched emails in this conversation
+        # Propagate lasso_lead_id to all unmatched emails in this conversation
         result = execute_query(
             """UPDATE email_messages
-               SET matched_lead_id = %s, match_confidence = 0.80, match_method = 'thread'
+               SET lasso_lead_id = %s, match_confidence = 0.80, match_method = 'thread'
                WHERE conversation_id = %s
-                 AND (matched_lead_id IS NULL)
+                 AND lasso_lead_id IS NULL
                RETURNING id""",
             (lead_id, conv_id),
         )
         count = len(result) if result else 0
         if count > 0:
             propagated += count
-            # Update lead email counters
-            execute_query(
-                "UPDATE leads SET email_match_count = email_match_count + %s WHERE id = %s",
-                (count, lead_id),
-                fetch=False,
-            )
 
     return propagated
 
@@ -2110,16 +2109,13 @@ async def _sync_messages(
                 "folder": "SentItems" if actual_direction == "outbound" else "Inbox",
             }
 
-            # Match to lead (excludes mailbox owner's lead records) — uses in-memory cache
+            # Match to Lasso lead (uses in-memory snapshot cache)
             lead_id, confidence, method = match_email_to_lead(email_record, mailbox_email, leads_cache)
 
-            # --- Auto-create lead from form submission emails ---
-            # If no match found AND the email contains customer info from a form submission,
-            # create a new lead so we can track it
-            if not lead_id:
-                lead_id, confidence, method = _try_auto_create_lead(email_record, mailbox_email, leads_cache)
+            # In Lasso-only mode we no longer auto-create local leads.
+            # Unmatched emails remain unmatched until the next Lasso sync updates the cache.
 
-            email_record["matched_lead_id"] = lead_id
+            email_record["lasso_lead_id"] = lead_id
             email_record["match_confidence"] = confidence
             email_record["match_method"] = method
             page_records.append(email_record)
@@ -2128,9 +2124,18 @@ async def _sync_messages(
         ai_tasks = []
         ai_indices = []
         for i, rec in enumerate(page_records):
-            if rec["matched_lead_id"]:
-                lead_rows = execute_query("SELECT first_name, last_name, email, status FROM leads WHERE id = %s", (rec["matched_lead_id"],))
-                lead_data = lead_rows[0] if lead_rows else None
+            if rec["lasso_lead_id"]:
+                # Fetch lead name/email from Lasso snapshot for AI context
+                lasso_rows = execute_query(
+                    "SELECT first_name, last_name, email, current_status AS status "
+                    "FROM dashboard_active_leads WHERE lasso_lead_id = %s "
+                    "UNION "
+                    "SELECT first_name, last_name, email, 'unassigned' AS status "
+                    "FROM dashboard_unassigned_leads WHERE lasso_lead_id = %s "
+                    "LIMIT 1",
+                    (rec["lasso_lead_id"], rec["lasso_lead_id"]),
+                )
+                lead_data = lasso_rows[0] if lasso_rows else None
                 ai_tasks.append(analyze_email_with_ai(
                     email_body=rec["body_preview"],
                     email_subject=rec["subject"],
@@ -2162,17 +2167,13 @@ async def _sync_messages(
             rec["ai_sentiment"] = ai_result.get("sentiment", "neutral")
             rec["ai_action_items"] = json.dumps(ai_result.get("action_items", []))
             rec["ai_ready_to_close"] = ai_result.get("deal_stage") in ("closed", "closing")
-            rec["ai_close_reasoning"] = f"Deal stage: {ai_result.get('deal_stage', 'unknown')}" if rec["matched_lead_id"] else ""
+            rec["ai_close_reasoning"] = f"Deal stage: {ai_result.get('deal_stage', 'unknown')}" if rec["lasso_lead_id"] else ""
+            rec["ai_urgency"] = ai_result.get("urgency") or None
+            rec["ai_job_type"] = ai_result.get("job_type") or None
+            rec["ai_product"] = ai_result.get("product") or None
+            rec["ai_window_count"] = ai_result.get("window_count") or None
+            rec["ai_next_action"] = ai_result.get("next_action") or None
             rec["processed_at"] = datetime.utcnow()
-
-            # Verify FK: if matched_lead_id set, confirm lead exists
-            if rec["matched_lead_id"]:
-                exists = execute_query("SELECT id FROM leads WHERE id = %s", (rec["matched_lead_id"],))
-                if not exists:
-                    print(f"[EMAIL_INTEL] WARNING: Lead #{rec['matched_lead_id']} missing, clearing match for '{rec.get('subject','')[:50]}'", flush=True)
-                    rec["matched_lead_id"] = None
-                    rec["match_confidence"] = 0
-                    rec["match_method"] = None
 
             try:
                 insert_rec = rec
@@ -2185,15 +2186,8 @@ async def _sync_messages(
                 )
                 existing_ids.add(rec["ms_message_id"])
                 synced += 1
-
-                if rec["matched_lead_id"]:
+                if rec["lasso_lead_id"]:
                     matched += 1
-                    execute_query(
-                        "UPDATE leads SET email_match_count = email_match_count + 1, "
-                        "last_email_activity = %s, email_sentiment = %s WHERE id = %s",
-                        (rec["received_at"], rec["ai_sentiment"], rec["matched_lead_id"]),
-                        fetch=False,
-                    )
             except Exception as insert_err:
                 print(f"[EMAIL_INTEL] WARNING: Failed to insert email '{rec.get('subject','')[:50]}': {insert_err}", flush=True)
                 continue
@@ -2333,14 +2327,9 @@ async def _sync_group_threads(
                     matching_mailbox_email,
                     leads_cache,
                 )
-                if not lead_id:
-                    lead_id, confidence, method = _try_auto_create_lead(
-                        email_record,
-                        matching_mailbox_email,
-                        leads_cache,
-                    )
+                # In Lasso-only mode, no auto-create of local leads.
 
-                email_record["matched_lead_id"] = lead_id
+                email_record["lasso_lead_id"] = lead_id
                 email_record["match_confidence"] = confidence
                 email_record["match_method"] = method
                 page_records.append(email_record)
@@ -2348,12 +2337,17 @@ async def _sync_group_threads(
         ai_tasks = []
         ai_indices = []
         for i, rec in enumerate(page_records):
-            if rec["matched_lead_id"]:
-                lead_rows = execute_query(
-                    "SELECT first_name, last_name, email, status FROM leads WHERE id = %s",
-                    (rec["matched_lead_id"],),
+            if rec["lasso_lead_id"]:
+                lasso_rows = execute_query(
+                    "SELECT first_name, last_name, email, current_status AS status "
+                    "FROM dashboard_active_leads WHERE lasso_lead_id = %s "
+                    "UNION "
+                    "SELECT first_name, last_name, email, 'unassigned' AS status "
+                    "FROM dashboard_unassigned_leads WHERE lasso_lead_id = %s "
+                    "LIMIT 1",
+                    (rec["lasso_lead_id"], rec["lasso_lead_id"]),
                 )
-                lead_data = lead_rows[0] if lead_rows else None
+                lead_data = lasso_rows[0] if lasso_rows else None
                 ai_tasks.append(
                     analyze_email_with_ai(
                         email_body=rec["body_preview"],
@@ -2390,22 +2384,15 @@ async def _sync_group_threads(
             rec["ai_ready_to_close"] = ai_result.get("deal_stage") in ("closed", "closing")
             rec["ai_close_reasoning"] = (
                 f"Deal stage: {ai_result.get('deal_stage', 'unknown')}"
-                if rec["matched_lead_id"]
+                if rec["lasso_lead_id"]
                 else ""
             )
+            rec["ai_urgency"] = ai_result.get("urgency") or None
+            rec["ai_job_type"] = ai_result.get("job_type") or None
+            rec["ai_product"] = ai_result.get("product") or None
+            rec["ai_window_count"] = ai_result.get("window_count") or None
+            rec["ai_next_action"] = ai_result.get("next_action") or None
             rec["processed_at"] = datetime.utcnow()
-
-            if rec["matched_lead_id"]:
-                exists = execute_query("SELECT id FROM leads WHERE id = %s", (rec["matched_lead_id"],))
-                if not exists:
-                    print(
-                        f"[EMAIL_INTEL] WARNING: Lead #{rec['matched_lead_id']} missing, "
-                        f"clearing group match for '{rec.get('subject','')[:50]}'",
-                        flush=True,
-                    )
-                    rec["matched_lead_id"] = None
-                    rec["match_confidence"] = 0
-                    rec["match_method"] = None
 
             try:
                 insert_rec = rec
@@ -2418,15 +2405,8 @@ async def _sync_group_threads(
                 )
                 existing_ids.add(rec["ms_message_id"])
                 synced += 1
-
-                if rec["matched_lead_id"]:
+                if rec["lasso_lead_id"]:
                     matched += 1
-                    execute_query(
-                        "UPDATE leads SET email_match_count = email_match_count + 1, "
-                        "last_email_activity = %s, email_sentiment = %s WHERE id = %s",
-                        (rec["received_at"], rec["ai_sentiment"], rec["matched_lead_id"]),
-                        fetch=False,
-                    )
             except Exception as insert_err:
                 print(
                     f"[EMAIL_INTEL] WARNING: Failed to insert group post '{rec.get('subject','')[:50]}': "
@@ -2466,7 +2446,7 @@ async def get_sync_status(current_user: AdminUser = Depends(get_current_user)):
     total = total_rows[0]["cnt"] if total_rows else 0
 
     matched_rows = execute_query(
-        "SELECT COUNT(*) AS cnt FROM email_messages WHERE matched_lead_id IS NOT NULL"
+        "SELECT COUNT(*) AS cnt FROM email_messages WHERE lasso_lead_id IS NOT NULL"
     )
     matched = matched_rows[0]["cnt"] if matched_rows else 0
 
@@ -2517,29 +2497,37 @@ async def get_lead_emails(
 ):
     """Get all matched emails for a specific lead."""
     audit_log("EMAIL_READ", f"Viewed emails for lead {lead_id}", current_user.username)
+    _BASE_COLS = (
+        "em.id, em.ms_message_id, em.subject, em.sender_email, em.sender_name, "
+        "em.recipient_emails, em.body_preview, em.received_at, em.is_read, em.direction, "
+        "em.lasso_lead_id, em.match_confidence, em.match_method, em.ai_summary, em.ai_sentiment, "
+        "em.ai_action_items, em.ai_ready_to_close, em.ai_close_reasoning, "
+        "em.ai_urgency, em.ai_job_type, em.ai_product, em.ai_window_count, em.ai_next_action, "
+        "em.processed_at"
+    )
     if lead_id == 0:
         # Return recent matched emails for the dashboard feed.
         emails = execute_query(
-            "SELECT em.id, em.ms_message_id, em.subject, em.sender_email, em.sender_name, "
-            "em.recipient_emails, em.body_preview, em.received_at, em.is_read, em.direction, "
-            "em.matched_lead_id, em.match_confidence, em.match_method, em.ai_summary, em.ai_sentiment, "
-            "em.ai_action_items, em.ai_ready_to_close, em.ai_close_reasoning, em.processed_at, "
-            "l.first_name AS lead_first_name, l.last_name AS lead_last_name, l.status AS lead_status "
+            f"SELECT {_BASE_COLS}, "
+            "COALESCE(al.first_name, ul.first_name) AS lead_first_name, "
+            "COALESCE(al.last_name, ul.last_name) AS lead_last_name, "
+            "COALESCE(al.current_status, 'unassigned') AS lead_status "
             "FROM email_messages em "
-            "LEFT JOIN leads l ON l.id = em.matched_lead_id "
-            "WHERE em.matched_lead_id IS NOT NULL "
+            "LEFT JOIN dashboard_active_leads al ON al.lasso_lead_id = em.lasso_lead_id "
+            "LEFT JOIN dashboard_unassigned_leads ul ON ul.lasso_lead_id = em.lasso_lead_id "
+            "WHERE em.lasso_lead_id IS NOT NULL "
             "ORDER BY em.received_at DESC LIMIT 50"
         )
     else:
         emails = execute_query(
-            "SELECT em.id, em.ms_message_id, em.subject, em.sender_email, em.sender_name, "
-            "em.recipient_emails, em.body_preview, em.received_at, em.is_read, em.direction, "
-            "em.matched_lead_id, em.match_confidence, em.match_method, em.ai_summary, em.ai_sentiment, "
-            "em.ai_action_items, em.ai_ready_to_close, em.ai_close_reasoning, em.processed_at, "
-            "l.first_name AS lead_first_name, l.last_name AS lead_last_name, l.status AS lead_status "
+            f"SELECT {_BASE_COLS}, "
+            "COALESCE(al.first_name, ul.first_name) AS lead_first_name, "
+            "COALESCE(al.last_name, ul.last_name) AS lead_last_name, "
+            "COALESCE(al.current_status, 'unassigned') AS lead_status "
             "FROM email_messages em "
-            "LEFT JOIN leads l ON l.id = em.matched_lead_id "
-            "WHERE em.matched_lead_id = %s "
+            "LEFT JOIN dashboard_active_leads al ON al.lasso_lead_id = em.lasso_lead_id "
+            "LEFT JOIN dashboard_unassigned_leads ul ON ul.lasso_lead_id = em.lasso_lead_id "
+            "WHERE em.lasso_lead_id = %s "
             "ORDER BY em.received_at DESC",
             (lead_id,),
         )
@@ -2553,7 +2541,15 @@ async def get_lead_context(
 ):
     """AI-generated context summary for a lead based on all matched emails."""
     audit_log("EMAIL_READ", f"Viewed email context for lead {lead_id}", current_user.username)
-    lead_rows = execute_query("SELECT * FROM leads WHERE id = %s", (lead_id,))
+    lead_rows = execute_query(
+        "SELECT lasso_lead_id AS id, name, first_name, last_name, email, current_status AS status "
+        "FROM dashboard_active_leads WHERE lasso_lead_id = %s "
+        "UNION "
+        "SELECT lasso_lead_id, name, first_name, last_name, email, 'unassigned' "
+        "FROM dashboard_unassigned_leads WHERE lasso_lead_id = %s "
+        "LIMIT 1",
+        (lead_id, lead_id),
+    )
     if not lead_rows:
         raise HTTPException(status_code=404, detail="Lead not found")
     lead = lead_rows[0]
@@ -2561,7 +2557,7 @@ async def get_lead_context(
     emails = execute_query(
         "SELECT subject, sender_email, sender_name, body_preview, received_at, "
         "direction, ai_summary, ai_sentiment "
-        "FROM email_messages WHERE matched_lead_id = %s "
+        "FROM email_messages WHERE lasso_lead_id = %s "
         "ORDER BY received_at ASC",
         (lead_id,),
     )
@@ -2640,27 +2636,32 @@ async def get_lead_context(
 async def get_active_match_review(current_user: AdminUser = Depends(get_current_user)):
     """Return active/follow-up leads with matched email activity and cleanup flags."""
     audit_log("EMAIL_READ", "Viewed active matched lead review", current_user.username)
+    # Lasso-only: match against dashboard_active_leads snapshot
     rows = execute_query(
         """
-        WITH match_rollup AS (
+        WITH lasso_active AS (
+            SELECT
+                lasso_lead_id AS id,
+                COALESCE(NULLIF(TRIM(name), ''), 'Lead') AS name,
+                COALESCE(NULLIF(TRIM(email), ''), '') AS email,
+                dealer_id AS assigned_dealer_id,
+                dealer_name AS assigned_dealer_name,
+                current_status AS status,
+                date_assigned AS created_at,
+                last_interaction
+            FROM dashboard_active_leads
+        ),
+        match_rollup AS (
             SELECT
                 l.id AS lead_id,
-                COALESCE(
-                    NULLIF(TRIM(CONCAT(COALESCE(l.first_name, ''), ' ', COALESCE(l.last_name, ''))), ''),
-                    NULLIF(TRIM(COALESCE(l.name, '')), ''),
-                    'Lead'
-                ) AS lead_name,
-                COALESCE(NULLIF(TRIM(l.email), ''), '') AS lead_email,
-                COALESCE(NULLIF(TRIM(l.phone), ''), '') AS lead_phone,
+                l.name AS lead_name,
+                l.email AS lead_email,
+                '' AS lead_phone,
                 l.status AS lead_status,
-                COALESCE(NULLIF(TRIM(l.source), ''), '') AS lead_source,
-                COALESCE(NULLIF(TRIM(l.landing_page), ''), '') AS landing_page,
-                COALESCE(NULLIF(TRIM(l.landing_page_url), ''), '') AS landing_page_url,
                 l.assigned_dealer_id,
-                d.name AS assigned_dealer_name,
-                COALESCE(l.email_match_count, 0) AS email_match_count,
-                l.last_email_activity,
+                l.assigned_dealer_name,
                 l.created_at,
+                l.last_interaction AS last_email_activity,
                 COUNT(em.id) AS matched_email_count,
                 COUNT(*) FILTER (WHERE em.match_method IN ('name', 'phone')) AS weak_match_count,
                 COUNT(*) FILTER (
@@ -2678,28 +2679,16 @@ async def get_active_match_review(current_user: AdminUser = Depends(get_current_
                     ' | '
                     ORDER BY COALESCE(NULLIF(BTRIM(em.sender_email), ''), '<unknown>')
                 ) AS contact_emails
-            FROM leads l
-            JOIN email_messages em ON em.matched_lead_id = l.id
-            LEFT JOIN dealers d ON d.id = l.assigned_dealer_id
-            WHERE l.status IN ('active', 'follow_up')
+            FROM lasso_active l
+            JOIN email_messages em ON em.lasso_lead_id = l.id
             GROUP BY
-                l.id,
-                lead_name,
-                lead_email,
-                lead_phone,
-                l.status,
-                lead_source,
-                landing_page,
-                landing_page_url,
-                l.assigned_dealer_id,
-                d.name,
-                l.email_match_count,
-                l.last_email_activity,
-                l.created_at
+                l.id, l.name, l.email, l.status,
+                l.assigned_dealer_id, l.assigned_dealer_name,
+                l.created_at, l.last_interaction
         ),
         latest_email AS (
-            SELECT DISTINCT ON (em.matched_lead_id)
-                em.matched_lead_id AS lead_id,
+            SELECT DISTINCT ON (em.lasso_lead_id)
+                em.lasso_lead_id AS lead_id,
                 em.id AS latest_email_id,
                 em.received_at AS latest_email_at,
                 COALESCE(NULLIF(BTRIM(em.sender_email), ''), '<unknown>') AS latest_sender_email,
@@ -2711,15 +2700,14 @@ async def get_active_match_review(current_user: AdminUser = Depends(get_current_
                 COALESCE(em.ai_sentiment, 'neutral') AS latest_ai_sentiment,
                 COALESCE(em.ai_ready_to_close, FALSE) AS latest_ai_ready_to_close
             FROM email_messages em
-            JOIN leads l ON l.id = em.matched_lead_id
-            WHERE l.status IN ('active', 'follow_up')
-            ORDER BY em.matched_lead_id, em.received_at DESC, em.id DESC
+            WHERE em.lasso_lead_id IS NOT NULL
+            ORDER BY em.lasso_lead_id, em.received_at DESC, em.id DESC
         ),
         dup_email AS (
             SELECT
                 LOWER(BTRIM(email)) AS email_key,
-                COUNT(*) FILTER (WHERE status IN ('active', 'follow_up')) AS active_duplicate_email_count
-            FROM leads
+                COUNT(*) AS active_duplicate_email_count
+            FROM dashboard_active_leads
             WHERE email IS NOT NULL AND BTRIM(email) <> ''
             GROUP BY 1
         )
@@ -2734,11 +2722,12 @@ async def get_active_match_review(current_user: AdminUser = Depends(get_current_
             le.latest_ai_summary,
             le.latest_ai_sentiment,
             le.latest_ai_ready_to_close,
-            ROUND(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - mr.created_at)) / 86400.0, 1) AS lead_age_days,
             ROUND(
-                EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(mr.last_email_activity, mr.latest_email_at)))
-                / 86400.0,
-                1
+                EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(mr.created_at, NOW()))) / 86400.0, 1
+            ) AS lead_age_days,
+            ROUND(
+                EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(mr.last_email_activity, le.latest_email_at, NOW())))
+                / 86400.0, 1
             ) AS days_since_last_email,
             COALESCE(de.active_duplicate_email_count, 0) AS active_duplicate_email_count,
             (mr.assigned_dealer_id IS NULL) AS missing_dealer,
@@ -2753,11 +2742,9 @@ async def get_active_match_review(current_user: AdminUser = Depends(get_current_
                 ELSE 'low'
             END AS review_priority,
             CASE
-                WHEN mr.assigned_dealer_id IS NULL AND COALESCE(mr.landing_page, '') <> '' THEN
-                    'Matched email activity exists, the lead is missing a dealer assignment, and the lead came from ' || mr.landing_page || '.'
                 WHEN mr.assigned_dealer_id IS NULL THEN 'Matched email activity exists, but the lead is still missing a dealer assignment.'
-                WHEN COALESCE(de.active_duplicate_email_count, 0) > 1 THEN 'Multiple open leads share this customer email, so email activity may be split across duplicates.'
-                WHEN mr.weak_match_count > 0 THEN 'This lead includes at least one weak email match from a name- or phone-based fallback.'
+                WHEN COALESCE(de.active_duplicate_email_count, 0) > 1 THEN 'Multiple active leads share this customer email.'
+                WHEN mr.weak_match_count > 0 THEN 'This lead has at least one weak email match (name or phone fallback).'
                 ELSE 'Matched email activity is available for manual review.'
             END AS review_reason
         FROM match_rollup mr
@@ -2765,11 +2752,7 @@ async def get_active_match_review(current_user: AdminUser = Depends(get_current_
         LEFT JOIN dup_email de ON de.email_key = LOWER(BTRIM(mr.lead_email))
         ORDER BY
             (mr.assigned_dealer_id IS NULL) DESC,
-            (
-                mr.weak_match_count > 0
-                OR COALESCE(de.active_duplicate_email_count, 0) > 1
-                OR COALESCE(mr.max_match_confidence, 0) < 0.90
-            ) DESC,
+            (mr.weak_match_count > 0 OR COALESCE(de.active_duplicate_email_count, 0) > 1) DESC,
             COALESCE(le.latest_email_at, mr.latest_email_at) DESC,
             mr.lead_id DESC
         """
@@ -2822,7 +2805,7 @@ async def get_new_lead_candidates(current_user: AdminUser = Depends(get_current_
                     + CASE WHEN LOWER(COALESCE(em.body_preview, '')) LIKE '%phone:%' THEN 1 ELSE 0 END
                 ) AS candidate_score
             FROM email_messages em
-            WHERE em.matched_lead_id IS NULL
+            WHERE em.lasso_lead_id IS NULL
               AND em.direction = 'inbound'
               AND (
                   LOWER(COALESCE(em.sender_email, '')) LIKE 'lead@%'
@@ -2847,10 +2830,12 @@ async def get_new_lead_candidates(current_user: AdminUser = Depends(get_current_
         FROM candidates c
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS sender_lead_count
-            FROM leads l
-            WHERE l.email IS NOT NULL
-              AND BTRIM(l.email) <> ''
-              AND LOWER(BTRIM(l.email)) = LOWER(BTRIM(c.sender_email))
+            FROM (
+                SELECT email FROM dashboard_active_leads WHERE email IS NOT NULL AND BTRIM(email) <> ''
+                UNION ALL
+                SELECT email FROM dashboard_unassigned_leads WHERE email IS NOT NULL AND BTRIM(email) <> ''
+            ) lasso_leads
+            WHERE LOWER(BTRIM(lasso_leads.email)) = LOWER(BTRIM(c.sender_email))
         ) existing ON TRUE
         WHERE c.candidate_score >= 3
         ORDER BY c.candidate_score DESC, c.received_at DESC, c.id DESC
@@ -3041,3 +3026,54 @@ async def dismiss_review(
 
     audit_log("REVIEW_DISMISSED", f"Review {review_id} dismissed for lead {review['lead_id']}", current_user.username)
     return {"success": True, "lead_id": review["lead_id"]}
+
+
+@router.post("/review-queue/flag")
+async def flag_lead_for_closure(
+    body: dict,
+    current_user: AdminUser = Depends(get_current_user),
+):
+    """Manually flag an active lead for closure review."""
+    lead_id = body.get("lead_id")
+    reason = body.get("reason", "Manually flagged for closure review")
+    if not lead_id:
+        raise HTTPException(status_code=400, detail="lead_id is required")
+
+    # Check not already pending
+    existing = execute_query(
+        "SELECT id FROM closure_review_queue WHERE lead_id = %s AND status = 'pending'",
+        (lead_id,),
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Lead is already in the closure review queue")
+
+    # Get lead info for days_inactive and email count
+    lead_rows = execute_query(
+        "SELECT id, last_email_activity, email_match_count FROM leads WHERE id = %s",
+        (lead_id,),
+    )
+    if not lead_rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = lead_rows[0]
+
+    from datetime import datetime
+    days_inactive = 0
+    last_email_at = lead.get("last_email_activity")
+    if last_email_at:
+        days_inactive = (datetime.utcnow() - last_email_at).days
+
+    execute_query(
+        "INSERT INTO closure_review_queue "
+        "(lead_id, ai_reasoning, days_inactive, last_email_at, email_count) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (lead_id, reason, days_inactive, last_email_at, lead.get("email_match_count", 0)),
+        fetch=False,
+    )
+    execute_query(
+        "UPDATE leads SET ai_closure_flagged = TRUE WHERE id = %s",
+        (lead_id,),
+        fetch=False,
+    )
+
+    audit_log("CLOSURE_FLAGGED", f"Lead {lead_id} manually flagged for closure: {reason}", current_user.username)
+    return {"success": True, "lead_id": lead_id}

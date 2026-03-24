@@ -1,8 +1,13 @@
-import os
 import logging
+import os
+import threading
+import time
 from pathlib import Path
+from typing import Optional
+
 from dotenv import load_dotenv
 import psycopg2
+from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
 from fastapi import HTTPException
 
@@ -24,30 +29,78 @@ class Settings:
     GEOCODING_PROVIDER = os.getenv("GEOCODING_PROVIDER", "nominatim")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
+
 settings = Settings()
+
+# -------------------------------------------------------
+# Connection pool — keeps 2–10 live connections to Azure
+# Postgres so every execute_query() gets a ready connection
+# instead of paying the ~150 ms TCP handshake each time.
+# -------------------------------------------------------
+_pool: Optional[pg_pool.ThreadedConnectionPool] = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> pg_pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is not None:
+        return _pool
+    with _pool_lock:
+        if _pool is None:
+            _pool = pg_pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=30,
+                dsn=settings.DATABASE_URL,
+                cursor_factory=RealDictCursor,
+            )
+    return _pool
 
 
 def get_db_connection():
+    """Borrow a connection from the pool, retrying briefly on exhaustion."""
+    pool = _get_pool()
+    last_err: Exception = RuntimeError("pool unavailable")
+    for attempt in range(10):
+        try:
+            return pool.getconn()
+        except pg_pool.PoolError as e:
+            last_err = e
+            if attempt < 9:
+                time.sleep(0.2 * (attempt + 1))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
+    raise HTTPException(status_code=500, detail=f"Database connection pool exhausted: {last_err}")
+
+
+def release_db_connection(conn) -> None:
+    """Return a connection to the pool."""
     try:
-        conn = psycopg2.connect(settings.DATABASE_URL, cursor_factory=RealDictCursor)
-        return conn
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
+        _get_pool().putconn(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def execute_query(query: str, params: tuple = None, fetch: bool = True):
+    """Execute a query using a pooled connection (with retry on exhaustion)."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute(query, params)
             if fetch:
-                result = cursor.fetchall()
-                return result
+                return cursor.fetchall()
             else:
                 conn.commit()
                 return True
+    except HTTPException:
+        raise
     except Exception as e:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
     finally:
-        conn.close()
+        release_db_connection(conn)

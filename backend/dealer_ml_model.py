@@ -1,11 +1,11 @@
 """Utility module that encapsulates the machine learning model used to
 recommend dealers for incoming leads.
 
-The model is trained on historical data stored in the ``historical_data``
-table.  It learns relationships between project attributes and the dealer
-that ultimately completed the job.  The predictor is kept deliberately
-light-weight so it can be refreshed in memory when the API boots or when new
-data becomes available.
+The model is trained from Lasso-backed history stored in the
+``dashboard_history_leads`` table. It learns relationships between project
+attributes and the dealer that ultimately completed the job. The predictor is
+kept deliberately light-weight so it can be refreshed in memory when the API
+boots or when new data becomes available.
 """
 
 from __future__ import annotations
@@ -129,21 +129,22 @@ class DealerMLModel:
     def _train_model(self) -> bool:
         """Fetch data from the database and train the estimator."""
 
-        logger.info("Training dealer ML model from historical data")
+        logger.info("Training dealer ML model from Lasso-backed history")
         self._last_attempt_at = datetime.utcnow()
         try:
             records = self._query_executor(
                 """
-                SELECT final_dealer_selection, dealer_name, project_type, square_footage, current_status
-                FROM historical_data
-                WHERE final_dealer_selection IS NOT NULL
+                SELECT dealer_name AS final_dealer_selection, dealer_name, project_type,
+                       square_footage_value AS square_footage, current_status
+                FROM dashboard_history_leads
+                WHERE dealer_name IS NOT NULL
                 """,
                 None,
                 True,
             )
         except Exception as exc:
             self._last_error = str(exc)
-            logger.exception("Unable to fetch historical data for ML training: %s", exc)
+            logger.exception("Unable to fetch Lasso-backed history for ML training: %s", exc)
             self._pipeline = None
             return False
 

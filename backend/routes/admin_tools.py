@@ -1,10 +1,8 @@
-import csv
-import io
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from auth import AdminUser, get_current_user, pwd_context
-from db import execute_query, get_db_connection
+from db import execute_query
 
 router = APIRouter(prefix="/api/admin/tools", tags=["Admin Tools"])
 
@@ -32,120 +30,32 @@ class ChangePasswordRequest(BaseModel):
 
 @router.post("/csv-import")
 async def csv_import(req: CSVImportRequest, current_user: AdminUser = Depends(get_current_user)):
-    """Import leads from CSV with column mapping."""
-    if not req.data:
-        raise HTTPException(status_code=400, detail="No data provided")
-
-    inserted = 0
-    errors = []
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            for i, row in enumerate(req.data):
-                try:
-                    mapped = {}
-                    for m in req.mappings:
-                        if m.csv_column in row:
-                            mapped[m.db_column] = row[m.csv_column]
-
-                    if not mapped:
-                        continue
-
-                    # Ensure name field
-                    if 'name' not in mapped:
-                        fn = mapped.get('first_name', '')
-                        ln = mapped.get('last_name', '')
-                        if fn or ln:
-                            mapped['name'] = f"{fn} {ln}".strip()
-                        else:
-                            mapped['name'] = f"Import Row {i+1}"
-
-                    mapped['status'] = 'active'
-
-                    columns = ', '.join(mapped.keys())
-                    placeholders = ', '.join(['%s'] * len(mapped))
-                    cursor.execute(
-                        f"INSERT INTO leads ({columns}, created_at) VALUES ({placeholders}, CURRENT_TIMESTAMP)",
-                        tuple(mapped.values())
-                    )
-                    inserted += 1
-                except Exception as e:
-                    errors.append(f"Row {i+1}: {str(e)}")
-            conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-    return {"message": f"Imported {inserted} leads", "inserted": inserted, "errors": errors}
+    """CSV import is retired in Lasso-only mode."""
+    raise HTTPException(status_code=409, detail="CSV import is disabled in Lasso-only mode")
 
 
 @router.post("/csv-upload")
 async def csv_upload(file: UploadFile = File(...), current_user: AdminUser = Depends(get_current_user)):
-    """Upload CSV file and return headers + preview data for column mapping."""
-    content = await file.read()
-    text = content.decode('utf-8-sig')
-    reader = csv.DictReader(io.StringIO(text))
-    headers = reader.fieldnames or []
-    preview = []
-    for i, row in enumerate(reader):
-        if i >= 5:
-            break
-        preview.append(dict(row))
-    return {"headers": headers, "preview": preview, "total_rows": i + 1}
+    """CSV upload is retired in Lasso-only mode."""
+    raise HTTPException(status_code=409, detail="CSV upload is disabled in Lasso-only mode")
 
 
 @router.post("/mass-email")
 async def mass_email(req: MassEmailRequest, current_user: AdminUser = Depends(get_current_user)):
-    """Send mass email to selected dealers (placeholder - logs the request)."""
-    dealers = execute_query("SELECT id, name, email FROM dealers WHERE id = ANY(%s)", (req.dealer_ids,))
-    # In production, integrate with email service. For now, log and create notifications.
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            for dealer in dealers:
-                cursor.execute(
-                    """INSERT INTO notifications (dealer_id, notification_type, sent_at, responded)
-                    VALUES (%s, 'mass_email', CURRENT_TIMESTAMP, FALSE)""",
-                    (dealer['id'],)
-                )
-            conn.commit()
-    finally:
-        conn.close()
-    return {"message": f"Email queued for {len(dealers)} dealers", "dealers": [d['name'] for d in dealers]}
+    """Mass email is retired in Lasso-only mode."""
+    raise HTTPException(status_code=409, detail="Mass email is disabled in Lasso-only mode")
 
 
 @router.get("/notification-check")
 async def notification_check(current_user: AdminUser = Depends(get_current_user)):
-    """Check notification status for all dealers."""
-    query = """
-        SELECT d.id, d.name, d.email,
-            COUNT(n.id) as total_notifications,
-            COUNT(CASE WHEN n.responded = TRUE THEN 1 END) as responded,
-            MAX(n.sent_at) as last_sent,
-            MAX(CASE WHEN n.responded = TRUE THEN n.responded_at END) as last_responded
-        FROM dealers d
-        LEFT JOIN notifications n ON d.id = n.dealer_id
-        WHERE d.is_active = TRUE
-        GROUP BY d.id, d.name, d.email
-        ORDER BY d.name
-    """
-    return {"dealers": execute_query(query)}
+    """Notification tracking is retired in Lasso-only mode."""
+    return {"dealers": []}
 
 
 @router.post("/notification-resend/{dealer_id}")
 async def resend_notification(dealer_id: int, current_user: AdminUser = Depends(get_current_user)):
-    """Resend notification to a dealer."""
-    dealer = execute_query("SELECT id, name FROM dealers WHERE id = %s", (dealer_id,))
-    if not dealer:
-        raise HTTPException(status_code=404, detail="Dealer not found")
-    execute_query(
-        """INSERT INTO notifications (dealer_id, notification_type, sent_at, responded)
-        VALUES (%s, 'resend', CURRENT_TIMESTAMP, FALSE)""",
-        (dealer_id,), fetch=False
-    )
-    return {"message": f"Notification resent to {dealer[0]['name']}"}
+    """Notification resends are retired in Lasso-only mode."""
+    raise HTTPException(status_code=409, detail="Notification resend is disabled in Lasso-only mode")
 
 
 @router.get("/lead-export")
@@ -156,30 +66,131 @@ async def lead_export(
     end_date: Optional[str] = None,
     current_user: AdminUser = Depends(get_current_user)
 ):
-    """Export leads as JSON (frontend converts to CSV)."""
+    """Export live Lasso-backed rows as JSON (frontend converts to CSV)."""
     conditions = []
     params = []
     if status:
-        conditions.append("l.status = %s")
+        conditions.append("status_bucket = %s")
         params.append(status)
     if province:
-        conditions.append("l.province = %s")
+        conditions.append("province = %s")
         params.append(province.upper())
     if start_date:
-        conditions.append("l.created_at >= %s")
+        conditions.append("created_at >= %s")
         params.append(start_date)
     if end_date:
-        conditions.append("l.created_at <= %s")
+        conditions.append("created_at <= %s")
         params.append(end_date)
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     query = f"""
-        SELECT l.*, d.name as dealer_name_assigned, rd.name as recommended_dealer_name
-        FROM leads l
-        LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
-        LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
+        SELECT *
+        FROM (
+            SELECT
+                'unassigned' AS source_bucket,
+                lasso_lead_id AS id,
+                lasso_lead_id,
+                name,
+                email,
+                NULL::text AS phone,
+                location_text AS address,
+                city,
+                province,
+                NULL::text AS postal_code,
+                NULL::text AS dealer_name_assigned,
+                'active' AS status,
+                NULL::text AS project_type,
+                NULL::text AS product_type,
+                NULL::numeric AS square_footage,
+                NULL::text AS business_category,
+                NULL::text AS lead_source,
+                NULL::text AS company_name,
+                NULL::text AS comments,
+                NULL::text AS landing_page,
+                NULL::text AS landing_page_url,
+                NULL::text AS landing_page_variant,
+                NULL::text AS utm_source,
+                NULL::text AS utm_medium,
+                NULL::text AS utm_campaign,
+                NULL::text AS utm_content,
+                NULL::numeric AS value_of_order,
+                record_date AS created_at,
+                last_interaction,
+                'active' AS status_bucket
+            FROM dashboard_unassigned_leads
+
+            UNION ALL
+
+            SELECT
+                'active' AS source_bucket,
+                lasso_lead_id AS id,
+                lasso_lead_id,
+                name,
+                email,
+                NULL::text AS phone,
+                location_text AS address,
+                city,
+                province,
+                NULL::text AS postal_code,
+                dealer_name AS dealer_name_assigned,
+                'active' AS status,
+                NULL::text AS project_type,
+                NULL::text AS product_type,
+                NULL::numeric AS square_footage,
+                NULL::text AS business_category,
+                NULL::text AS lead_source,
+                NULL::text AS company_name,
+                NULL::text AS comments,
+                NULL::text AS landing_page,
+                NULL::text AS landing_page_url,
+                NULL::text AS landing_page_variant,
+                NULL::text AS utm_source,
+                NULL::text AS utm_medium,
+                NULL::text AS utm_campaign,
+                NULL::text AS utm_content,
+                NULL::numeric AS value_of_order,
+                date_assigned AS created_at,
+                last_interaction,
+                'active' AS status_bucket
+            FROM dashboard_active_leads
+
+            UNION ALL
+
+            SELECT
+                'history' AS source_bucket,
+                lasso_lead_id AS id,
+                lasso_lead_id,
+                name,
+                email,
+                phone,
+                address,
+                city,
+                province,
+                postal_code,
+                dealer_name AS dealer_name_assigned,
+                current_status AS status,
+                project_type,
+                product_type,
+                square_footage_value AS square_footage,
+                business_category,
+                lead_source,
+                company_name,
+                comments,
+                landing_page,
+                landing_page_url,
+                landing_page_variant,
+                utm_source,
+                utm_medium,
+                utm_campaign,
+                utm_content,
+                value_of_order,
+                COALESCE(submit_date, created_date, form_submit_date) AS created_at,
+                last_interaction,
+                status_bucket
+            FROM dashboard_history_leads
+        ) exported
         {where}
-        ORDER BY l.created_at DESC
+        ORDER BY created_at DESC NULLS LAST, last_interaction DESC NULLS LAST
     """
     leads = execute_query(query, tuple(params) if params else None)
     return {"leads": leads, "count": len(leads)}

@@ -177,7 +177,6 @@ const OverallSummaryTab: React.FC = () => {
 
 const DealerPerformanceTab: React.FC = () => {
   const [data, setData] = useState<DealerPerformanceData[]>([]);
-  const [source, setSource] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [sortField, setSortField] = useState<string>('dealer_name');
@@ -187,14 +186,14 @@ const DealerPerformanceTab: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      const res = await getDealerPerformance(source || undefined);
+      const res = await getDealerPerformance();
       setData(res.data);
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to load data');
     } finally {
       setLoading(false);
     }
-  }, [source]);
+  }, []);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -227,18 +226,8 @@ const DealerPerformanceTab: React.FC = () => {
         New Report 1 – Dealer Performance (All Lead Sources)
       </h2>
       <p style={{ color: '#666', fontSize: 13, marginBottom: 16 }}>
-        Shows {data.length} dealers with Active, Converted, Dead leads and Avg. Response Time.
+        Shows {data.length} dealers with Active, Converted, Dead leads and Avg. Response Time from the live Lasso snapshot.
       </p>
-
-      <div style={{ marginBottom: 16 }}>
-        <label style={{ fontSize: 13, fontWeight: 600, color: '#555', marginRight: 8 }}>Filter by Source:</label>
-        <select value={source} onChange={e => setSource(e.target.value)} style={sourceSelectStyle}>
-          <option value="">All Sources</option>
-          <option value="Dealer - Request a Quote or Consultation">Dealer - Request a Quote</option>
-          <option value="import">Import</option>
-          <option value="website">Website</option>
-        </select>
-      </div>
 
       {error && <div style={{ color: '#c91414', marginBottom: 12 }}>{error}</div>}
       {loading && <p style={{ color: '#999' }}>Loading...</p>}
@@ -292,7 +281,6 @@ const DealerPerformanceTab: React.FC = () => {
 
 const ProjectSizeTab: React.FC = () => {
   const [data, setData] = useState<DealerProjectData[]>([]);
-  const [source, setSource] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -300,14 +288,14 @@ const ProjectSizeTab: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      const res = await getDealerProjects(source || undefined);
+      const res = await getDealerProjects();
       setData(res.data);
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to load data');
     } finally {
       setLoading(false);
     }
-  }, [source]);
+  }, []);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -317,18 +305,8 @@ const ProjectSizeTab: React.FC = () => {
         New Report 2 – Project Size Breakdown by Dealer
       </h2>
       <p style={{ color: '#666', fontSize: 13, marginBottom: 16 }}>
-        Breaks down leads by square footage categories for {data.length} dealers.
+        Breaks down live Lasso history by square footage categories for {data.length} dealers.
       </p>
-
-      <div style={{ marginBottom: 16 }}>
-        <label style={{ fontSize: 13, fontWeight: 600, color: '#555', marginRight: 8 }}>Filter by Source:</label>
-        <select value={source} onChange={e => setSource(e.target.value)} style={sourceSelectStyle}>
-          <option value="">All Sources</option>
-          <option value="Dealer - Request a Quote or Consultation">Dealer - Request a Quote</option>
-          <option value="import">Import</option>
-          <option value="website">Website</option>
-        </select>
-      </div>
 
       {error && <div style={{ color: '#c91414', marginBottom: 12 }}>{error}</div>}
       {loading && <p style={{ color: '#999' }}>Loading...</p>}
@@ -376,7 +354,6 @@ const ProjectSizeTab: React.FC = () => {
 
 const LeadStatusTab: React.FC = () => {
   const [data, setData] = useState<LeadStatusReportType[]>([]);
-  const [source, setSource] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -384,14 +361,14 @@ const LeadStatusTab: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      const res = await getLeadStatusReport(source || undefined);
+      const res = await getLeadStatusReport();
       setData(res.data);
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to load data');
     } finally {
       setLoading(false);
     }
-  }, [source]);
+  }, []);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -403,18 +380,8 @@ const LeadStatusTab: React.FC = () => {
         New Report 3 – Lead Status & Conversion Scores
       </h2>
       <p style={{ color: '#666', fontSize: 13, marginBottom: 16 }}>
-        Shows each dealer's reviewing/undecided, building budget, converted total $, and lead score %.
+        Shows each dealer's reviewing/undecided, building budget, converted total $, and lead score % from the live Lasso snapshot.
       </p>
-
-      <div style={{ marginBottom: 16 }}>
-        <label style={{ fontSize: 13, fontWeight: 600, color: '#555', marginRight: 8 }}>Filter by Source:</label>
-        <select value={source} onChange={e => setSource(e.target.value)} style={sourceSelectStyle}>
-          <option value="">All Sources</option>
-          <option value="Dealer - Request a Quote or Consultation">Dealer - Request a Quote</option>
-          <option value="import">Import</option>
-          <option value="website">Website</option>
-        </select>
-      </div>
 
       {error && <div style={{ color: '#c91414', marginBottom: 12 }}>{error}</div>}
       {loading && <p style={{ color: '#999' }}>Loading...</p>}

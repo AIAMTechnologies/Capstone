@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { lazy, Suspense } from 'react';
 import { createBrowserRouter, RouterProvider, Navigate, Outlet } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import Header from './components/Header';
@@ -6,14 +6,21 @@ import ProtectedRoute from './components/ProtectedRoute';
 import Home from './pages/Home';
 import AdminLogin from './pages/AdminLogin';
 import AdminLayout from './components/admin/AdminLayout';
-import Dashboard from './pages/admin/Dashboard';
-import History from './pages/admin/History';
-import Resources from './pages/admin/Resources';
-import Reports from './pages/admin/Reports';
-import Tools from './pages/admin/Tools';
-import EmailIntel from './pages/admin/EmailIntel';
-import EmailOps from './pages/admin/EmailOps';
 import './styles/App.css';
+
+// Lazy-load all admin pages so /admin/dashboard doesn't pull in
+// Email Intel, Reports, History, etc. up front.
+const Dashboard = lazy(() => import('./pages/admin/Dashboard'));
+const History = lazy(() => import('./pages/admin/History'));
+const Resources = lazy(() => import('./pages/admin/Resources'));
+const Reports = lazy(() => import('./pages/admin/Reports'));
+const Tools = lazy(() => import('./pages/admin/Tools'));
+const EmailIntel = lazy(() => import('./pages/admin/EmailIntel'));
+const EmailOps = lazy(() => import('./pages/admin/EmailOps'));
+
+const AdminFallback = () => (
+  <div style={{ padding: '40px 20px', color: '#6b7280' }}>Loading...</div>
+);
 
 const AppShell = () => (
   <div className="app">
@@ -45,13 +52,13 @@ const router = createBrowserRouter(
       element: <AdminShell />,
       children: [
         { index: true, element: <Navigate to="/admin/dashboard" replace /> },
-        { path: 'dashboard', element: <Dashboard /> },
-        { path: 'history', element: <History /> },
-        { path: 'resources', element: <Resources /> },
-        { path: 'reports', element: <Reports /> },
-        { path: 'tools', element: <Tools /> },
-        { path: 'email-intel', element: <EmailIntel /> },
-        { path: 'email-ops', element: <EmailOps /> },
+        { path: 'dashboard', element: <Suspense fallback={<AdminFallback />}><Dashboard /></Suspense> },
+        { path: 'history', element: <Suspense fallback={<AdminFallback />}><History /></Suspense> },
+        { path: 'resources', element: <Suspense fallback={<AdminFallback />}><Resources /></Suspense> },
+        { path: 'reports', element: <Suspense fallback={<AdminFallback />}><Reports /></Suspense> },
+        { path: 'tools', element: <Suspense fallback={<AdminFallback />}><Tools /></Suspense> },
+        { path: 'email-intel', element: <Suspense fallback={<AdminFallback />}><EmailIntel /></Suspense> },
+        { path: 'email-ops', element: <Suspense fallback={<AdminFallback />}><EmailOps /></Suspense> },
       ],
     },
   ]

@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "Frontend (Vite + React)",
-      "runtimeExecutable": "node",
-      "runtimeArgs": ["start-vite.mjs"],
+      "runtimeExecutable": "/usr/local/bin/node",
+      "runtimeArgs": ["/Users/ammaralam/Documents/lap_portal_v3_nov6/start-vite.mjs"],
       "port": 3000,
       "autoPort": true
     }

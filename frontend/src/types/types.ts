@@ -77,6 +77,62 @@ export interface DashboardStats {
   active_dealers: number;
 }
 
+export interface LassoDashboardStatus {
+  sync_in_progress: boolean;
+  sync_type?: string | null;
+  started_at?: string | null;
+  last_error?: string | null;
+  last_successful_sync_at?: string | null;
+  last_successful_sync_type?: string | null;
+  last_full_successful_sync_at?: string | null;
+  unassigned_count: number;
+  active_count: number;
+  history_count?: number;
+  dealer_lead_reporting_synced_at?: string | null;
+  history_synced_at?: string | null;
+  dealer_performance_synced_at?: string | null;
+  dealer_project_breakdown_synced_at?: string | null;
+  dealer_status_synced_at?: string | null;
+  fast_sync_interval_minutes: number;
+  full_sync_interval_minutes: number;
+  active_queue_max_age_days: number;
+}
+
+export interface DashboardUnassignedLead {
+  lasso_lead_id: number;
+  lead_id?: number | null;
+  first_name?: string | null;
+  last_name?: string | null;
+  name: string;
+  email?: string | null;
+  city?: string | null;
+  province?: string | null;
+  location_text?: string | null;
+  current_status?: string | null;
+  record_date?: string | null;
+  last_interaction?: string | null;
+  synced_at: string;
+}
+
+export interface DashboardActiveLead {
+  lasso_lead_id: number;
+  lead_id?: number | null;
+  dealer_id?: number | null;
+  dealer_name?: string | null;
+  first_name?: string | null;
+  last_name?: string | null;
+  name: string;
+  email?: string | null;
+  city?: string | null;
+  province?: string | null;
+  location_text?: string | null;
+  current_status?: string | null;
+  date_assigned?: string | null;
+  last_interaction?: string | null;
+  lead_details?: string | null;
+  synced_at: string;
+}
+
 export interface CostTrackingModelBreakdown {
   model_used: string;
   total_calls: number;
@@ -373,6 +429,11 @@ export interface EmailMessage {
   ai_sentiment: 'positive' | 'neutral' | 'negative' | null;
   ai_action_items: string[] | null;
   ai_ready_to_close: boolean;
+  ai_urgency: 'high' | 'medium' | 'low' | null;
+  ai_job_type: 'residential' | 'commercial' | 'replacement' | 'unknown' | null;
+  ai_product: string | null;
+  ai_window_count: string | null;
+  ai_next_action: string | null;
   lead_first_name?: string | null;
   lead_last_name?: string | null;
   lead_status?: string | null;

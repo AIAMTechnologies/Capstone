@@ -7,8 +7,17 @@ ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS distance_to_dealer_km NUMERIC,
     ADD COLUMN IF NOT EXISTS dealer_ml_probability DOUBLE PRECISION;
 
-ALTER TABLE historical_data
-    ADD COLUMN IF NOT EXISTS final_dealer_selection TEXT;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_name = 'historical_data'
+  ) THEN
+    EXECUTE 'ALTER TABLE historical_data ADD COLUMN IF NOT EXISTS final_dealer_selection TEXT';
+  END IF;
+END $$;
 
 DROP TRIGGER IF EXISTS update_installer_capacity_trigger ON leads;
 DROP FUNCTION IF EXISTS update_installer_capacity();
@@ -94,7 +103,16 @@ ALTER TABLE leads
     DROP COLUMN IF EXISTS final_installer_selection CASCADE,
     DROP COLUMN IF EXISTS distance_to_installer_km CASCADE;
 
-ALTER TABLE historical_data
-    DROP COLUMN IF EXISTS final_installer_selection CASCADE;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_name = 'historical_data'
+  ) THEN
+    EXECUTE 'ALTER TABLE historical_data DROP COLUMN IF EXISTS final_installer_selection CASCADE';
+  END IF;
+END $$;
 
 DROP TABLE IF EXISTS installers CASCADE;

@@ -96,6 +96,7 @@ async def get_unassigned_leads(current_user: AdminUser = Depends(get_current_use
         FROM leads l
         LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
         WHERE l.assigned_dealer_id IS NULL
+        AND COALESCE(NULLIF(TRIM(l.lead_source), ''), '') <> 'Email Auto-Created'
         AND l.status NOT IN ('converted', 'dead', 'archived')
         ORDER BY l.created_at DESC
     """
@@ -123,6 +124,7 @@ async def get_active_leads(current_user: AdminUser = Depends(get_current_user)):
         LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
         LEFT JOIN dealers rd ON l.recommended_dealer_id = rd.id
         WHERE l.assigned_dealer_id IS NOT NULL
+        AND COALESCE(NULLIF(TRIM(l.lead_source), ''), '') <> 'Email Auto-Created'
         AND l.status NOT IN ('converted', 'dead', 'archived')
         ORDER BY l.created_at DESC
     """

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { getHistoryLeads, updateValueOfOrder } from '../../services/api';
+import { getHistoryLeads } from '../../services/api';
 import type { ExtendedLead } from '../../types/types';
 
 const PROVINCES = [
@@ -56,10 +56,6 @@ const History: React.FC = () => {
 
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
 
-  const [editingValueId, setEditingValueId] = useState<number | null>(null);
-  const [editValue, setEditValue] = useState('');
-  const [savingValue, setSavingValue] = useState(false);
-
   const fetchLeads = useCallback(async (newOffset = 0, append = false) => {
     setLoading(true);
     setError('');
@@ -105,21 +101,6 @@ const History: React.FC = () => {
       else next.add(id);
       return next;
     });
-  };
-
-  const handleSaveValue = async (leadId: number) => {
-    setSavingValue(true);
-    try {
-      await updateValueOfOrder(leadId, parseFloat(editValue) || 0);
-      setLeads(prev =>
-        prev.map(l => l.id === leadId ? { ...l, value_of_order: parseFloat(editValue) || 0 } : l)
-      );
-      setEditingValueId(null);
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to update value');
-    } finally {
-      setSavingValue(false);
-    }
   };
 
   const formatDate = (d?: string) => {
@@ -184,40 +165,7 @@ const History: React.FC = () => {
                   <div><strong>Company:</strong> {lead.company_name || '-'}</div>
                   <div>
                     <strong>Value of Order:</strong>{' '}
-                    {editingValueId === lead.id ? (
-                      <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
-                        <input
-                          type="number"
-                          value={editValue}
-                          onChange={e => setEditValue(e.target.value)}
-                          style={{ width: 100, padding: '4px 8px', borderRadius: 4, border: '1px solid #ddd', fontSize: 13 }}
-                          onClick={e => e.stopPropagation()}
-                        />
-                        <button
-                          disabled={savingValue}
-                          onClick={e => { e.stopPropagation(); handleSaveValue(lead.id); }}
-                          style={{ padding: '4px 10px', background: '#c91414', color: 'white', border: 'none', borderRadius: 4, fontSize: 12, cursor: 'pointer' }}
-                        >
-                          {savingValue ? '...' : 'Save'}
-                        </button>
-                        <button
-                          onClick={e => { e.stopPropagation(); setEditingValueId(null); }}
-                          style={{ padding: '4px 10px', background: '#eee', color: '#333', border: 'none', borderRadius: 4, fontSize: 12, cursor: 'pointer' }}
-                        >
-                          Cancel
-                        </button>
-                      </span>
-                    ) : (
-                      <span>
-                        {lead.value_of_order != null ? `$${Number(lead.value_of_order).toLocaleString()}` : '-'}
-                        <button
-                          onClick={e => { e.stopPropagation(); setEditingValueId(lead.id); setEditValue(String(lead.value_of_order || '')); }}
-                          style={{ marginLeft: 6, padding: '2px 8px', background: 'none', border: '1px solid #ddd', borderRadius: 4, fontSize: 11, cursor: 'pointer', color: '#666' }}
-                        >
-                          Edit
-                        </button>
-                      </span>
-                    )}
+                    {lead.value_of_order != null ? `$${Number(lead.value_of_order).toLocaleString()}` : '-'}
                   </div>
                   <div><strong>Comments:</strong> {lead.comments || '-'}</div>
                   <div><strong>UTM Source:</strong> {lead.utm_source || '-'}</div>

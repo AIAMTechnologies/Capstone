@@ -10,14 +10,6 @@ from cost_control import build_spend_limit_message
 router = APIRouter(prefix="/api/ai", tags=["AI Insights"])
 
 
-def _conversion_rate(row: dict) -> float:
-    total = row.get('total') or 0
-    converted = row.get('converted') or 0
-    if not total:
-        return 0.0
-    return converted / total
-
-
 def _format_age(days: int) -> str:
     if days >= 730:
         return f"about {round(days / 365)} years"
@@ -32,7 +24,6 @@ def _fallback_insights(
     aging_count: int,
     oldest_unassigned_days: int,
     active_count: int,
-    follow_up_count: int,
     stale_assigned_count: int,
     province_stats: list[dict],
 ) -> list[dict]:
@@ -43,10 +34,10 @@ def _fallback_insights(
             "type": "warning",
             "title": f"{aging_count} unassigned leads are aging",
             "body": (
-                f"{aging_count} open leads have been sitting unassigned for more than 48 hours. "
+                f"{aging_count} leads are sitting in the unassigned queue. "
                 f"The oldest has been waiting {_format_age(oldest_unassigned_days)}."
             ),
-            "action": "Work the unassigned queue first and clear the oldest leads today.",
+            "action": "Work the unassigned queue and clear the oldest leads today.",
         })
 
     if active_count > 0 and stale_assigned_count > 0:
@@ -55,49 +46,22 @@ def _fallback_insights(
             "type": "alert",
             "title": f"{stale_assigned_count} assigned leads look stalled",
             "body": (
-                f"{stale_assigned_count} assigned leads have no logged activity in the last 7 days, "
-                f"which is about {stale_pct}% of the active pipeline."
+                f"{stale_assigned_count} assigned leads have had no Lasso interaction in the last 7 days, "
+                f"about {stale_pct}% of the active pipeline."
             ),
             "action": "Have the team review stale assigned leads and push next actions or reassign them.",
         })
 
-    if follow_up_count > 0:
-        follow_up_pct = round((follow_up_count / max(active_count, 1)) * 100)
-        insights.append({
-            "type": "trend",
-            "title": f"{follow_up_count} leads are sitting in follow-up",
-            "body": (
-                f"{follow_up_count} leads are already marked follow-up, representing about "
-                f"{follow_up_pct}% of the active pipeline."
-            ),
-            "action": "Audit follow-up leads for overdue quotes, callbacks, and next-touch dates.",
-        })
-
-    provinces_with_volume = [row for row in province_stats if (row.get('total') or 0) >= 100]
-    if provinces_with_volume:
-        best = max(provinces_with_volume, key=_conversion_rate)
-        worst = min(provinces_with_volume, key=_conversion_rate)
-
-        if best.get('province'):
+    if province_stats:
+        best = max(province_stats, key=lambda r: r.get("total") or 0)
+        if best.get("province") and (best.get("total") or 0) >= 5:
             insights.append({
                 "type": "trend",
-                "title": f"{best['province']} is converting best",
+                "title": f"{best['province']} has the most active leads",
                 "body": (
-                    f"{best['province']} is converting at {_conversion_rate(best) * 100:.1f}% "
-                    f"from {best['total']} leads."
+                    f"{best['province']} has {best['total']} active leads in the current Lasso snapshot."
                 ),
-                "action": "Review what is working in that region and reuse the same playbook elsewhere.",
-            })
-
-        if worst.get('province') and worst.get('province') != best.get('province'):
-            insights.append({
-                "type": "warning",
-                "title": f"{worst['province']} needs attention",
-                "body": (
-                    f"{worst['province']} is converting at only {_conversion_rate(worst) * 100:.1f}% "
-                    f"from {worst['total']} leads."
-                ),
-                "action": "Check dealer responsiveness, quote speed, and close rates in that province.",
+                "action": "Ensure adequate dealer coverage in that province.",
             })
 
     return insights[:4]
@@ -105,70 +69,81 @@ def _fallback_insights(
 
 @router.get("/insights")
 async def get_insights(current_user: AdminUser = Depends(get_current_user)):
-    """AI-generated actionable insights from current lead/dealer data."""
-    # Gather aggregations
-    aging = execute_query(
-        "SELECT COUNT(*) as cnt FROM leads WHERE assigned_dealer_id IS NULL AND status = 'active' AND created_at < CURRENT_TIMESTAMP - INTERVAL '48 hours'"
+    """AI-generated actionable insights from the Lasso live snapshot."""
+
+    # Unassigned leads (all are effectively "new" in the Lasso queue)
+    aging_rows = execute_query(
+        "SELECT COUNT(*) AS cnt FROM dashboard_unassigned_leads "
+        "WHERE record_date < NOW() - INTERVAL '48 hours'"
     )
-    aging_count = aging[0]['cnt'] if aging else 0
-    oldest_unassigned = execute_query(
-        "SELECT COALESCE(MAX(EXTRACT(DAY FROM CURRENT_TIMESTAMP - created_at)), 0) AS days "
-        "FROM leads WHERE assigned_dealer_id IS NULL AND status = 'active'"
+    aging_count = int(aging_rows[0]["cnt"]) if aging_rows else 0
+
+    oldest_rows = execute_query(
+        "SELECT COALESCE(MAX(EXTRACT(DAY FROM NOW() - record_date)), 0) AS days "
+        "FROM dashboard_unassigned_leads"
     )
-    oldest_unassigned_days = int(oldest_unassigned[0]['days']) if oldest_unassigned else 0
+    oldest_unassigned_days = int(oldest_rows[0]["days"]) if oldest_rows else 0
 
-    pipeline_counts = execute_query("""
-        SELECT
-            COUNT(*) FILTER (WHERE assigned_dealer_id IS NOT NULL AND status IN ('active', 'follow_up')) AS active_count,
-            COUNT(*) FILTER (WHERE status = 'follow_up') AS follow_up_count
-        FROM leads
-        WHERE status NOT IN ('converted', 'dead', 'archived')
-    """)
-    active_count = int(pipeline_counts[0]['active_count']) if pipeline_counts else 0
-    follow_up_count = int(pipeline_counts[0]['follow_up_count']) if pipeline_counts else 0
+    # Active (assigned) leads
+    active_rows = execute_query(
+        "SELECT COUNT(*) AS cnt FROM dashboard_active_leads WHERE dealer_id IS NOT NULL"
+    )
+    active_count = int(active_rows[0]["cnt"]) if active_rows else 0
 
-    stale_assigned = execute_query("""
-        SELECT COUNT(*) AS cnt
-        FROM leads l
-        WHERE l.assigned_dealer_id IS NOT NULL
-        AND l.status IN ('active', 'follow_up')
-        AND GREATEST(
-            COALESCE((SELECT MAX(created_at) FROM lead_logs WHERE lead_id = l.id), l.created_at),
-            COALESCE(l.updated_at, l.created_at)
-        ) < CURRENT_TIMESTAMP - INTERVAL '7 days'
-    """)
-    stale_assigned_count = int(stale_assigned[0]['cnt']) if stale_assigned else 0
+    # Stale assigned: no last_interaction in 7 days
+    stale_rows = execute_query(
+        "SELECT COUNT(*) AS cnt FROM dashboard_active_leads "
+        "WHERE dealer_id IS NOT NULL "
+        "AND (last_interaction IS NULL OR last_interaction < NOW() - INTERVAL '7 days')"
+    )
+    stale_assigned_count = int(stale_rows[0]["cnt"]) if stale_rows else 0
 
-    province_stats = execute_query("""
-        SELECT province, COUNT(*) as total,
-            COUNT(CASE WHEN status = 'converted' THEN 1 END) as converted
-        FROM leads WHERE province IS NOT NULL
-        GROUP BY province ORDER BY total DESC LIMIT 5
-    """)
+    # Province breakdown from active leads
+    province_stats = execute_query(
+        "SELECT CASE "
+        "  WHEN UPPER(TRIM(province)) IN ('ONTARIO','ON') THEN 'ON' "
+        "  WHEN UPPER(TRIM(province)) IN ('BRITISH COLUMBIA','BC') THEN 'BC' "
+        "  WHEN UPPER(TRIM(province)) IN ('ALBERTA','AB') THEN 'AB' "
+        "  WHEN UPPER(TRIM(province)) IN ('QUEBEC','QC') THEN 'QC' "
+        "  WHEN UPPER(TRIM(province)) IN ('MANITOBA','MB') THEN 'MB' "
+        "  WHEN UPPER(TRIM(province)) IN ('SASKATCHEWAN','SK') THEN 'SK' "
+        "  WHEN UPPER(TRIM(province)) IN ('NOVA SCOTIA','NS') THEN 'NS' "
+        "  WHEN UPPER(TRIM(province)) IN ('NEW BRUNSWICK','NB') THEN 'NB' "
+        "  WHEN UPPER(TRIM(province)) IN ('NEWFOUNDLAND AND LABRADOR','NEWFOUNDLAND','NL') THEN 'NL' "
+        "  WHEN UPPER(TRIM(province)) IN ('PRINCE EDWARD ISLAND','PEI','PE') THEN 'PE' "
+        "  WHEN UPPER(TRIM(province)) IN ('NORTHWEST TERRITORIES','NT') THEN 'NT' "
+        "  WHEN UPPER(TRIM(province)) IN ('NUNAVUT','NU') THEN 'NU' "
+        "  WHEN UPPER(TRIM(province)) IN ('YUKON','YT') THEN 'YT' "
+        "  ELSE UPPER(TRIM(province)) "
+        "END AS province, COUNT(*) AS total "
+        "FROM dashboard_active_leads "
+        "WHERE province IS NOT NULL "
+        "GROUP BY 1 ORDER BY total DESC LIMIT 5"
+    ) or []
 
     summary = (
-        f"Aging unassigned leads: {aging_count}. "
+        f"Unassigned leads older than 48h: {aging_count}. "
         f"Oldest unassigned lead age: {oldest_unassigned_days} days. "
         f"Active assigned leads: {active_count}. "
-        f"Follow-up leads: {follow_up_count}. "
-        f"Stale assigned leads: {stale_assigned_count}. "
+        f"Stale assigned leads (no interaction 7+ days): {stale_assigned_count}. "
     )
-    summary += "Province breakdown: " + ", ".join(
-        f"{p['province']}: {p['total']} total/{p['converted']} converted" for p in (province_stats or [])
-    )
+    if province_stats:
+        summary += "Province breakdown (active): " + ", ".join(
+            f"{p['province']}: {p['total']}" for p in province_stats
+        )
 
-    cache_key = hashlib.sha1(summary.encode('utf-8')).hexdigest()
+    cache_key = hashlib.sha1(summary.encode("utf-8")).hexdigest()
 
     result = ai_client.call_json(
         system=(
             "You are the revenue operations copilot for Window Film Canada. "
             "Generate 3-4 sharp manager-facing insights using the exact numbers provided. "
-            "Prioritize backlog risk, regional conversion performance, stalled pipeline, and follow-up load. "
+            "Prioritize backlog risk, regional pipeline, stalled assigned leads, and unassigned queue aging. "
             "Do not repeat the same theme twice, avoid generic phrasing, and make each action specific. "
             "Return JSON: {\"insights\": [{\"type\": \"warning|trend|alert\", \"title\": \"short title\", "
             "\"body\": \"1-2 sentence insight with actual numbers\", \"action\": \"specific action text\"}]}"
         ),
-        user=f"Current data summary:\n{summary}",
+        user=f"Current Lasso snapshot summary:\n{summary}",
         cache_key=f"insights_{cache_key}",
         max_tokens=250,
         temperature=0.2,
@@ -181,17 +156,15 @@ async def get_insights(current_user: AdminUser = Depends(get_current_user)):
         aging_count=aging_count,
         oldest_unassigned_days=oldest_unassigned_days,
         active_count=active_count,
-        follow_up_count=follow_up_count,
         stale_assigned_count=stale_assigned_count,
-        province_stats=province_stats or [],
+        province_stats=province_stats,
     )
 
-    if result and result.get('insights'):
-        ai_insights = result['insights'][:4]
+    if result and result.get("insights"):
+        ai_insights = result["insights"][:4]
         if len(ai_insights) >= 3:
             return {"insights": ai_insights}
-        combined = ai_insights + fallback
-        return {"insights": combined[:4]}
+        return {"insights": (ai_insights + fallback)[:4]}
 
     if ai_client.last_error_meta.get("type") == "agent_paused":
         return {
@@ -219,47 +192,62 @@ async def get_insights(current_user: AdminUser = Depends(get_current_user)):
             ][:4]
         }
 
-    return {"insights": fallback or [{"type": "trend", "title": "Pipeline looks healthy", "body": "No urgent issues were detected in the current dashboard snapshot.", "action": "Review dashboard"}]}
+    return {
+        "insights": fallback or [{
+            "type": "trend",
+            "title": "Pipeline looks healthy",
+            "body": "No urgent issues detected in the current Lasso snapshot.",
+            "action": "Review dashboard for details.",
+        }]
+    }
 
 
 @router.get("/churn-risks")
 async def get_churn_risks(current_user: AdminUser = Depends(get_current_user)):
-    """Identify leads at risk of churning based on inactivity."""
-    at_risk = execute_query("""
-        SELECT l.id as lead_id, l.name, l.city, l.province, l.status,
-            l.assigned_dealer_id, d.name as dealer_name,
-            EXTRACT(DAY FROM CURRENT_TIMESTAMP - COALESCE(
-                (SELECT MAX(created_at) FROM lead_logs WHERE lead_id = l.id),
-                l.created_at
-            )) as days_inactive
-        FROM leads l
-        LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
-        WHERE l.status IN ('active', 'follow_up')
-        AND COALESCE(
-            (SELECT MAX(created_at) FROM lead_logs WHERE lead_id = l.id),
-            l.created_at
-        ) < CURRENT_TIMESTAMP - INTERVAL '7 days'
+    """Identify active Lasso leads at risk based on inactivity."""
+    at_risk = execute_query(
+        """
+        SELECT
+            lasso_lead_id AS lead_id,
+            name,
+            city,
+            province,
+            current_status AS status,
+            dealer_id AS assigned_dealer_id,
+            dealer_name,
+            ROUND(
+                EXTRACT(EPOCH FROM (NOW() - COALESCE(last_interaction, date_assigned, synced_at)))
+                / 86400.0
+            )::int AS days_inactive
+        FROM dashboard_active_leads
+        WHERE last_interaction IS NULL
+           OR last_interaction < NOW() - INTERVAL '7 days'
         ORDER BY days_inactive DESC
         LIMIT 20
-    """)
+        """
+    ) or []
 
     results = []
-    for lead in (at_risk or []):
-        days = int(lead.get('days_inactive', 0))
-        risk_level = 'high' if days > 14 else 'medium' if days > 7 else 'low'
-        reason = f"No interaction in {days} days."
-        if not lead.get('assigned_dealer_id'):
+    for lead in at_risk:
+        days = lead.get("days_inactive") or 0
+        risk_level = "high" if days > 14 else "medium" if days > 7 else "low"
+        reason = f"No Lasso interaction in {days} days."
+        if not lead.get("assigned_dealer_id"):
             reason += " Lead is unassigned."
-            risk_level = 'high'
-        action = "Reassign to more responsive dealer" if risk_level == 'high' else "Follow up with assigned dealer"
+            risk_level = "high"
+        action = (
+            "Reassign to a more responsive dealer"
+            if risk_level == "high"
+            else "Follow up with assigned dealer"
+        )
         results.append({
-            "lead_id": lead['lead_id'],
-            "name": lead.get('name', ''),
+            "lead_id": lead["lead_id"],
+            "name": lead.get("name", ""),
             "risk_level": risk_level,
             "days_inactive": days,
             "reason": reason,
             "recommended_action": action,
-            "dealer_name": lead.get('dealer_name')
+            "dealer_name": lead.get("dealer_name"),
         })
 
     return {"at_risk_leads": results}

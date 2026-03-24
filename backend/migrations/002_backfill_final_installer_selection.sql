@@ -25,8 +25,20 @@ BEGIN
   END IF;
 END $$;
 
-UPDATE historical_data
-SET final_dealer_selection = dealer_name
-WHERE (final_dealer_selection IS NULL OR trim(final_dealer_selection) = '')
-  AND dealer_name IS NOT NULL
-  AND trim(dealer_name) <> '';
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_name = 'historical_data'
+  ) THEN
+    EXECUTE $sql$
+      UPDATE historical_data
+      SET final_dealer_selection = dealer_name
+      WHERE (final_dealer_selection IS NULL OR trim(final_dealer_selection) = '')
+        AND dealer_name IS NOT NULL
+        AND trim(dealer_name) <> ''
+    $sql$;
+  END IF;
+END $$;

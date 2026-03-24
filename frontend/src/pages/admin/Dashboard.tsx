@@ -1,13 +1,38 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import { useSearchParams } from 'react-router-dom';
 import AIInsightsPanel from '../../components/admin/AIInsightsPanel';
 import AISpendWidget from '../../components/admin/AISpendWidget';
-import InsertLeadForm from '../../components/admin/InsertLeadForm';
-import UnassignedLeadsList from '../../components/admin/UnassignedLeadsList';
-import ActiveLeadsList from '../../components/admin/ActiveLeadsList';
-import LeadDetailModal from '../../components/admin/LeadDetailModal';
-import { getLeadDetail } from '../../services/api';
-import type { ExtendedLead } from '../../types';
+import LassoSyncStatusCard from '../../components/admin/LassoSyncStatusCard';
+import LassoUnassignedLeadsTable from '../../components/admin/LassoUnassignedLeadsTable';
+import LassoActiveLeadsTable from '../../components/admin/LassoActiveLeadsTable';
+import { getDashboardSnapshot } from '../../services/api';
+import type { LassoDashboardStatus, DashboardUnassignedLead, DashboardActiveLead } from '../../types/types';
+
+const SNAPSHOT_CACHE_KEY = 'dashboard_snapshot_v1';
+
+interface SnapshotCache {
+  sync_status: LassoDashboardStatus;
+  unassigned: DashboardUnassignedLead[];
+  active: DashboardActiveLead[];
+  cached_at: number;
+}
+
+function readCache(): SnapshotCache | null {
+  try {
+    const raw = sessionStorage.getItem(SNAPSHOT_CACHE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as SnapshotCache;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(snap: SnapshotCache): void {
+  try {
+    sessionStorage.setItem(SNAPSHOT_CACHE_KEY, JSON.stringify(snap));
+  } catch {
+    // Storage quota exceeded — not critical
+  }
+}
 
 const bannerStyle: React.CSSProperties = {
   background: '#c91414',
@@ -32,63 +57,37 @@ const sectionStyle: React.CSSProperties = {
 };
 
 const Dashboard: React.FC = () => {
-  const [searchParams, setSearchParams] = useSearchParams();
-  const [insertOpen, setInsertOpen] = useState(true);
   const [unassignedOpen, setUnassignedOpen] = useState(true);
   const [activeOpen, setActiveOpen] = useState(true);
-  const [linkedLead, setLinkedLead] = useState<ExtendedLead | null>(null);
+  const [lassoRefreshKey, setLassoRefreshKey] = useState(0);
 
-  // Keys to force remount / refresh child components
-  const [unassignedKey, setUnassignedKey] = useState(0);
-  const [activeKey, setActiveKey] = useState(0);
-
-  const refreshUnassigned = useCallback(() => {
-    setUnassignedKey((k) => k + 1);
-  }, []);
-
-  const refreshActive = useCallback(() => {
-    setActiveKey((k) => k + 1);
-  }, []);
-
-  const refreshAll = useCallback(() => {
-    refreshUnassigned();
-    refreshActive();
-  }, [refreshUnassigned, refreshActive]);
+  // Seed from cache immediately (zero wait), then replace with fresh data
+  const cached = readCache();
+  const [snapshotStatus, setSnapshotStatus] = useState<LassoDashboardStatus | undefined>(cached?.sync_status);
+  const [snapshotUnassigned, setSnapshotUnassigned] = useState<DashboardUnassignedLead[] | undefined>(cached?.unassigned);
+  const [snapshotActive, setSnapshotActive] = useState<DashboardActiveLead[] | undefined>(cached?.active);
 
   useEffect(() => {
-    const leadId = Number(searchParams.get('lead'));
-    if (!leadId) {
-      setLinkedLead(null);
-      return;
-    }
+    getDashboardSnapshot()
+      .then((snap) => {
+        setSnapshotStatus(snap.sync_status);
+        setSnapshotUnassigned(snap.unassigned.leads);
+        setSnapshotActive(snap.active.leads);
+        writeCache({
+          sync_status: snap.sync_status,
+          unassigned: snap.unassigned.leads,
+          active: snap.active.leads,
+          cached_at: Date.now(),
+        });
+      })
+      .catch(() => {
+        // On failure, keep whatever is already shown (cache or undefined)
+      });
+  }, []);
 
-    let cancelled = false;
-    const loadLead = async () => {
-      try {
-        const lead = await getLeadDetail(leadId);
-        if (!cancelled) {
-          setLinkedLead(lead as ExtendedLead);
-        }
-      } catch {
-        if (!cancelled) {
-          setLinkedLead(null);
-        }
-      }
-    };
-
-    loadLead();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [searchParams]);
-
-  const closeLinkedLead = useCallback(() => {
-    const nextParams = new URLSearchParams(searchParams);
-    nextParams.delete('lead');
-    setSearchParams(nextParams, { replace: true });
-    setLinkedLead(null);
-  }, [searchParams, setSearchParams]);
+  const refreshSnapshotSections = useCallback(() => {
+    setLassoRefreshKey((value) => value + 1);
+  }, []);
 
   return (
     <div style={{ maxWidth: 1200, margin: '0 auto', padding: '40px 20px' }}>
@@ -98,24 +97,13 @@ const Dashboard: React.FC = () => {
 
       <AISpendWidget />
 
+      <LassoSyncStatusCard
+        onSnapshotUpdated={refreshSnapshotSections}
+        initialStatus={snapshotStatus}
+      />
+
       {/* AI Insights Panel */}
       <AIInsightsPanel />
-
-      {/* Section 1: Insert New Lead */}
-      <div style={sectionStyle}>
-        <div
-          style={bannerStyle}
-          onClick={() => setInsertOpen((o) => !o)}
-        >
-          <span>Insert New Lead</span>
-          <span style={{ fontSize: 14 }}>{insertOpen ? '-' : '+'}</span>
-        </div>
-        {insertOpen && (
-          <div style={{ padding: 20 }}>
-            <InsertLeadForm onLeadCreated={refreshAll} />
-          </div>
-        )}
-      </div>
 
       {/* Section 2: Unassigned Leads */}
       <div style={sectionStyle}>
@@ -127,9 +115,10 @@ const Dashboard: React.FC = () => {
           <span style={{ fontSize: 14 }}>{unassignedOpen ? '-' : '+'}</span>
         </div>
         {unassignedOpen && (
-          <UnassignedLeadsList
-            key={unassignedKey}
-            onLeadAssigned={refreshActive}
+          <LassoUnassignedLeadsTable
+            refreshToken={lassoRefreshKey}
+            onLeadAssigned={refreshSnapshotSections}
+            initialLeads={snapshotUnassigned}
           />
         )}
       </div>
@@ -144,18 +133,13 @@ const Dashboard: React.FC = () => {
           <span style={{ fontSize: 14 }}>{activeOpen ? '-' : '+'}</span>
         </div>
         {activeOpen && (
-          <ActiveLeadsList
-            key={activeKey}
-            onRefresh={refreshUnassigned}
+          <LassoActiveLeadsTable
+            refreshToken={lassoRefreshKey}
+            onRefresh={refreshSnapshotSections}
+            initialLeads={snapshotActive}
           />
         )}
       </div>
-
-      <LeadDetailModal
-        lead={linkedLead}
-        isOpen={linkedLead !== null}
-        onClose={closeLinkedLead}
-      />
     </div>
   );
 };

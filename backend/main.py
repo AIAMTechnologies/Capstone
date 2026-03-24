@@ -99,6 +99,7 @@ from routes.admin_logs import router as admin_logs_router
 from routes.admin_audit_log import router as admin_audit_log_router
 from routes.admin_cost_tracking import router as admin_cost_tracking_router
 from routes.admin_ai_controls import router as admin_ai_controls_router
+from routes.admin_lasso_dashboard import router as admin_lasso_dashboard_router
 from routes.admin_reports import router as admin_reports_router
 from routes.admin_resources import router as admin_resources_router
 from routes.admin_tools import router as admin_tools_router
@@ -114,6 +115,7 @@ app.include_router(admin_logs_router)
 app.include_router(admin_audit_log_router)
 app.include_router(admin_cost_tracking_router)
 app.include_router(admin_ai_controls_router)
+app.include_router(admin_lasso_dashboard_router)
 app.include_router(admin_reports_router)
 app.include_router(admin_resources_router)
 app.include_router(admin_tools_router)
@@ -174,96 +176,8 @@ def resolve_final_dealer_selection(record: Dict[str, Any]) -> Optional[str]:
 
 
 def sync_lead_to_historical(lead_id: int, executor=None) -> None:
-    """Upsert the historical_data row for a lead.
-
-    Root cause addressed: the previous implementation only wrote history when a
-    lead left the active pipeline for the first time. Once a historical row
-    existed, later status changes (e.g., converted → dead lead) never updated
-    historical_data, so downstream reporting missed the final outcome. This
-    function always updates existing rows and inserts on first conversion.
-    """
-
-    executor = executor or execute_query
-
-    lead_rows = executor(
-        """
-        SELECT l.*, d.name AS dealer_name_assigned
-        FROM leads l
-        LEFT JOIN dealers d ON l.assigned_dealer_id = d.id
-        WHERE l.id = %s
-        """,
-        (lead_id,),
-    )
-
-    if not lead_rows:
-        raise HTTPException(status_code=404, detail="Lead not found")
-
-    lead = dict(lead_rows[0])
-    normalized_status = (lead.get("status") or "").strip().lower()
-
-    final_dealer = resolve_final_dealer_selection(lead)
-    dealer_name = lead.get("dealer_name") or lead.get("dealer_name_assigned") or final_dealer
-
-    # Persist the resolved final dealer on the operational lead so dashboard
-    # queries don't recompute it.
-    if final_dealer and final_dealer != (lead.get("final_dealer_selection") or "").strip():
-        executor(
-            "UPDATE leads SET final_dealer_selection = %s WHERE id = %s",
-            (final_dealer, lead_id),
-            fetch=False,
-        )
-
-    existing = executor("SELECT 1 FROM historical_data WHERE id = %s", (lead_id,))
-    has_history = bool(existing)
-
-    # Only insert the first time a lead is converted; afterwards always update.
-    is_converted = normalized_status.startswith("converted")
-    if not has_history and not is_converted:
-        return
-
-    query = """
-        INSERT INTO historical_data (
-            id,
-            submit_date,
-            first_name,
-            address1,
-            city,
-            province,
-            postal,
-            dealer_name,
-            project_type,
-            current_status,
-            final_dealer_selection,
-            created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-        ON CONFLICT (id) DO UPDATE
-        SET submit_date = EXCLUDED.submit_date,
-            first_name = EXCLUDED.first_name,
-            address1 = EXCLUDED.address1,
-            city = EXCLUDED.city,
-            province = EXCLUDED.province,
-            postal = EXCLUDED.postal,
-            dealer_name = EXCLUDED.dealer_name,
-            project_type = EXCLUDED.project_type,
-            current_status = EXCLUDED.current_status,
-            final_dealer_selection = EXCLUDED.final_dealer_selection
-    """
-
-    params = (
-        lead.get("id"),
-        lead.get("created_at"),
-        lead.get("name"),
-        lead.get("address"),
-        lead.get("city"),
-        lead.get("province"),
-        lead.get("postal_code"),
-        dealer_name,
-        lead.get("job_type"),
-        lead.get("status"),
-        final_dealer,
-    )
-
-    executor(query, params, fetch=False)
+    """Historical persistence is retired in Lasso-only mode."""
+    return None
 
 
 # Initialize the ML allocator once so it can be reused across requests
@@ -1112,34 +1026,46 @@ async def get_historical_data(
     status: Optional[str] = None,
     current_user: AdminUser = Depends(get_current_user)
 ):
-    """Get historical data records"""
+    """Get Lasso-backed historical data records."""
 
+    conditions = ["1=1"]
+    params: list[Any] = []
     if status and status != 'all':
-        query = """
-            SELECT * FROM historical_data
-            WHERE current_status = %s
-            ORDER BY created_at DESC
+        conditions.append("status_bucket = %s")
+        params.append(status)
+
+    where_clause = " AND ".join(conditions)
+    data = execute_query(
+        f"""
+            SELECT
+                lasso_lead_id AS id,
+                COALESCE(submit_date, created_date, form_submit_date) AS submit_date,
+                first_name,
+                last_name,
+                company_name,
+                address AS address1,
+                city,
+                province,
+                postal_code AS postal,
+                dealer_name,
+                project_type,
+                product_type,
+                square_footage_value AS square_footage,
+                current_status,
+                value_of_order,
+                synced_at AS created_at
+            FROM dashboard_history_leads
+            WHERE {where_clause}
+            ORDER BY last_interaction DESC NULLS LAST, created_date DESC NULLS LAST
             LIMIT %s OFFSET %s
-        """
-        params = (status, limit, offset)
-    else:
-        query = """
-            SELECT * FROM historical_data
-            ORDER BY created_at DESC
-            LIMIT %s OFFSET %s
-        """
-        params = (limit, offset)
+        """,
+        tuple([*params, limit, offset]),
+    )
 
-    data = execute_query(query, params)
-
-    # Get total count
-    count_query = "SELECT COUNT(*) as total FROM historical_data"
-    if status and status != 'all':
-        count_query += " WHERE current_status = %s"
-        total_count = execute_query(count_query, (status,))[0]['total']
-    else:
-        total_count = execute_query(count_query)[0]['total']
-
+    total_count = execute_query(
+        f"SELECT COUNT(*) as total FROM dashboard_history_leads WHERE {where_clause}",
+        tuple(params) if params else None,
+    )[0]['total']
     return {"data": data, "count": len(data), "total": total_count}
 
 
@@ -1239,21 +1165,96 @@ async def run_migrations():
     if not migrations_dir.exists():
         return
     migration_files = sorted(glob.glob(str(migrations_dir / "*.sql")))
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            for mf in migration_files:
+    for mf in migration_files:
+        conn = None
+        try:
+            with open(mf, 'r') as f:
+                sql = f.read()
+            conn = get_db_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(sql)
+            conn.commit()
+            logger.info(f"Migration applied: {Path(mf).name}")
+        except Exception as e:
+            if conn is not None and getattr(conn, "closed", 1) == 0:
                 try:
-                    with open(mf, 'r') as f:
-                        sql = f.read()
-                    cursor.execute(sql)
-                    conn.commit()
-                    logger.info(f"Migration applied: {Path(mf).name}")
-                except Exception as e:
                     conn.rollback()
-                    logger.warning(f"Migration {Path(mf).name} skipped or failed: {e}")
-    finally:
-        conn.close()
+                except Exception:
+                    pass
+            logger.warning(f"Migration {Path(mf).name} skipped or failed: {e}")
+        finally:
+            if conn is not None and getattr(conn, "closed", 1) == 0:
+                conn.close()
+
+# ============================================
+# BACKGROUND SYNC SCHEDULER
+# ============================================
+
+import threading as _threading
+
+def _lasso_scheduler_loop() -> None:
+    """
+    Background thread that drives Lasso syncs on a schedule.
+    Fast sync every lasso_fast_sync_interval_minutes (default 5 min).
+    Full sync every lasso_full_sync_interval_minutes (default 15 min).
+    Pages never trigger syncs themselves — all syncs originate here or
+    from an explicit admin action (Tools button / POST /sync).
+    """
+    import time as _time
+    from services.lasso_dashboard_sync import (
+        start_lasso_dashboard_sync,
+        _last_successful_sync,
+        _current_running_sync,
+        SYNC_STATUS,
+    )
+    from settings_store import get_setting_float
+    from datetime import datetime, timedelta
+
+    _time.sleep(10)  # let the app finish starting up before first check
+
+    while True:
+        try:
+            if not SYNC_STATUS["in_progress"] and not _current_running_sync():
+                fast_interval = int(round(get_setting_float("lasso_fast_sync_interval_minutes", 5.0)))
+                full_interval = int(round(get_setting_float("lasso_full_sync_interval_minutes", 15.0)))
+                last = _last_successful_sync()
+                now = datetime.utcnow()
+
+                if last is None:
+                    start_lasso_dashboard_sync(sync_type="full", actor="scheduler")
+                elif last.get("completed_at"):
+                    age_minutes = (now - last["completed_at"]).total_seconds() / 60
+                    # Check if a full sync is due first
+                    last_full_rows = None
+                    try:
+                        from db import execute_query as _eq
+                        rows = _eq(
+                            "SELECT completed_at FROM lasso_sync_runs "
+                            "WHERE status='completed' AND sync_type='full' "
+                            "ORDER BY completed_at DESC NULLS LAST LIMIT 1"
+                        )
+                        last_full_rows = rows[0] if rows else None
+                    except Exception:
+                        pass
+                    full_age = None
+                    if last_full_rows and last_full_rows.get("completed_at"):
+                        full_age = (now - last_full_rows["completed_at"]).total_seconds() / 60
+                    if full_age is None or full_age >= full_interval:
+                        start_lasso_dashboard_sync(sync_type="full", actor="scheduler")
+                    elif age_minutes >= fast_interval:
+                        start_lasso_dashboard_sync(sync_type="fast", actor="scheduler")
+        except Exception as exc:
+            logger.warning(f"Lasso scheduler error: {exc}")
+
+        _time.sleep(60)  # check every 60 s; the interval logic above decides whether to act
+
+
+@app.on_event("startup")
+async def start_lasso_scheduler():
+    t = _threading.Thread(target=_lasso_scheduler_loop, name="lasso-scheduler", daemon=True)
+    t.start()
+    logger.info("Lasso background sync scheduler started")
+
 
 # ============================================
 # RUN SERVER

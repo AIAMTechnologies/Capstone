@@ -21,6 +21,7 @@ import {
   createLeadFromEmailCandidate,
   approveClosureReview,
   dismissClosureReview,
+  flagLeadForClosure,
   getLeadEmails,
 } from '../../services/api';
 import { getApiErrorMessage } from '../../utils/apiErrors';
@@ -92,6 +93,38 @@ const renderPriorityBadge = (priority: ActiveMatchReviewItem['review_priority'])
   );
 };
 
+// ===================== Collapsible Section Wrapper =====================
+const CollapsibleSection: React.FC<{
+  title: string;
+  defaultOpen: boolean;
+  badge: React.ReactNode;
+  children: React.ReactNode;
+}> = ({ title, defaultOpen, badge, children }) => {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div style={{ ...cardStyle, padding: 0 }}>
+      <div
+        onClick={() => setOpen(!open)}
+        style={{
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          padding: '14px 20px', cursor: 'pointer', userSelect: 'none',
+          borderBottom: open ? '1px solid #e5e7eb' : 'none',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 14, color: '#9ca3af', fontWeight: 600, transition: 'transform 0.2s', transform: open ? 'rotate(90deg)' : 'rotate(0deg)' }}>
+            ▶
+          </span>
+          <span style={{ fontSize: 16, fontWeight: 700, color: '#1a1a2e' }}>{title}</span>
+          {badge}
+        </div>
+        <span style={{ fontSize: 12, color: '#9ca3af' }}>{open ? 'Click to collapse' : 'Click to expand'}</span>
+      </div>
+      {open && <div style={{ padding: 0 }}>{children}</div>}
+    </div>
+  );
+};
+
 const EmailIntel: React.FC = () => {
   const [oauthMsg, setOauthMsg] = useState('');
   const [queueRefreshToken, setQueueRefreshToken] = useState(0);
@@ -124,16 +157,24 @@ const EmailIntel: React.FC = () => {
         </div>
       )}
       <SyncConfigSection />
-      <ActiveMatchReviewSection
-        refreshToken={queueRefreshToken}
-        onQueueChanged={() => setQueueRefreshToken((prev) => prev + 1)}
-      />
-      <NewLeadCandidatesSection
-        refreshToken={queueRefreshToken}
-        onQueueChanged={() => setQueueRefreshToken((prev) => prev + 1)}
-      />
-      <ReviewQueueSection />
-      <RecentEmailsSection />
+      <CollapsibleSection title="Active Match Cleanup" defaultOpen={true} badge={null}>
+        <ActiveMatchReviewSection
+          refreshToken={queueRefreshToken}
+          onQueueChanged={() => setQueueRefreshToken((prev) => prev + 1)}
+        />
+      </CollapsibleSection>
+      <CollapsibleSection title="New Lead Candidates" defaultOpen={false} badge={null}>
+        <NewLeadCandidatesSection
+          refreshToken={queueRefreshToken}
+          onQueueChanged={() => setQueueRefreshToken((prev) => prev + 1)}
+        />
+      </CollapsibleSection>
+      <CollapsibleSection title="Closure Review Queue" defaultOpen={false} badge={null}>
+        <ReviewQueueSection />
+      </CollapsibleSection>
+      <CollapsibleSection title="Recent Email Activity" defaultOpen={false} badge={null}>
+        <RecentEmailsSection />
+      </CollapsibleSection>
     </div>
   );
 };
@@ -469,6 +510,21 @@ const ActiveMatchReviewSection: React.FC<{
   const [error, setError] = useState('');
   const [assignLead, setAssignLead] = useState<ActiveMatchReviewItem | null>(null);
   const [drawerLead, setDrawerLead] = useState<{ leadId: number; leadName: string } | null>(null);
+  const [flaggingId, setFlaggingId] = useState<number | null>(null);
+
+  const handleFlagClosure = async (item: ActiveMatchReviewItem) => {
+    setFlaggingId(item.lead_id);
+    setError('');
+    try {
+      await flagLeadForClosure(item.lead_id, `Manually flagged from Active Match Cleanup — ${item.review_reason}`);
+      await load();
+      onQueueChanged();
+    } catch (err: any) {
+      setError(getApiErrorMessage(err, 'Failed to flag for closure'));
+    } finally {
+      setFlaggingId(null);
+    }
+  };
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -492,12 +548,11 @@ const ActiveMatchReviewSection: React.FC<{
   const reviewCount = items.filter((item) => item.needs_match_review).length;
 
   return (
-    <div style={cardStyle}>
+    <div style={{ padding: 20 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap' }}>
         <div>
-          <h2 style={{ fontSize: 18, fontWeight: 700, color: '#1a1a2e', margin: 0 }}>Active Match Cleanup</h2>
-          <p style={{ margin: '6px 0 0 0', fontSize: 13, color: '#6b7280', lineHeight: 1.5 }}>
-            Review the active leads where matched email activity can reduce manual assignment or cleanup work.
+          <p style={{ margin: 0, fontSize: 13, color: '#6b7280', lineHeight: 1.5 }}>
+            Active leads with matched email activity that may need dealer assignment or match review.
           </p>
         </div>
         <button onClick={load} disabled={loading} style={{ ...btnSecondary, opacity: loading ? 0.6 : 1 }}>
@@ -615,6 +670,13 @@ const ActiveMatchReviewSection: React.FC<{
                     >
                       Review Emails
                     </button>
+                    <button
+                      onClick={() => handleFlagClosure(item)}
+                      disabled={flaggingId === item.lead_id}
+                      style={{ ...btnGray, width: '100%', fontSize: 12, padding: '6px 12px', background: '#92400e', opacity: flaggingId === item.lead_id ? 0.6 : 1 }}
+                    >
+                      {flaggingId === item.lead_id ? 'Flagging...' : 'Flag for Closure'}
+                    </button>
                     {item.missing_dealer && (
                       <button
                         onClick={() => setAssignLead(item)}
@@ -673,6 +735,7 @@ const NewLeadCandidatesSection: React.FC<{
   const [error, setError] = useState('');
   const [actionMessage, setActionMessage] = useState('');
   const [creatingId, setCreatingId] = useState<number | null>(null);
+  const [expandedId, setExpandedId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -713,12 +776,12 @@ const NewLeadCandidatesSection: React.FC<{
   const overlapCount = items.filter((item) => item.existing_sender_lead_count > 0).length;
 
   return (
-    <div style={cardStyle}>
+    <div style={{ padding: 20 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap' }}>
         <div>
-          <h2 style={{ fontSize: 18, fontWeight: 700, color: '#1a1a2e', margin: 0 }}>New Lead Candidates</h2>
-          <p style={{ margin: '6px 0 0 0', fontSize: 13, color: '#6b7280', lineHeight: 1.5 }}>
-            Unmatched inbound emails that look like real lead inquiries. This stays read-only until the create-from-email flow is ready.
+          <p style={{ margin: 0, fontSize: 13, color: '#6b7280', lineHeight: 1.5 }}>
+            Inbound emails that don't match any existing lead in Lasso or the WFC dashboard.
+            These are potential new customer inquiries — review and create a lead if they look legitimate.
           </p>
         </div>
         <button onClick={load} disabled={loading} style={{ ...btnSecondary, opacity: loading ? 0.6 : 1 }}>
@@ -759,48 +822,111 @@ const NewLeadCandidatesSection: React.FC<{
             </tr>
           </thead>
           <tbody>
-            {items.map((item) => (
-              <tr key={item.id}>
-                <td style={{ ...tdStyle, minWidth: 220 }}>
-                  <div style={{ fontWeight: 700, color: '#1f2937', marginBottom: 4 }}>{item.sender_name || item.sender_email}</div>
-                  <div style={{ fontSize: 12, color: '#6b7280' }}>{item.sender_email}</div>
-                </td>
-                <td style={{ ...tdStyle, minWidth: 280 }}>
-                  <div style={{ fontWeight: 600, color: '#1f2937', marginBottom: 4 }}>{truncateText(item.subject, 75)}</div>
-                  <div style={{ fontSize: 12, color: '#6b7280', lineHeight: 1.5 }}>{truncateText(item.body_preview, 120)}</div>
-                </td>
-                <td style={{ ...tdStyle, minWidth: 160, color: '#374151' }}>{item.candidate_reason}</td>
-                <td style={tdStyle}>
-                  <span
-                    style={{
-                      padding: '2px 8px',
-                      borderRadius: 10,
-                      fontSize: 11,
-                      fontWeight: 700,
-                      background: item.candidate_score >= 6 ? '#dcfce7' : '#fef3c7',
-                      color: item.candidate_score >= 6 ? '#166534' : '#92400e',
-                    }}
-                  >
-                    {item.candidate_score}
-                  </span>
-                </td>
-                <td style={tdStyle}>
-                  <span style={{ color: item.existing_sender_lead_count > 0 ? '#92400e' : '#6b7280', fontWeight: item.existing_sender_lead_count > 0 ? 600 : 500 }}>
-                    {item.existing_sender_lead_count > 0 ? `${item.existing_sender_lead_count} lead(s)` : 'None'}
-                  </span>
-                </td>
-                <td style={tdStyle}>{fmtDate(item.received_at)}</td>
-                <td style={{ ...tdStyle, minWidth: 160 }}>
-                  <button
-                    onClick={() => handleCreateLead(item.id)}
-                    disabled={creatingId === item.id}
-                    style={{ ...btnPrimary, width: '100%', fontSize: 12, padding: '6px 12px', opacity: creatingId === item.id ? 0.6 : 1 }}
-                  >
-                    {creatingId === item.id ? 'Working...' : item.existing_sender_lead_count > 0 ? 'Create / Match' : 'Create Lead'}
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {items.map((item) => {
+              const isExpanded = expandedId === item.id;
+              return (
+                <React.Fragment key={item.id}>
+                  <tr>
+                    <td style={{ ...tdStyle, minWidth: 220 }}>
+                      <div style={{ fontWeight: 700, color: '#1f2937', marginBottom: 4 }}>{item.sender_name || item.sender_email}</div>
+                      <div style={{ fontSize: 12, color: '#6b7280' }}>{item.sender_email}</div>
+                    </td>
+                    <td style={{ ...tdStyle, minWidth: 280 }}>
+                      <div style={{ fontWeight: 600, color: '#1f2937', marginBottom: 4 }}>{truncateText(item.subject, 75)}</div>
+                      <div style={{ fontSize: 12, color: '#6b7280', lineHeight: 1.5 }}>{truncateText(item.body_preview, 120)}</div>
+                    </td>
+                    <td style={{ ...tdStyle, minWidth: 160, color: '#374151' }}>{item.candidate_reason}</td>
+                    <td style={tdStyle}>
+                      <span
+                        style={{
+                          padding: '2px 8px',
+                          borderRadius: 10,
+                          fontSize: 11,
+                          fontWeight: 700,
+                          background: item.candidate_score >= 6 ? '#dcfce7' : '#fef3c7',
+                          color: item.candidate_score >= 6 ? '#166534' : '#92400e',
+                        }}
+                      >
+                        {item.candidate_score}
+                      </span>
+                    </td>
+                    <td style={tdStyle}>
+                      <span style={{ color: item.existing_sender_lead_count > 0 ? '#92400e' : '#6b7280', fontWeight: item.existing_sender_lead_count > 0 ? 600 : 500 }}>
+                        {item.existing_sender_lead_count > 0 ? `${item.existing_sender_lead_count} lead(s)` : 'None'}
+                      </span>
+                    </td>
+                    <td style={tdStyle}>{fmtDate(item.received_at)}</td>
+                    <td style={{ ...tdStyle, minWidth: 160 }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        <button
+                          onClick={() => setExpandedId(isExpanded ? null : item.id)}
+                          style={{ ...btnSecondary, width: '100%', fontSize: 12, padding: '6px 12px' }}
+                        >
+                          {isExpanded ? 'Hide Preview' : 'Preview Email'}
+                        </button>
+                        <button
+                          onClick={() => handleCreateLead(item.id)}
+                          disabled={creatingId === item.id}
+                          style={{ ...btnPrimary, width: '100%', fontSize: 12, padding: '6px 12px', opacity: creatingId === item.id ? 0.6 : 1 }}
+                        >
+                          {creatingId === item.id ? 'Working...' : item.existing_sender_lead_count > 0 ? 'Create / Match' : 'Create Lead'}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                  {isExpanded && (
+                    <tr>
+                      <td colSpan={7} style={{ padding: '0 12px 12px 12px', background: '#f8fafc', borderBottom: '1px solid #e5e7eb' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, padding: '12px 0' }}>
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>
+                              Email Content
+                            </div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: '#111827', marginBottom: 4 }}>{item.subject}</div>
+                            <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 8 }}>
+                              From: {item.sender_name} &lt;{item.sender_email}&gt; · {fmtDate(item.received_at)}
+                            </div>
+                            <div style={{
+                              padding: '10px 12px', background: '#fff', borderRadius: 6,
+                              border: '1px solid #e5e7eb', fontSize: 13, color: '#374151',
+                              lineHeight: 1.6, whiteSpace: 'pre-wrap', maxHeight: 240, overflowY: 'auto',
+                            }}>
+                              {item.body_preview || 'No preview available.'}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>
+                              Lead Preview (if created)
+                            </div>
+                            <div style={{ padding: '10px 12px', background: '#fff', borderRadius: 6, border: '1px solid #e5e7eb', fontSize: 13 }}>
+                              <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 12px' }}>
+                                <span style={{ color: '#6b7280', fontWeight: 600 }}>Name:</span>
+                                <span style={{ color: '#111827' }}>{item.sender_name || '-'}</span>
+                                <span style={{ color: '#6b7280', fontWeight: 600 }}>Email:</span>
+                                <span style={{ color: '#111827' }}>{item.sender_email || '-'}</span>
+                                <span style={{ color: '#6b7280', fontWeight: 600 }}>Source:</span>
+                                <span style={{ color: '#111827' }}>{item.candidate_reason}</span>
+                                <span style={{ color: '#6b7280', fontWeight: 600 }}>Score:</span>
+                                <span style={{ color: '#111827' }}>{item.candidate_score}/10</span>
+                                <span style={{ color: '#6b7280', fontWeight: 600 }}>Overlap:</span>
+                                <span style={{ color: item.existing_sender_lead_count > 0 ? '#92400e' : '#111827', fontWeight: item.existing_sender_lead_count > 0 ? 600 : 400 }}>
+                                  {item.existing_sender_lead_count > 0 ? `${item.existing_sender_lead_count} existing lead(s) with this email` : 'No existing leads'}
+                                </span>
+                              </div>
+                            </div>
+                            {item.existing_sender_lead_count > 0 && (
+                              <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 6, background: '#fef3c7', border: '1px solid #fde68a', fontSize: 12, color: '#92400e' }}>
+                                This sender already has leads in the system. Clicking "Create / Match" will attempt to match to an existing lead first.
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
             {items.length === 0 && !loading && (
               <tr>
                 <td colSpan={7} style={{ ...tdStyle, textAlign: 'center', color: '#999' }}>
@@ -863,8 +989,8 @@ const ReviewQueueSection: React.FC = () => {
   };
 
   return (
-    <div style={cardStyle}>
-      <h2 style={{ fontSize: 18, fontWeight: 700, color: '#1a1a2e', marginBottom: 16 }}>Review Queue</h2>
+    <div style={{ padding: 20 }}>
+      <p style={{ margin: '0 0 12px 0', fontSize: 13, color: '#6b7280' }}>Leads flagged by AI as potentially ready to close. Approve to mark as converted or dismiss to keep active.</p>
 
       {error && <div style={{ color: '#c91414', marginBottom: 12, fontSize: 13 }}>{error}</div>}
       {loading && <p style={{ color: '#999', fontSize: 13 }}>Loading...</p>}
@@ -949,8 +1075,8 @@ const RecentEmailsSection: React.FC = () => {
   useEffect(() => { load(); }, [load]);
 
   return (
-    <div style={cardStyle}>
-      <h2 style={{ fontSize: 18, fontWeight: 700, color: '#1a1a2e', marginBottom: 16 }}>Recent Matched Email Activity</h2>
+    <div style={{ padding: 20 }}>
+      <p style={{ margin: '0 0 12px 0', fontSize: 13, color: '#6b7280' }}>Latest emails matched to existing leads across all dealers.</p>
 
       {error && <div style={{ color: '#c91414', marginBottom: 12, fontSize: 13 }}>{error}</div>}
       {loading && <p style={{ color: '#999', fontSize: 13 }}>Loading...</p>}

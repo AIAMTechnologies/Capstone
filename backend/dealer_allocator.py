@@ -68,8 +68,8 @@ def fetch_dealer_historical_feature_stats(
 
     rows = query_executor(
         """
-        SELECT dealer_name, project_type, product_type, square_footage, current_status
-        FROM historical_data
+        SELECT dealer_name, project_type, product_type, square_footage_value AS square_footage, current_status
+        FROM dashboard_history_leads
         WHERE dealer_name IS NOT NULL
         """,
         None,

@@ -4,6 +4,9 @@ import type {
   LeadFormData,
   LoginResponse,
   DashboardStats,
+  LassoDashboardStatus,
+  DashboardUnassignedLead,
+  DashboardActiveLead,
   CostTrackingSnapshot,
   AIControlsSnapshot,
   AISpendLimitUpdateRequest,
@@ -117,6 +120,70 @@ export const login = async (username: string, password: string): Promise<LoginRe
 
 export const getDashboardStats = async (): Promise<DashboardStats> => {
   const response = await api.get<DashboardStats>('/admin/dashboard');
+  return response.data;
+};
+
+export const getLassoDashboardStatus = async (): Promise<LassoDashboardStatus> => {
+  const response = await api.get<LassoDashboardStatus>('/admin/lasso-dashboard/status');
+  return response.data;
+};
+
+export const triggerLassoDashboardSync = async (
+  syncType: 'fast' | 'full' = 'fast'
+): Promise<{ message: string; started: boolean; reason?: string; sync_type?: string }> => {
+  const response = await api.post('/admin/lasso-dashboard/sync', null, {
+    params: { sync_type: syncType },
+  });
+  return response.data;
+};
+
+export const getDashboardSnapshot = async (): Promise<{
+  sync_status: LassoDashboardStatus;
+  unassigned: { leads: DashboardUnassignedLead[]; count: number };
+  active: { leads: DashboardActiveLead[]; count: number };
+}> => {
+  const response = await api.get('/admin/lasso-dashboard/snapshot', { timeout: 30000 });
+  return response.data;
+};
+
+export const getDashboardUnassignedLeads = async (): Promise<{ leads: DashboardUnassignedLead[]; count: number }> => {
+  const response = await api.get('/admin/lasso-dashboard/unassigned-leads', { timeout: 30000 });
+  return response.data;
+};
+
+export const getDashboardActiveLeads = async (): Promise<{ leads: DashboardActiveLead[]; count: number }> => {
+  const response = await api.get('/admin/lasso-dashboard/active-leads', { timeout: 30000 });
+  return response.data;
+};
+
+export const archiveActiveLead = async (
+  lassoLeadId: number
+): Promise<{ message: string; lasso_lead_id: number }> => {
+  const response = await api.post('/admin/lasso-dashboard/archive-lead', null, {
+    params: { lasso_lead_id: lassoLeadId },
+  });
+  return response.data;
+};
+
+export const reassignActiveLead = async (
+  lassoLeadId: number,
+  dealerId?: number,
+  dealerName?: string
+): Promise<{ message: string; lasso_lead_id: number; dealer_id?: number; dealer_name?: string }> => {
+  const response = await api.post('/admin/lasso-dashboard/reassign-lead', null, {
+    params: { lasso_lead_id: lassoLeadId, dealer_id: dealerId, dealer_name: dealerName },
+  });
+  return response.data;
+};
+
+export const createLocalLeadFromLassoSnapshot = async (
+  lassoLeadId: number,
+  snapshotType: 'unassigned' | 'active'
+): Promise<{ message: string; lead_id: number; created: boolean; snapshot_type: string; lasso_lead_id: number }> => {
+  const response = await api.post('/admin/lasso-dashboard/create-local-lead', {
+    lasso_lead_id: lassoLeadId,
+    snapshot_type: snapshotType,
+  });
   return response.data;
 };
 
@@ -525,6 +592,11 @@ export const approveClosureReview = async (reviewId: number): Promise<{ success:
 
 export const dismissClosureReview = async (reviewId: number): Promise<{ success: boolean }> => {
   const response = await api.post(`/email-intel/review-queue/${reviewId}/dismiss`);
+  return response.data;
+};
+
+export const flagLeadForClosure = async (leadId: number, reason?: string): Promise<{ success: boolean; lead_id: number }> => {
+  const response = await api.post('/email-intel/review-queue/flag', { lead_id: leadId, reason });
   return response.data;
 };
 
