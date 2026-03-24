@@ -310,6 +310,57 @@ body {
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
 }
 
+.admin-lead-form-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.admin-lead-form-grid-6 {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.admin-lead-field {
+  margin-bottom: 12px;
+}
+
+.admin-span-2 {
+  grid-column: span 2;
+}
+
+.admin-span-3 {
+  grid-column: span 3;
+}
+
+@media (max-width: 1024px) {
+  .admin-lead-form-grid-3 {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-lead-form-grid-6 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .admin-span-2,
+  .admin-span-3 {
+    grid-column: span 2;
+  }
+}
+
+@media (max-width: 640px) {
+  .admin-lead-form-grid-6 {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-span-2,
+  .admin-span-3 {
+    grid-column: span 1;
+  }
+}
+
 /* Stats Cards */
 .stat-card {
   background: linear-gradient(135deg, var(--primary-color) 0%, var(--primary-dark) 100%);
